@@ -138,7 +138,7 @@ void trace_tb_execution(struct TranslationBlock *tb)
                 (void *)0);
         fprintf(stderr, "[trace] size    = %-18ld , TB's target code size\n",
                 (unsigned long)tb->size);
-        fprintf(stderr, "[trace] tc.ptr  = %-18p , TB's host code size\n",
+        fprintf(stderr, "[trace] tc.ptr  = %-18p , TB's host code address\n",
                 (void *)tb->tc.ptr);
         fprintf(stderr, "[trace] tc.size = %-18ld , TB's host code size\n",
                 (unsigned long)tb->tc.size);

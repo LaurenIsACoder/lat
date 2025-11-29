@@ -19,6 +19,10 @@ FileFunMap filefunmap[] = {
 static void extract_filename(char* filename, char* buffer,
                             size_t buffer_size)
 {
+    if (buffer_size == 0) {
+        return;
+    }
+
     char* last_slash = strrchr(filename, '/');
     char* filename_only;
     if (last_slash != NULL) {
@@ -27,6 +31,7 @@ static void extract_filename(char* filename, char* buffer,
         filename_only = filename;
     }
     strncpy(buffer, filename_only, buffer_size - 1);
+    buffer[buffer_size - 1] = '\0';
     char* extension = strchr(buffer, '.');
     if (extension != NULL) {
         *extension = '\0';

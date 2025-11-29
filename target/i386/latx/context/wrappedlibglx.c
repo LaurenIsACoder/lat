@@ -151,7 +151,7 @@ void* getGLProcAddress(glprocaddress_t procaddr, const char* rname)
     printf_dlsym(LOG_DEBUG, "Calling getGLProcAddress[%p](\"%s\") => ", procaddr, rname);
     gl_wrappers_t* wrappers = getGLProcWrapper(procaddr);
     // check if glxprocaddress is filled, and search for lib and fill it if needed
-    // get proc adress using actual glXGetProcAddress
+    // get proc address using actual glXGetProcAddress
     k = kh_get(symbolmap, wrappers->glmymap, rname);
     int is_my = (k==kh_end(wrappers->glmymap))?0:1;
     void* symbol;
