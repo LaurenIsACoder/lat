@@ -74,13 +74,6 @@ typedef struct TUControl {
 
 } TUControl;
 
-typedef enum TU_TB_START_TYPE {
-    TU_TB_START_NONE = 0,
-    TU_TB_START_JMP,
-    TU_TB_START_NORMAL,
-    TU_TB_START_ENTRY
-} TU_TB_START_TYPE;
-
 extern __thread TUControl *tu_data;
 
 void tu_enough_space(CPUState *cpu);
@@ -90,7 +83,7 @@ TranslationBlock *tu_tree_lookup(target_ulong pc, uint32_t flags,
 void tu_control_init(void);
 TranslationBlock* tb_create(CPUState *cpu, target_ulong pc,
         target_ulong cs_base, uint32_t flags, int cflags,
-        int max_insns, uint16_t bool_flags, TU_TB_START_TYPE mode);
+        int max_insns, uint16_t bool_flags);
 TranslationBlock *tu_push_back(TranslationBlock *tb);
 TranslationBlock *tu_gen_code(CPUState *cpu, target_ulong pc,
                               target_ulong cs_base, uint32_t flags,

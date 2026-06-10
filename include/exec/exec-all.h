@@ -513,10 +513,7 @@ struct separated_data{
     int32_t rel_start;
     int32_t rel_end;
     uint8_t last_ir1_type;
-    union {
-        int is_first_tb;
-        int tu_size;
-    };
+    int tu_size;
 #ifdef CONFIG_LATX_TU
     tu_tb_mode_type tu_tb_mode;
     size_t offset_in_tu;

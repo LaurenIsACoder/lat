@@ -199,7 +199,7 @@ void tu_reset_tb(TranslationBlock *tb)
     tb->s_data->next_pc = 0;
     tb->s_data->target_pc = 0;
     tb->s_data->tu_id = 0;
-    tb->s_data->is_first_tb = 0;
+    tb->s_data->tu_size = 0;
     tb->s_data->last_ir1_type = 0;
     tb->s_data->tu_tb_mode = TU_TB_MODE_NONE;
     tb->tu_jmp[TU_TB_INDEX_TARGET] = TB_JMP_RESET_OFFSET_INVALID;
@@ -226,7 +226,7 @@ static __thread uint32_t search_buff_offset[MAX_TB_IN_CACHE];
 #include<sys/syscall.h>
 TranslationBlock* tb_create(CPUState *cpu, target_ulong pc,
         target_ulong cs_base, uint32_t flags, int cflags,
-        int max_insns, uint16_t bool_flags, TU_TB_START_TYPE mode)
+        int max_insns, uint16_t bool_flags)
 {
     TranslationBlock* tb;
     if (unlikely(pc == 0)) {
@@ -446,7 +446,7 @@ static inline void get_tu_queue(CPUState *cpu,
                 }
                 if (!next_tb) {
                     next_tb = tb_create(cpu, ir1_next_pc, cs_base, flags,
-                                   cflags, max_insns, 0, TU_TB_START_NORMAL);
+                                   cflags, max_insns, 0);
                     next_tb = tu_push_back(next_tb);
                 }
                 if (next_tb && next_tb->tc.ptr != NULL) {
@@ -470,7 +470,7 @@ static inline void get_tu_queue(CPUState *cpu,
                 }
                 if (!target_tb) {
                     target_tb = tb_create(cpu, ir1_target_pc, cs_base, flags,
-                                     cflags, max_insns, 0, TU_TB_START_JMP);
+                                     cflags, max_insns, 0);
                     target_tb = tu_push_back(target_tb);
                 }
                 if (target_tb && target_tb->tc.ptr != NULL) {
@@ -495,7 +495,7 @@ static inline void get_tu_queue(CPUState *cpu,
                 }
                 if (get_page(tb->pc) == get_page(ir1_target_pc) && !target_tb) {
                     target_tb = tb_create(cpu, ir1_target_pc, cs_base, flags,
-                                     cflags, max_insns, 0, TU_TB_START_JMP);
+                                     cflags, max_insns, 0);
                     target_tb = tu_push_back(target_tb);
                 }
                 tb->s_data->next_tb[TU_TB_INDEX_TARGET] = target_tb;
@@ -516,7 +516,7 @@ static inline void get_tu_queue(CPUState *cpu,
                 }
                 if (!next_tb) {
                     next_tb = tb_create(cpu, ir1_next_pc, cs_base, flags,
-                                   cflags, max_insns, 0, TU_TB_START_NORMAL);
+                                   cflags, max_insns, 0);
                     next_tb = tu_push_back(next_tb);
                 }
                 tb->s_data->next_tb[TU_TB_INDEX_NEXT] = next_tb;
@@ -642,7 +642,7 @@ static TranslationBlock *tb_explore(CPUState *cpu,
 
     /* the entry used as return value*/
     TranslationBlock *entry = tb_create(cpu, pc, cs_base,
-            flags, cflags, max_insns, 0 , TU_TB_START_ENTRY);
+            flags, cflags, max_insns, 0);
     entry = tu_push_back(entry);
 
     /* search all tbs we can get */
