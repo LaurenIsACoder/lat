@@ -256,9 +256,9 @@ void ts_push_back(TranslationBlock *tb)
     }
     assert(tb_num_in_ts < ts_vector_capacity);
 #ifdef CONFIG_LATX_TU
-	if (unlikely(tb->s_data->tu_tb_mode == TB_GEN_CODE)) {
-		tb->s_data->offset_in_tu = 0;
-	}
+    if (unlikely(tb->s_data->tu_tb_mode == TU_TB_MODE_GEN_CODE)) {
+        tb->s_data->offset_in_tu = 0;
+    }
 #endif
     ts_vector[tb_num_in_ts++] = tb;
 }
@@ -318,7 +318,7 @@ char is_bad_tb(TranslationBlock *tb)
     if (tb == NULL
 #ifdef CONFIG_LATX_TU
             || tb->s_data->tu_tb_mode == TU_TB_MODE_BROKEN
-            || tb->s_data->tu_tb_mode == BAD_TB
+            || tb->s_data->tu_tb_mode == TU_TB_MODE_BAD
 #endif
             || tb->icount == 0
             || (tb->bool_flags & IS_TUNNEL_LIB)) {

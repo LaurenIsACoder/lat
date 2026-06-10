@@ -499,8 +499,8 @@ typedef enum tu_tb_mode_type {
     TU_TB_MODE_SWITCH_TO_TB,
     TU_TB_MODE_BROKEN,
     TU_TB_MODE_STATIC,
-    TB_GEN_CODE,
-    BAD_TB
+    TU_TB_MODE_GEN_CODE,
+    TU_TB_MODE_BAD
 } tu_tb_mode_type;
 #endif
 

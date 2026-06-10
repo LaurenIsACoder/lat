@@ -188,7 +188,7 @@ IR1_INST *get_ir1_list(struct TranslationBlock *tb, ADDRX pc, int max_insns)
 
 #ifdef CONFIG_LATX_TU
     uint32_t *ir1_num_in_tu = &(tu_data->ir1_num_in_tu);
-    if (tb->s_data->tu_tb_mode == TB_GEN_CODE) {
+    if (tb->s_data->tu_tb_mode == TU_TB_MODE_GEN_CODE) {
         *ir1_num_in_tu = 0;
     }
     IR1_INST *ir1_list = ir1_list_rel + (*ir1_num_in_tu);
@@ -2221,7 +2221,7 @@ int tr_ir2_generate(struct TranslationBlock *tb)
         bool translation_success = ir1_translate(pir1);
         if (!translation_success) {
 #ifdef CONFIG_LATX_TU
-            tb->s_data->tu_tb_mode = BAD_TB;
+            tb->s_data->tu_tb_mode = TU_TB_MODE_BAD;
 #else
             lsassertm(0, "ir1_translate fail");
 #endif

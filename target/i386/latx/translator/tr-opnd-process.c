@@ -776,7 +776,7 @@ void store_ireg_to_ir1(IR2_OPND opnd2, IR1_OPND *opnd1, bool is_xmm_hi)
 #ifdef CONFIG_LATX_TU
         TranslationBlock *tb =
             (TranslationBlock *)lsenv->tr_data->curr_tb;
-        tb->s_data->tu_tb_mode = BAD_TB;
+        tb->s_data->tu_tb_mode = TU_TB_MODE_BAD;
         return;
 #endif
         lsassert(0);

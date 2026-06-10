@@ -285,7 +285,7 @@ TranslationBlock* tb_create(CPUState *cpu, target_ulong pc,
     target_disasm(tb, max_insns);
 
     if (tb->icount == 0 || tb->s_data->tu_tb_mode == TU_TB_MODE_BROKEN
-			|| tb->s_data->tu_tb_mode == BAD_TB) {
+            || tb->s_data->tu_tb_mode == TU_TB_MODE_BAD) {
         return NULL;
     }
     tb = tcg_tb_alloc_full(tcg_ctx);
@@ -553,7 +553,7 @@ void solve_tb_overlap(uint tb_num_in_tu,
             continue;
         }
         if (pre_tb->s_data->tu_tb_mode == TU_TB_MODE_BROKEN
-                || pre_tb->s_data->tu_tb_mode == BAD_TB) {
+                || pre_tb->s_data->tu_tb_mode == TU_TB_MODE_BAD) {
             assert(0);
             pre_tb = tb;
             continue;
@@ -1138,7 +1138,7 @@ static void register_tu(uint32 tb_num_in_tu, TranslationBlock **tb_list,
     for (int i = 0; i < tb_num_in_tu; i++) {
         TranslationBlock *tb = tb_list[i];
         if (tb->s_data->tu_tb_mode != TU_TB_MODE_BROKEN
-				&& tb->s_data->tu_tb_mode != BAD_TB) {
+                && tb->s_data->tu_tb_mode != TU_TB_MODE_BAD) {
             CPUArchState *env = cpu->env_ptr;
             tb_page_addr_t phys_pc;
             tb_page_addr_t phys_page2;

@@ -2092,7 +2092,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     jrra_tb_reset(tb);
 #ifdef CONFIG_LATX_TU
     tu_reset_tb(tb);
-    tb->s_data->tu_tb_mode = TB_GEN_CODE;
+    tb->s_data->tu_tb_mode = TU_TB_MODE_GEN_CODE;
 #endif
 #ifdef CONFIG_LATX_SMC_OPT
     tb->smc_data = 0;
