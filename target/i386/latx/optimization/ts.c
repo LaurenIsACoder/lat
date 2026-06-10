@@ -553,7 +553,7 @@ static inline void get_target_tb(TranslationBlock *curr_tb, CPUState *cpu,
     curr_tb->s_data->next_tb[TU_TB_INDEX_TARGET] = target_tb;
 }
 
-static int untr_tb_id;
+static __thread int untr_tb_id;
 
 static inline void get_ts_queue(CPUState *cpu, target_ulong cs_base,
         uint32_t flags, int cflags, int max_insns, target_ulong curr_page)
