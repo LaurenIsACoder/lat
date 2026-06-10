@@ -258,9 +258,13 @@ uint8_t get_file_type(const char *file_name)
 void ts_push_back(TranslationBlock *tb)
 {
     if (tb_num_in_ts >= ts_vector_capacity) {
-        ts_vector_capacity <<= 1;
-        ts_vector = (TranslationBlock **)realloc(ts_vector,
-                ts_vector_capacity * sizeof(TranslationBlock *));
+        if (ts_vector_capacity) {
+            g_assert(ts_vector_capacity <= G_MAXSIZE / 2);
+            ts_vector_capacity <<= 1;
+        } else {
+            ts_vector_capacity = 8192;
+        }
+        ts_vector = g_renew(TranslationBlock *, ts_vector, ts_vector_capacity);
     }
     assert(tb_num_in_ts < ts_vector_capacity);
 #ifdef CONFIG_LATX_TU
@@ -285,10 +289,8 @@ static inline void translate_init(CPUState *cpu,
     *cflags = curr_cflags(cpu);
     cpu_get_tb_cpu_state(env, &pc, cs_base, flags);
     if (ts_vector_capacity == 0) {
-            ts_vector_capacity = 8192;
-            ts_vector = (TranslationBlock **)malloc(ts_vector_capacity
-            * sizeof(TranslationBlock*));
-
+        ts_vector_capacity = 8192;
+        ts_vector = g_new(TranslationBlock *, ts_vector_capacity);
     }
 #ifdef CONFIG_LATX_FAST_JMPCACHE
     latx_fast_jmp_cache_clear_all(cpu);

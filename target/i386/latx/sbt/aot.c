@@ -158,10 +158,12 @@ static void get_tb(void)
 {
     tb_num = 0;
     record_index = 0;
+    tb_vector = NULL;
     qht_iter(&tb_ctx.htable, do_tb_count, NULL);
-    tb_vector =
-        (TranslationBlock **)malloc(tb_num * sizeof(TranslationBlock *));
-    assert(tb_vector);
+    if (tb_num == 0) {
+        return;
+    }
+    tb_vector = g_new(TranslationBlock *, tb_num);
     qht_iter(&tb_ctx.htable, do_tb_record, NULL);
     if (tb_num == 0) {
         return;
@@ -172,12 +174,12 @@ static void get_tb(void)
 /* Prepare segment infomation. */ 
 static void get_seg_infomation(void)
 {
+    seg_info_vector = NULL;
     seg_info_num = get_segment_num();
     if (seg_info_num == 0) {/*not need create aot*/
        return;
     }
-    seg_info_vector = (seg_info **)malloc(seg_info_num * sizeof(seg_info *));
-    assert(seg_info_vector);
+    seg_info_vector = g_new(seg_info *, seg_info_num);
     do_segment_record(seg_info_vector);
 }
 
@@ -1019,12 +1021,23 @@ void aot_generate(CPUState *cpu)
     get_seg_infomation();
 
     if (tb_num == 0 || seg_info_num == 0) {
+        g_free(tb_vector);
+        tb_vector = NULL;
+        g_free(seg_info_vector);
+        seg_info_vector = NULL;
         return;
     }
 
     get_dynamic_message(tb_vector, tb_num, seg_info_vector, &seg_info_num);
+    g_free(tb_vector);
+    tb_vector = NULL;
 
     generate_aot_v2(cpu);
+
+    tb_vector = NULL;
+    g_free(seg_info_vector);
+    seg_info_vector = NULL;
+    seg_info_num = 0;
 }
 
 int aot_get_file_init(char *aot_file)
