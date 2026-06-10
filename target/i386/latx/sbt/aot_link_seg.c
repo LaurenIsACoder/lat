@@ -81,8 +81,9 @@ void try_aot_link(void)
 
 void aot_link_tree_init(void)
 {
+    g_free(aot_global_info);
     aot_global_info_total = 100000;
-    aot_global_info = malloc(aot_global_info_total * sizeof(aot_link_info));
+    aot_global_info = g_new(aot_link_info, aot_global_info_total);
     aot_global_info_index = 0;
 }
 
@@ -90,9 +91,10 @@ void aot_link_tree_insert(TranslationBlock *curr,
         target_ulong aim1_pc, target_ulong aim2_pc)
 {
     if (aot_global_info_index >= aot_global_info_total) {
+        g_assert(aot_global_info_total <= G_MAXINT - 1000);
         aot_global_info_total += 1000;
-        aot_global_info = realloc(aot_global_info,
-            aot_global_info_total * sizeof(aot_link_info));
+        aot_global_info = g_renew(aot_link_info, aot_global_info,
+                                  aot_global_info_total);
     }
     aot_link_info *info = aot_global_info + aot_global_info_index;
     info->curr = curr;

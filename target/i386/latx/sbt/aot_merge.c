@@ -128,13 +128,12 @@ static int32_t cp_rel_entry(aot_rel *old_rel_table)
     if (merge_rel_table_capacity == 0) {
         merge_rel_table_capacity = 10000;
         merge_rel_entry_num = 0;
-        merge_rel_table =
-            (aot_rel *)malloc(merge_rel_table_capacity * sizeof(aot_rel));
+        merge_rel_table = g_new(aot_rel, merge_rel_table_capacity);
     } else if (merge_rel_table_capacity == merge_rel_entry_num) {
+        g_assert(merge_rel_table_capacity <= G_MAXINT / 2);
         merge_rel_table_capacity <<= 1;
-        merge_rel_table =
-            (aot_rel *)realloc(merge_rel_table,
-            merge_rel_table_capacity * sizeof(aot_rel));
+        merge_rel_table = g_renew(aot_rel, merge_rel_table,
+                                  merge_rel_table_capacity);
     }
     int i = merge_rel_entry_num++;
     assert(merge_rel_entry_num <= merge_rel_table_capacity);

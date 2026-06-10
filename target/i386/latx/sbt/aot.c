@@ -96,12 +96,11 @@ int add_rel_entry(aot_rel_kind kind, uint32_t **tc_offset,
     if (rel_table_capacity == 0) {
         rel_table_capacity = 10000;
         rel_entry_num = 0;
-        rel_table = (aot_rel *)malloc(rel_table_capacity * sizeof(aot_rel));
-        assert(rel_table);
+        rel_table = g_new(aot_rel, rel_table_capacity);
     } else if (rel_table_capacity == rel_entry_num) {
+        g_assert(rel_table_capacity <= G_MAXINT / 2);
         rel_table_capacity <<= 1;
-        rel_table =
-            (aot_rel *)realloc(rel_table, rel_table_capacity * sizeof(aot_rel));
+        rel_table = g_renew(aot_rel, rel_table, rel_table_capacity);
     }
     int i = rel_entry_num++;
     assert(rel_entry_num <= rel_table_capacity);
@@ -996,8 +995,9 @@ static void generate_aot_v2(CPUState *cpu)
 void clear_rel_table(void)
 {
     if (rel_entry_num) {
-        free(rel_table);
+        g_free(rel_table);
     }
+    rel_table = NULL;
     rel_entry_num = 0;
     rel_table_capacity = 0;
 }
