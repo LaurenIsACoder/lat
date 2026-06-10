@@ -769,9 +769,9 @@ static void translate_by_tu(CPUState *cpu,
 {
     untr_tb_id = curr_seg->first_tb_id;
 #ifdef CONFIG_LATX_DEBUG
-    for (int i = curr_seg->first_tb_id; i < curr_seg->last_tb_id; i++) {
-	assert(curr_tb_message_vector[i].pc >= curr_seg->seg_begin
-			&& curr_tb_message_vector[i].pc <= curr_seg->seg_end);
+    for (int i = curr_seg->first_tb_id; i <= curr_seg->last_tb_id; i++) {
+        assert(curr_tb_message_vector[i].pc >= curr_seg->seg_begin
+                && curr_tb_message_vector[i].pc < curr_seg->seg_end);
     }
 #endif
     int tb_num_in_seg = curr_seg->last_tb_id - curr_seg->first_tb_id + 1;
@@ -792,7 +792,7 @@ static void translate_by_tu(CPUState *cpu,
 static void translate_seg(seg_info *seg, CPUState *cpu,
         target_ulong cs_base, uint32_t flags, int cflags)
 {
-    for (int i = curr_seg->first_tb_id; i <= curr_seg->last_tb_id; i++) {
+    for (int i = seg->first_tb_id; i <= seg->last_tb_id; i++) {
         curr_tb_message_vector[i].tb = NULL;
     }
 #ifndef CONFIG_LATX_TU
@@ -800,7 +800,7 @@ static void translate_seg(seg_info *seg, CPUState *cpu,
 #else
     translate_by_tu(cpu, cs_base, flags, cflags);
 #endif
-    for (int i = curr_seg->first_tb_id; i < curr_seg->last_tb_id; i++) {
+    for (int i = seg->first_tb_id; i <= seg->last_tb_id; i++) {
         TranslationBlock *tb = curr_tb_message_vector[i].tb;
         if (tb != NULL) {
             jrra_pre_translate((void **)&tb, 1, cpu, tb->flags, tb->cflags);
