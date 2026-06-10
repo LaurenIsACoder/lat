@@ -50,13 +50,6 @@ void mmap_lock(void)
 #endif
 }
 
-void mmap_trylock(void)
-{
-    if (mmap_lock_count++ == 0) {
-        pthread_mutex_trylock(&mmap_mutex);
-    }
-}
-
 void mmap_unlock(void)
 {
 #ifdef CONFIG_LATX_PERF

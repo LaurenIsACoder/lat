@@ -457,8 +457,9 @@ static void update_tcg_context_before_asm(TranslationBlock *tb)
 static void update_tcg_context_after_asm(void *gen_code_buf,
     TranslationBlock *tb, size_t glue_code_size)
 {
-    uint32_t search_size = encode_search(tb,
-        (void *)gen_code_buf + glue_code_size);
+    int search_size = encode_search(tb,
+        (void *)gen_code_buf + glue_code_size, tcg_ctx->code_gen_highwater);
+    lsassert(search_size >= 0);
 
     /* increase code_gen_ptr with align */
     qatomic_set(&tcg_ctx->code_gen_ptr,

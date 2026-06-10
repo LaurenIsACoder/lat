@@ -382,9 +382,9 @@ static target_long decode_sleb128(const uint8_t **pp)
    That is, the first column is seeded with the guest pc, the last column
    with the host pc, and the middle columns with zeros.  */
 
-int encode_search(TranslationBlock *tb, uint8_t *block)
+int encode_search(TranslationBlock *tb, uint8_t *block,
+                  const uint8_t *block_end)
 {
-    uint8_t *highwater = tcg_ctx->code_gen_highwater;
     uint8_t *p = block;
     int i, j, n;
 
@@ -403,10 +403,10 @@ int encode_search(TranslationBlock *tb, uint8_t *block)
         p = encode_sleb128(p, tcg_ctx->gen_insn_end_off[i] - prev);
 
         /* Test for (pending) buffer overflow.  The assumption is that any
-           one row beginning below the high water mark cannot overrun
+           one row beginning below the buffer end cannot overrun
            the buffer completely.  Thus we can test for overflow after
            encoding a row without having to check during encoding.  */
-        if (!in_pre_translate && unlikely(p > highwater)) {
+        if (unlikely(p > block_end)) {
             return -1;
         }
     }
@@ -2207,7 +2207,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
             g_assert_not_reached();
         }
     }
-    search_size = encode_search(tb, (void *)gen_code_buf + gen_code_size);
+    search_size = encode_search(tb, (void *)gen_code_buf + gen_code_size,
+                                tcg_ctx->code_gen_highwater);
     if (unlikely(search_size < 0)) {
         goto buffer_overflow;
     }
@@ -2327,7 +2328,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
      * To handle segv case, every insn has encode data at the end of tb
      * Calculate the search_size and set the new gen_code_buf
      */
-    search_size = encode_search(tb, (void *)gen_code_buf + gen_code_size);
+    search_size = encode_search(tb, (void *)gen_code_buf + gen_code_size,
+                                tcg_ctx->code_gen_highwater);
     if (unlikely(search_size < 0)) {
         qatomic_set(&tcg_ctx->code_gen_ptr, tcg_ctx->code_gen_highwater + 1);
         goto buffer_overflow;

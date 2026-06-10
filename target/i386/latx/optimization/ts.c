@@ -341,7 +341,7 @@ static inline void create_dynamic_tb(seg_info *seg, CPUState *cpu,
         if (aot_tb_lookup(pc, cflags)) {
             continue;
         }
-        mmap_trylock();
+        mmap_lock();
         tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
         mmap_unlock();
         if (is_bad_tb(tb)) {
@@ -357,7 +357,7 @@ static inline int translate_static_tb(seg_info *seg, CPUState *cpu,
     TranslationBlock *tb;
     if (pc >= seg->seg_begin && pc < seg->seg_end
             && !aot_tb_lookup(pc, cflags)) {
-        mmap_trylock();
+        mmap_lock();
         tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
         mmap_unlock();
         if (is_bad_tb(tb)) {
@@ -412,31 +412,10 @@ static inline void translate_by_tb(seg_info *seg, CPUState *cpu,
 
 #else
 
-static inline unsigned int tb_jmp_cache_hash_func(target_ulong pc)
+static TranslationBlock *lookup_static_tb(target_ulong pc, uint32_t flags,
+                                          int cflags)
 {
-    return pc & (TB_JMP_CACHE_SIZE - 1);
-}
-
-static TranslationBlock *lookup_static_tb(target_ulong pc, int cflags,
-        CPUState *cpu)
-{
-    TranslationBlock *tb;
-    uint32_t hash = tb_jmp_cache_hash_func(pc);
-    tb = qatomic_read(&cpu->tb_jmp_cache[hash]);
-    if (tb && tb->pc == pc && tb->cflags == cflags) {
-        return tb;
-    } else {
-        return NULL;
-    }
-}
-
-static void save_static_tb(TranslationBlock *tb, CPUState *cpu)
-{
-    uint32_t hash = tb_jmp_cache_hash_func(tb->pc);
-#ifdef CONFIG_LATX_FAST_JMPCACHE
-    latx_fast_jmp_cache_add(cpu, hash, tb);
-#endif
-    qatomic_set(&cpu->tb_jmp_cache[hash], tb);
+    return tu_tree_lookup(pc, flags, cflags);
 }
 
 static TranslationBlock* create_static_tb(CPUState *cpu, target_ulong pc,
@@ -453,10 +432,14 @@ static TranslationBlock* create_static_tb(CPUState *cpu, target_ulong pc,
 	return NULL;
     }
 
-    tb = (TranslationBlock *)malloc(sizeof(TranslationBlock));
-    tb->s_data = (struct separated_data *)malloc(sizeof(struct separated_data));
-    if (tb == NULL || tb->s_data == NULL) {
-        exit(-1);
+    tb = g_try_new0(TranslationBlock, 1);
+    if (!tb) {
+        return NULL;
+    }
+    tb->s_data = g_try_new0(struct separated_data, 1);
+    if (!tb->s_data) {
+        g_free(tb);
+        return NULL;
     }
     tu_reset_tb(tb);
 #ifdef CONFIG_LATX_SMC_OPT
@@ -479,7 +462,6 @@ static TranslationBlock* create_static_tb(CPUState *cpu, target_ulong pc,
     target_disasm(tb, max_insns);
 
     tb->s_data->tu_tb_mode = TU_TB_MODE_STATIC;
-    save_static_tb(tb, cpu);
     return tb;
 }
 
@@ -505,7 +487,7 @@ static inline void get_next_tb(TranslationBlock *curr_tb, CPUState *cpu,
             if (is_bad_tb(next_tb)) {
                 next_tb = NULL;
             }
-            tu_push_back(next_tb);
+            next_tb = tu_push_back(next_tb);
         }
         if (curr_tb->s_data->last_ir1_type == IR1_TYPE_BRANCH &&
                 next_tb && next_tb->tc.ptr != NULL) {
@@ -514,13 +496,13 @@ static inline void get_next_tb(TranslationBlock *curr_tb, CPUState *cpu,
         }
     } else {
         /* Get static tb. */
-        next_tb = lookup_static_tb(next_tb_pc, cflags, cpu);
+        next_tb = lookup_static_tb(next_tb_pc, flags, cflags);
         if (!next_tb) {
             next_tb = create_static_tb(cpu, next_tb_pc,
                     cs_base, flags, cflags, max_insns);
             if (next_tb) {
                 next_tb->bool_flags |= (curr_tb->bool_flags & IS_CODE64);
-                tu_push_back(next_tb);
+                next_tb = tu_push_back(next_tb);
             }
         }
     }
@@ -549,7 +531,7 @@ static inline void get_target_tb(TranslationBlock *curr_tb, CPUState *cpu,
             if (is_bad_tb(target_tb)) {
                 target_tb = NULL;
             }
-            tu_push_back(target_tb);
+            target_tb = tu_push_back(target_tb);
         }
         if (curr_tb->s_data->last_ir1_type == IR1_TYPE_BRANCH &&
                 target_tb && target_tb->tc.ptr != NULL) {
@@ -558,13 +540,13 @@ static inline void get_target_tb(TranslationBlock *curr_tb, CPUState *cpu,
         }
     } else {
         /* Get static tb. */
-        target_tb = lookup_static_tb(target_tb_pc, cflags, cpu);
+        target_tb = lookup_static_tb(target_tb_pc, flags, cflags);
         if (!target_tb) {
             target_tb = create_static_tb(cpu, target_tb_pc,
                     cs_base, flags, cflags, max_insns);
             if (target_tb) {
                 target_tb->bool_flags |= (curr_tb->bool_flags & IS_CODE64);
-                tu_push_back(target_tb);
+                target_tb = tu_push_back(target_tb);
             }
         }
     }
@@ -587,13 +569,17 @@ static inline void get_ts_queue(CPUState *cpu, target_ulong cs_base,
         if (get_page(curr_tb_pc) != curr_page || curr_tb_cflags != cflags) {
             break;
         }
-	if(curr_tb_message_vector[untr_tb_id].tb) {
+        if (curr_tb_message_vector[untr_tb_id].tb) {
+            untr_tb_id++;
             continue;
         }
         tb = tb_create(cpu, curr_tb_pc, cs_base, flags, curr_tb_cflags, max_insns,
                 curr_tb_message_vector[untr_tb_id].bool_flags , TU_TB_START_ENTRY);
-        tu_push_back(tb);
+        tb = tu_push_back(tb);
         untr_tb_id++;
+        if (!tb) {
+            continue;
+        }
         for (; tb_id <  *tb_num_in_tu && *tb_num_in_tu < MAX_TB_IN_TS;  tb_id++) {
 #ifdef CONFIG_LATX_DEBUG
             if (get_tb_id(tb->pc, tb->cflags) < 0) {
@@ -663,8 +649,9 @@ static void delet_static_tb(TranslationBlock **tb_list, uint32_t *tb_num_in_tu)
         tb = tb_list[i];
         assert(tb);
         if (tb->s_data->tu_tb_mode == TU_TB_MODE_STATIC) {
-            free(tb->s_data);
-            free(tb);
+            g_tree_remove(tu_data->tree, tb);
+            g_free(tb->s_data);
+            g_free(tb);
             tb = NULL;
         } else {
             tb_list[last_tb_id++] = tb;
@@ -766,6 +753,7 @@ static inline void gen_tu(CPUState *cpu,
     }
     translate_tu(tu_data->tb_num, tu_data->tb_list);
     save_tu_to_ts();
+    tu_trees_reset();
 }
 
 static void translate_by_tu(CPUState *cpu,
@@ -782,7 +770,7 @@ static void translate_by_tu(CPUState *cpu,
     /* sort with cflags and pc in seg*/
     qsort(curr_tb_message_vector + curr_seg->first_tb_id, tb_num_in_seg,
             sizeof(tb_tmp_message), tmp_message_sort_cmp);
-    mmap_trylock();
+    mmap_lock();
     while (untr_tb_id <= curr_seg->last_tb_id) {
 	if (need_flush()) {
     	    break;
@@ -836,4 +824,3 @@ uint64 translate_lib(seg_info **seg_info_vector, int begin_id,
     in_pre_translate = 0;
     return tb_num_in_ts;
 }
-

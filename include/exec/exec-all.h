@@ -64,7 +64,8 @@ void clear_signal_link_flag(TranslationBlock *tb, int index);
 void tb_reset_jump(TranslationBlock *tb, int n);
 void restore_state_to_opc(CPUArchState *env, TranslationBlock *tb,
                           target_ulong *data);
-int encode_search(TranslationBlock *tb, uint8_t *block);
+int encode_search(TranslationBlock *tb, uint8_t *block,
+                  const uint8_t *block_end);
 
 /**
  * cpu_restore_state:
@@ -856,8 +857,6 @@ static inline void assert_no_pages_locked(void)
 struct MemoryRegionSection *iotlb_to_section(CPUState *cpu,
                                              hwaddr index, MemTxAttrs attrs);
 #endif
-
-void mmap_trylock(void);
 
 /**
  * get_page_addr_code_hostp()

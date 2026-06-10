@@ -85,12 +85,13 @@ extern __thread TUControl *tu_data;
 
 void tu_enough_space(CPUState *cpu);
 void tu_trees_reset(void);
-TranslationBlock *tu_tree_lookup(target_ulong pc);
+TranslationBlock *tu_tree_lookup(target_ulong pc, uint32_t flags,
+                                 uint32_t cflags);
 void tu_control_init(void);
 TranslationBlock* tb_create(CPUState *cpu, target_ulong pc,
         target_ulong cs_base, uint32_t flags, int cflags,
         int max_insns, uint16_t bool_flags, TU_TB_START_TYPE mode);
-void tu_push_back(TranslationBlock *tb);
+TranslationBlock *tu_push_back(TranslationBlock *tb);
 TranslationBlock *tu_gen_code(CPUState *cpu, target_ulong pc,
                               target_ulong cs_base, uint32_t flags,
                               int cflags);
