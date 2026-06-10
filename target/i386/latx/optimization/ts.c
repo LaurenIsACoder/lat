@@ -98,24 +98,32 @@ static inline ADDRX get_page(ADDRX pc)
 void get_dynamic_message(TranslationBlock **tb_list, int tb_num,
         seg_info **seg_info_vector, int *seg_info_num)
 {
-    dynamic_tb_message_vector = malloc(sizeof(tb_tmp_message) * tb_num);
+    tb_tmp_message *new_message_vector = g_new0(tb_tmp_message, tb_num);
+    TranslationBlock *prev_tb = NULL;
+
+    if (curr_tb_message_vector == dynamic_tb_message_vector) {
+        curr_tb_message_vector = NULL;
+    }
+    g_free(dynamic_tb_message_vector);
+    dynamic_tb_message_vector = new_message_vector;
     dynamic_tb_num = 0;
-    assert(dynamic_tb_message_vector);
     int j = 0;
     for (int i = 0; i < tb_num; i++) {
-        if (!tb_list[i] || !tb_list[i]->pc) {
+        TranslationBlock *tb = tb_list[i];
+
+        if (!tb || !tb->pc) {
             continue;
         }
-        if (i && (tb_list[i]->pc == tb_list[i - 1]->pc)
-                    && ((tb_list[i]->cflags & CF_PARALLEL)
-                    == (tb_list[i - 1]->cflags & CF_PARALLEL))) {
+        if (prev_tb && tb->pc == prev_tb->pc
+                && (tb->cflags & CF_PARALLEL)
+                == (prev_tb->cflags & CF_PARALLEL)) {
             continue;
         }
-        dynamic_tb_message_vector[dynamic_tb_num].pc = tb_list[i]->pc;
-        dynamic_tb_message_vector[dynamic_tb_num].cflags = tb_list[i]->cflags;
-        dynamic_tb_message_vector[dynamic_tb_num].bool_flags = tb_list[i]->bool_flags;
+        dynamic_tb_message_vector[dynamic_tb_num].pc = tb->pc;
+        dynamic_tb_message_vector[dynamic_tb_num].cflags = tb->cflags;
+        dynamic_tb_message_vector[dynamic_tb_num].bool_flags = tb->bool_flags;
         while (j < *seg_info_num &&
-                seg_info_vector[j]->seg_end <= tb_list[i]->pc) {
+                seg_info_vector[j]->seg_end <= tb->pc) {
 #ifdef CONFIG_LATX_DEBUG
             if (j > 0) {
                 assert(seg_info_vector[j]->seg_begin
@@ -126,8 +134,7 @@ void get_dynamic_message(TranslationBlock **tb_list, int tb_num,
         }
         if (j < *seg_info_num) {
             seg_info *seg = seg_info_vector[j];
-            if (seg->seg_begin <= tb_list[i]->pc
-                    && seg->seg_end > tb_list[i]->pc) {
+            if (seg->seg_begin <= tb->pc && seg->seg_end > tb->pc) {
                 if (seg->first_tb_id == -1) {
                     seg->first_tb_id = dynamic_tb_num;
                 }
@@ -142,6 +149,7 @@ void get_dynamic_message(TranslationBlock **tb_list, int tb_num,
 		!= dynamic_tb_message_vector[dynamic_tb_num - 1].cflags));
 	}
 #endif
+        prev_tb = tb;
 	dynamic_tb_num++;
     }
 }
