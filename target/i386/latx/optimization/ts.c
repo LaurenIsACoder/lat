@@ -154,36 +154,6 @@ void get_dynamic_message(TranslationBlock **tb_list, int tb_num,
     }
 }
 
-char is_pe(char *file_name)
-{
-    char name_type [5] = {0};
-    const char * pe_file [] = {".dll", ".exe", ".sys", ".drv",
-        ".tlb", ".8bf", ".ttf", ".otf", ".bin", ".dat", ".pak", "real"};
-    char is_pe = false;
-    int name_len = strlen(file_name);
-    for (int i = 0; i < 4; i++) {
-        name_type[i] = tolower(file_name[name_len - 4 + i]);
-    }
-    for (int i = 0; i < sizeof(pe_file) / sizeof(const char *); i++) {
-        if(strstr(name_type, pe_file[i])) {
-           is_pe = true;
-        }
-    }
-    char name_type2[8] = {0};
-    const char * pe_file2 [] = {".dll.so", ".exe.so", ".sys.so",
-    ".drv.so"};
-    name_len = strlen(file_name);
-    for (int i = 0; i < 7; i++) {
-        name_type2[i] = tolower(file_name[name_len - 7 + i]);
-    }
-    for (int i = 0; i < sizeof(pe_file2) / sizeof(const char *); i++) {
-        if(strstr(name_type2, pe_file2[i])) {
-           is_pe = true;
-        }
-    }
-    return is_pe;
-}
-
 #define SIGNATURE_LENGTH 4
 uint8_t is_pe_file(const char *filename) {
     FILE *file = fopen(filename, "rb");
