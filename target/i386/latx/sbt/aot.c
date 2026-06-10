@@ -180,7 +180,7 @@ static void get_seg_infomation(void)
        return;
     }
     seg_info_vector = g_new(seg_info *, seg_info_num);
-    do_segment_record(seg_info_vector);
+    seg_info_num = do_segment_record(seg_info_vector);
 }
 
 static int page_count;

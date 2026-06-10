@@ -32,11 +32,11 @@ void smc_tree_init(void)
 static gboolean dump_smc_tree_node(gpointer key, gpointer val,
                                        gpointer data)
 {
-    static int index;
-    smc_info **vec = (smc_info **)data;
+    smc_info ***cursor = data;
     smc_info *smc = (smc_info *)val;
-    vec[index++] = smc;
-    return 0;
+
+    *(*cursor)++ = smc;
+    return false;
 }
 
 #include "aot_page.h"
@@ -86,6 +86,8 @@ gint get_smc_num(void)
 
 void do_smc_record(smc_info **smc_info_vector)
 {
-    g_tree_foreach(smc_tree, dump_smc_tree_node, smc_info_vector);
+    smc_info **cursor = smc_info_vector;
+
+    g_tree_foreach(smc_tree, dump_smc_tree_node, &cursor);
 }
 #endif

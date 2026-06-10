@@ -10,6 +10,13 @@
 #ifdef CONFIG_LATX_AOT
 static GTree *segment_tree;
 static GTree *wine_sec_tree;
+
+typedef struct SegmentRecordContext {
+    seg_info **vector;
+    gint count;
+    gint capacity;
+} SegmentRecordContext;
+
 static void seg_delete(gconstpointer a) {
     seg_info *oldkey = (seg_info *)a;
     lsassert(oldkey);
@@ -55,17 +62,18 @@ void segment_tree_init(void)
 static gboolean dump_segment_tree_node(gpointer key, gpointer val,
                                        gpointer data)
 {
-    static int index;
-    seg_info **vec = (seg_info **)data;
+    SegmentRecordContext *ctx = data;
     seg_info *seg = (seg_info *)val;
+
     if ((seg->seg_end - seg->seg_begin) / TARGET_PAGE_SIZE > 204800) {
         qemu_log_mask(LAT_LOG_AOT, "seg %s is too large\n", seg->file_name);
-        return 0;
+        return false;
     }
+    g_assert(ctx->count < ctx->capacity);
     seg->first_tb_id = -1;
     seg->last_tb_id = -2;
-    vec[index++] = seg;
-    return 0;
+    ctx->vector[ctx->count++] = seg;
+    return false;
 }
 
 static void wine_sec_tree_remove(wine_sec_info *sec)
@@ -349,8 +357,14 @@ gint get_segment_num(void)
     return g_tree_nnodes(segment_tree);
 }
 
-void do_segment_record(seg_info **seg_info_vector)
+gint do_segment_record(seg_info **seg_info_vector)
 {
-    g_tree_foreach(segment_tree, dump_segment_tree_node, seg_info_vector);
+    SegmentRecordContext ctx = {
+        .vector = seg_info_vector,
+        .capacity = get_segment_num(),
+    };
+
+    g_tree_foreach(segment_tree, dump_segment_tree_node, &ctx);
+    return ctx.count;
 }
 #endif

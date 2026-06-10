@@ -78,6 +78,6 @@ seg_info *segment_tree_lookup2(target_ulong begin, target_ulong end);
 void segment_tree_remove(seg_info *val);
 bool segment_tree_winepe_lookup(target_ulong pc);
 gint get_segment_num(void);
-void do_segment_record(seg_info **seg_info_vector);
+gint do_segment_record(seg_info **seg_info_vector);
 
 #endif
