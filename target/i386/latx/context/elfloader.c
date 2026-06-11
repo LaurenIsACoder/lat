@@ -160,8 +160,10 @@ uintptr_t loadSoaddrFromMap(char * real_path)
 void ElfHeadReFix (elfheader_t* head, uintptr_t delta)
 {
     head->latx_hasfix = 1;
-    lsassert(delta);
     head->delta = delta;
+    if (!delta) {
+        return;
+    }
     #define GO(a) if ((uintptr_t)head->a > 0) {   \
             if ((uintptr_t)head->a > (uintptr_t)head->delta) {   \
                 head->delta = 0;                           \

@@ -9,8 +9,10 @@
 #include "config-host.h"
 #include "lsenv.h"
 #include "myalign.h"
+#include "elfmap.h"
 #include "elfloader.h"
 #include "elfloader_private.h"
+#include "guestobject.h"
 #include <sys/epoll.h>
 #include <sys/sem.h>
 #include <sys/syscall.h>
@@ -2222,62 +2224,285 @@ static char* kzt_find_realsofilepath(char * filepath, char *filetmp)
     return filepath;
 }
 extern const char* libcName;
-static void kzt_tb_callback(CPUX86State *env)
+static const char *kzt_object_basename(const char *path)
 {
-    struct link_map_x64 * my_lm = (struct link_map_x64 *)env->regs[R_EAX + ld_info->reg];
-    elfheader_t *h = NULL;
-    if ((!my_lm ||!my_lm->l_name ||!strlen(my_lm->l_name) || ! my_lm->l_addr)&& my_lm->l_addr != info1.load_addr) {
-        printf_log(LOG_DEBUG, "error %d debug %s link_map = %p{0x%lx, %s}\n", getpid(), __func__, my_lm, my_lm->l_addr, my_lm->l_name);
-        return;
+    const char *basename = strrchr(path, '/');
+    return basename ? basename + 1 : path;
+}
+
+typedef struct KztGuestObject {
+    struct link_map_x64 *link_map;
+    char *object_name;
+    char *filename;
+    const char *basename;
+    char filetmp[PATH_MAX];
+    int is_loader;
+    uintptr_t map_start;
+    uintptr_t map_end;
+} KztGuestObject;
+
+static struct link_map_x64 *kzt_get_callback_link_map(CPUX86State *env)
+{
+    struct link_map_x64 *my_lm =
+        (struct link_map_x64 *)env->regs[R_EAX + ld_info->reg];
+
+    if (!my_lm) {
+        printf_log(LOG_DEBUG, "error %d debug %s link_map = NULL\n",
+                   getpid(), "kzt_tb_callback");
+        return NULL;
     }
-    printf_log(LOG_DEBUG, "%d debug %s link_map = %p{0x%lx, %s}\n", getpid(), __func__, my_lm, my_lm->l_addr, my_lm->l_name);
-    char * rfilename = my_lm->l_name;
-    if (strstr(basename(rfilename), "ld-linux-x86-64.so.2")) {
-        AddDebugInfo(LIB_EMULATED, my_lm->l_name, my_lm->l_map_start, my_lm->l_map_end);
-        return;
+    if (!my_lm->l_addr && my_lm->l_addr != info1.load_addr) {
+        printf_log(LOG_DEBUG,
+                   "error %d debug %s link_map = %p{0x%lx, %s}\n",
+                   getpid(), "kzt_tb_callback", my_lm, my_lm->l_addr,
+                   my_lm->l_name ? my_lm->l_name : "<null>");
+        return NULL;
     }
-    char filetmp[PATH_MAX] = {0};
-    if (rfilename[0] == '/') {
-        rfilename = kzt_find_realsofilepath(rfilename, filetmp);
+    return my_lm;
+}
+
+static char *kzt_get_object_name(struct link_map_x64 *my_lm)
+{
+    char *object_name = my_lm->l_name;
+
+    if (!object_name || !object_name[0]) {
+        if (my_lm->l_addr != info1.load_addr) {
+            printf_log(LOG_DEBUG,
+                       "error %d debug %s link_map = %p has no name\n",
+                       getpid(), "kzt_tb_callback", my_lm);
+            return NULL;
+        }
+        object_name = my_context->fullpath;
+        if ((!object_name || !object_name[0]) && my_context->argv)
+            object_name = my_context->argv[0];
+        if (!object_name || !object_name[0]) {
+            printf_log(LOG_DEBUG,
+                       "error %d debug %s main object has no filename\n",
+                       getpid(), "kzt_tb_callback");
+            return NULL;
+        }
     }
-    char * rbasename = basename(rfilename);
-    library_t* lib = NewLibrary(rbasename, my_context);
-    if (lib) {
-        const char* libs[] = {rbasename};
-        AddNeededLib(my_context->maplib, &my_context->neededlibs, NULL, 0, 1, libs, 1, my_context);
+    return object_name;
+}
+
+static int kzt_register_callback_guest_object(CPUX86State *env,
+                                              KztGuestObject *object)
+{
+    object->link_map = kzt_get_callback_link_map(env);
+    if (!object->link_map)
+        return 0;
+
+    object->object_name = kzt_get_object_name(object->link_map);
+    if (!object->object_name)
+        return 0;
+
+    printf_log(LOG_DEBUG, "%d debug %s link_map = %p{0x%lx, %s}\n",
+               getpid(), "kzt_tb_callback", object->link_map,
+               object->link_map->l_addr, object->object_name);
+
+    guest_object_observation_t observation = ObserveGuestObject(
+        my_context->guest_objects,
+        (uintptr_t)object->link_map,
+        object->link_map->l_addr,
+        (uintptr_t)object->link_map->l_ld,
+        object->object_name);
+
+    if (observation == GUEST_OBJECT_OBSERVE_NEW
+        || observation == GUEST_OBJECT_OBSERVE_CHANGED) {
+        printf_log(LOG_DEBUG,
+                   "%s guest object %s: map=%p bias=0x%lx dynamic=%p name=%s\n",
+                   "kzt_tb_callback",
+                   observation == GUEST_OBJECT_OBSERVE_NEW ? "discovered"
+                                                          : "changed",
+                   object->link_map, object->link_map->l_addr,
+                   object->link_map->l_ld, object->object_name);
     }
-    if (!lib && (!strncmp(rbasename, "libSDL", 6)||!strncmp(rbasename, "libCgGL.so", strlen("libCgGL.so")))) {
-        printf_log(LOG_DEBUG, "%s libSDL need libGL.so.1\n", __func__);
-        const char* libs[] = {"libGL.so.1"};
-        AddNeededLib(my_context->maplib, &my_context->neededlibs, NULL, 0, 1, libs, 1, my_context);
+
+    return 1;
+}
+
+static int kzt_begin_legacy_guest_object_processing(KztGuestObject *object)
+{
+    guest_object_process_result_t processing = BeginGuestObjectProcessing(
+        my_context->guest_objects, (uintptr_t)object->link_map);
+    if (processing == GUEST_OBJECT_PROCESS_IN_PROGRESS) {
+        printf_log(LOG_DEBUG,
+                   "%s skip guest object map=%p name=%s reason=processing\n",
+                   "kzt_tb_callback", object->link_map, object->object_name);
+        return 0;
     }
-    FILE *f = fopen(rfilename, "rb");
-    if(!f) {
-        printf_log(LOG_INFO, "%s Error: Cannot open \"%s\"\n", __func__, rfilename);
-        return;
+    if (processing == GUEST_OBJECT_PROCESS_INVALID)
+        printf_log(LOG_DEBUG, "%s guest object registry unavailable\n",
+                   "kzt_tb_callback");
+    return 1;
+}
+
+static void kzt_resolve_guest_object_path(KztGuestObject *object)
+{
+    object->filename = object->object_name;
+    if (object->filename[0] == '/') {
+        object->filename =
+            kzt_find_realsofilepath(object->filename, object->filetmp);
     }
-    h = LoadAndCheckElfHeader(f, rfilename, 0);
-    ElfHeadReFix(h, my_lm->l_addr);
+    object->basename = kzt_object_basename(object->filename);
+    object->is_loader =
+        strstr(object->basename, "ld-linux-x86-64.so.2") != NULL;
+}
+
+static elfheader_t *kzt_open_guest_elf(KztGuestObject *object)
+{
+    FILE *f = fopen(object->filename, "rb");
+    if (!f) {
+        printf_log(LOG_INFO, "%s Error: Cannot open \"%s\"\n",
+                   "kzt_tb_callback", object->filename);
+        SetGuestObjectState(my_context->guest_objects,
+                            (uintptr_t)object->link_map,
+                            object->is_loader ? GUEST_OBJECT_EMULATED
+                                              : GUEST_OBJECT_FAILED);
+        return NULL;
+    }
+
+    elfheader_t *h = LoadAndCheckElfHeader(f, object->filename, 0);
+    if (!h) {
+        printf_log(LOG_INFO, "%s Error: Cannot parse ELF header for \"%s\"\n",
+                   "kzt_tb_callback", object->filename);
+        fclose(f);
+        SetGuestObjectState(my_context->guest_objects,
+                            (uintptr_t)object->link_map,
+                            object->is_loader ? GUEST_OBJECT_EMULATED
+                                              : GUEST_OBJECT_FAILED);
+        return NULL;
+    }
     fclose(f);
+    return h;
+}
+
+static void kzt_record_guest_load_range(KztGuestObject *object,
+                                        elfheader_t *h)
+{
+    if (!GetElfLoadRange(h->PHEntries, h->numPHEntries,
+                         object->link_map->l_addr, TARGET_PAGE_SIZE,
+                         &object->map_start, &object->map_end)) {
+        SetGuestObjectMapRange(my_context->guest_objects,
+                               (uintptr_t)object->link_map,
+                               object->map_start, object->map_end);
+    } else {
+        printf_log(LOG_INFO,
+                   "%s Warning: Cannot determine load range for \"%s\"\n",
+                   "kzt_tb_callback", object->filename);
+    }
+}
+
+static library_t *kzt_register_guest_library_policy(KztGuestObject *object)
+{
+    library_t *lib = NewLibrary(object->basename, my_context);
+    if (lib) {
+        const char *libs[] = {object->basename};
+        AddNeededLib(my_context->maplib, &my_context->neededlibs, NULL, 0,
+                     1, libs, 1, my_context);
+    }
+    if (!lib && (!strncmp(object->basename, "libSDL", 6)
+                 || !strncmp(object->basename, "libCgGL.so",
+                             strlen("libCgGL.so")))) {
+        printf_log(LOG_DEBUG, "%s libSDL need libGL.so.1\n",
+                   "kzt_tb_callback");
+        const char *libs[] = {"libGL.so.1"};
+        AddNeededLib(my_context->maplib, &my_context->neededlibs, NULL, 0,
+                     1, libs, 1, my_context);
+    }
+    return lib;
+}
+
+static void kzt_process_guest_object_legacy(KztGuestObject *object)
+{
+    elfheader_t *h = NULL;
+
+    if (!kzt_begin_legacy_guest_object_processing(object))
+        return;
+
+    kzt_resolve_guest_object_path(object);
+    library_t *lib = NULL;
+    h = kzt_open_guest_elf(object);
+    if (!h)
+        return;
+
+    kzt_record_guest_load_range(object, h);
+
+    if (object->is_loader) {
+        if (object->map_start < object->map_end)
+            AddDebugInfo(LIB_EMULATED, object->object_name, object->map_start,
+                         object->map_end);
+        FreeElfHeader(&h);
+        SetGuestObjectState(my_context->guest_objects,
+                            (uintptr_t)object->link_map,
+                            GUEST_OBJECT_EMULATED);
+        return;
+    }
+
+    lib = kzt_register_guest_library_policy(object);
+
+    ElfHeadReFix(h, object->link_map->l_addr);
     collectX86free(h);
-    if(!x86free &&!strcmp(rbasename, libcName)) {
+    if(!x86free &&!strcmp(object->basename, libcName)) {
         struct malloc_map * m = SearchMallocMap(my_context, (char *)libcName);
         lsassert(m);
         x86free = m->freep;
         x86realloc = m->reallocp;
     }
-    if(!x86pthread_setcanceltype &&!strcmp(rbasename, libcName)) {
+    if(!x86pthread_setcanceltype &&!strcmp(object->basename, libcName)) {
         findx86pthread_setcanceltype(h);
     }
     AddElfHeader(my_context, h);
-    LoadNeededLibs(h, my_context->maplib, &my_context->neededlibs, NULL, 0, 0, my_context);
-    RelocateElf(my_context->maplib, NULL, 0, h);
-    RelocateElfPlt(my_context->maplib, NULL, 0, h);
-    if (lib) {
-        AddDebugInfo(LIB_WRAPPED, my_lm->l_name, my_lm->l_map_start, my_lm->l_map_end);
-    } else {
-        AddDebugInfo(LIB_EMULATED, my_lm->l_name, my_lm->l_map_start, my_lm->l_map_end);
+    if (LoadNeededLibs(h, my_context->maplib, &my_context->neededlibs, NULL,
+                       0, 0, my_context)) {
+        printf_log(LOG_INFO, "%s Error: loading needed libs for \"%s\"\n",
+                   "kzt_tb_callback", object->filename);
+        SetGuestObjectState(my_context->guest_objects,
+                            (uintptr_t)object->link_map,
+                            GUEST_OBJECT_FAILED);
+        return;
     }
+    if (RelocateElf(my_context->maplib, NULL, 0, h)) {
+        printf_log(LOG_INFO, "%s Error: relocating symbols for \"%s\"\n",
+                   "kzt_tb_callback", object->filename);
+        SetGuestObjectState(my_context->guest_objects,
+                            (uintptr_t)object->link_map,
+                            GUEST_OBJECT_FAILED);
+        return;
+    }
+    if (RelocateElfPlt(my_context->maplib, NULL, 0, h)) {
+        printf_log(LOG_INFO, "%s Error: relocating PLT symbols for \"%s\"\n",
+                   "kzt_tb_callback", object->filename);
+        SetGuestObjectState(my_context->guest_objects,
+                            (uintptr_t)object->link_map,
+                            GUEST_OBJECT_FAILED);
+        return;
+    }
+    if (lib) {
+        if (object->map_start < object->map_end)
+            AddDebugInfo(LIB_WRAPPED, object->object_name, object->map_start,
+                         object->map_end);
+        SetGuestObjectState(my_context->guest_objects,
+                            (uintptr_t)object->link_map,
+                            GUEST_OBJECT_WRAPPED);
+    } else {
+        if (object->map_start < object->map_end)
+            AddDebugInfo(LIB_EMULATED, object->object_name, object->map_start,
+                         object->map_end);
+        SetGuestObjectState(my_context->guest_objects,
+                            (uintptr_t)object->link_map,
+                            GUEST_OBJECT_EMULATED);
+    }
+}
+
+static void kzt_tb_callback(CPUX86State *env)
+{
+    KztGuestObject object = {0};
+
+    if (!kzt_register_callback_guest_object(env, &object))
+        return;
+
+    kzt_process_guest_object_legacy(&object);
 }
 static TranslationBlock* test_tb;
 static void test_x86free(CPUX86State *env)
@@ -2345,7 +2570,11 @@ static void finiReFlesh(elfheader_t* exech)
 {
     CPUState *cpu;
     static uint32 test_ld [2] = {0};
-    lsassert(my_context->mallocmapsize);
+    if (!my_context->mallocmapsize) {
+        printf_log(LOG_DEBUG, "%s skip malloc hook setup for %s: no malloc map\n",
+                   __func__, exech ? ElfPath(exech) : "<unknown>");
+        return;
+    }
     struct malloc_map * m;
 
     if (my_context->mallocmapsize == 1) {

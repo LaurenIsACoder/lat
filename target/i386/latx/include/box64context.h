@@ -15,6 +15,7 @@ typedef struct kh_symbol1map_s kh_symbol1map_t;
 typedef struct library_s library_t;
 typedef struct linkmap_s linkmap_t;
 typedef struct kh_threadstack_s kh_threadstack_t;
+typedef struct guest_object_registry_s guest_object_registry_t;
 typedef struct atfork_fnc_s {
     uintptr_t prepare;
     uintptr_t parent;
@@ -62,144 +63,16 @@ struct latx_kzt_debug {
     unsigned long map_end;
 };
 
-enum r_dir_status { unknown, nonexisting, existing };
-struct r_scope_elem
-{
-  /* Array of maps for the scope.  */
-  struct link_map_x64 **r_list;
-  /* Number of entries in the scope.  */
-  unsigned int r_nlist;
-};
-struct r_search_path_elem
-{
-    /* This link is only used in the `all_dirs' member of `r_search_path'.  */
-    struct r_search_path_elem *next;
-
-    /* Strings saying where the definition came from.  */
-    const char *what;
-    const char *where;
-
-    /* Basename for this search path element.  The string must end with
-       a slash character.  */
-    const char *dirname;
-    size_t dirnamelen;
-
-    enum r_dir_status status[0];
-};
-
-struct r_search_path_struct
-{
-    struct r_search_path_elem **dirs;
-    int malloced;
-};
-typedef Elf64_Half Elf64_Versym;
-typedef unsigned long dev_t;
-struct r_file_id
-{
-    dev_t dev;
-    ino64_t ino;
-};
-struct link_map_machine
-{
-    Elf64_Addr plt;
-    Elf64_Addr gotplt;
-    void *tlsdesc_table;
-};
-struct auditstate {
-    uintptr_t cookie;
-    unsigned int bindflags;
-};
-
-typedef long ptrdiff_t;
-
+/*
+ * Only the public ABI prefix from <link.h> is used here. Glibc fields after
+ * l_prev are private and their offsets change between loader versions.
+ */
 struct link_map_x64 {
     Elf64_Addr l_addr;
     char *l_name;
     Elf64_Dyn *l_ld;
     struct link_map_x64 *l_next;
     struct link_map_x64 *l_prev;
-    struct link_map_x64 *l_real;
-    Lmid_t l_ns;
-    struct libname_list *l_libname;
-    Elf64_Dyn *l_info[77];//get form gdb ptype    ---latx
-    const Elf64_Phdr *l_phdr;
-    Elf64_Addr l_entry;
-    Elf64_Half l_phnum;
-    Elf64_Half l_ldnum;
-    struct r_scope_elem l_searchlist;
-    struct r_scope_elem l_symbolic_searchlist;
-    struct link_map_x64 *l_loader;
-    struct r_found_version *l_versions;
-    unsigned int l_nversions;
-    Elf_Symndx l_nbuckets;
-    Elf32_Word l_gnu_bitmask_idxbits;
-    Elf32_Word l_gnu_shift;
-    const Elf64_Addr *l_gnu_bitmask;
-    union {
-        const Elf32_Word *l_gnu_buckets;
-        const Elf_Symndx *l_chain;
-    };
-    union {
-        const Elf32_Word *l_gnu_chain_zero;
-        const Elf_Symndx *l_buckets;
-    };
-    unsigned int l_direct_opencount;
-    enum {lt_executable, lt_library, lt_loaded} l_type : 2;
-    unsigned int l_relocated : 1;
-    unsigned int l_init_called : 1;
-    unsigned int l_global : 1;
-    unsigned int l_reserved : 2;
-    unsigned int l_phdr_allocated : 1;
-    unsigned int l_soname_added : 1;
-    unsigned int l_faked : 1;
-    unsigned int l_need_tls_init : 1;
-    unsigned int l_auditing : 1;
-    unsigned int l_audit_any_plt : 1;
-    unsigned int l_removed : 1;
-    unsigned int l_contiguous : 1;
-    unsigned int l_symbolic_in_local_scope : 1;
-    unsigned int l_free_initfini : 1;
-    enum {lc_unknown, lc_none, lc_ibt, lc_shstk = 4, lc_ibt_and_shstk = 6} l_cet : 3;
-    struct r_search_path_struct l_rpath_dirs;
-    struct reloc_result *l_reloc_result;
-    Elf64_Versym *l_versyms;
-    const char *l_origin;
-    Elf64_Addr l_map_start;
-    Elf64_Addr l_map_end;
-    Elf64_Addr l_text_end;
-    struct r_scope_elem *l_scope_mem[4];
-    size_t l_scope_max;
-    struct r_scope_elem **l_scope;
-    struct r_scope_elem *l_local_scope[2];
-    struct r_file_id l_file_id;
-    struct r_search_path_struct l_runpath_dirs;
-    struct link_map_x64 **l_initfini;
-    struct link_map_reldeps *l_reldeps;
-    unsigned int l_reldepsmax;
-    unsigned int l_used;
-    Elf64_Word l_feature_1;
-    Elf64_Word l_flags_1;
-    Elf64_Word l_flags;
-    int l_idx;
-    struct link_map_machine l_mach;
-    struct {
-        const Elf64_Sym *sym;
-        int type_class;
-        struct link_map *value;
-        const Elf64_Sym *ret;
-    } l_lookup_cache;
-    void *l_tls_initimage;
-    size_t l_tls_initimage_size;
-    size_t l_tls_blocksize;
-    size_t l_tls_align;
-    size_t l_tls_firstbyte_offset;
-    ptrdiff_t l_tls_offset;
-    size_t l_tls_modid;
-    size_t l_tls_dtor_count;
-    Elf64_Addr l_relro_addr;
-    size_t l_relro_size;
-    unsigned long long l_serial;
-    struct auditstate l_audit[];
 };
 struct malloc_map {
     void* mallocp;
@@ -238,6 +111,7 @@ typedef struct box64context_s {
     elfheader_t         **elfs;         // elf headers and memory
     int                 elfcap;
     int                 elfsize;        // number of elf loaded
+    guest_object_registry_t *guest_objects;
 
     struct malloc_map          **mallocmaps;         // elf filepath and memory
     int                 mallocmapcap;
