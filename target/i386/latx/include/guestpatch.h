@@ -13,6 +13,7 @@ typedef enum KztPatchDecisionReason {
     KZT_PATCH_REASON_LAZY_BINDING_DEFERRED,
     KZT_PATCH_REASON_LAZY_BINDING_RESOLVED,
     KZT_PATCH_REASON_PLT_RESOLVER,
+    KZT_PATCH_REASON_GUEST_OWNER_TARGET,
     KZT_PATCH_REASON_SYMBOL_MISSING,
     KZT_PATCH_REASON_UNSUPPORTED_RELOCATION,
 } KztPatchDecisionReason;
@@ -60,12 +61,15 @@ typedef struct KztPatchDecision {
     uintptr_t maplib_bridge;
     const char *maplib_owner;
     uintptr_t maplib_owner_base;
+    KztPatchOwnerRelation maplib_owner_relation;
     uintptr_t new_bridge;
     const char *new_owner;
     uintptr_t new_owner_base;
     uintptr_t guest_owner_bridge;
+    const char *guest_owner_library;
     const char *guest_owner;
     uintptr_t guest_owner_base;
+    KztPatchOwnerRelation guest_owner_relation;
     KztPatchDecisionReason reason;
     KztPatchOwnerRelation owner_relation;
     KztPatchShadowResult shadow_result;
@@ -73,7 +77,22 @@ typedef struct KztPatchDecision {
 } KztPatchDecision;
 
 void KztPatchDecisionInit(KztPatchDecision *decision);
+int KztPatchDecisionHasTarget(const KztPatchDecision *decision);
+void KztPatchDecisionSetMaplibTarget(KztPatchDecision *decision,
+                                     uintptr_t bridge,
+                                     const char *owner,
+                                     uintptr_t owner_base);
+void KztPatchDecisionSetGuestOwnerFailure(KztPatchDecision *decision,
+                                          KztPatchShadowResult failure);
+void KztPatchDecisionSetGuestOwnerTarget(KztPatchDecision *decision,
+                                         uintptr_t bridge,
+                                         const char *library,
+                                         const char *owner,
+                                         uintptr_t owner_base,
+                                         int select_target);
 void KztPatchDecisionSelectGuestOwnerTarget(KztPatchDecision *decision);
+KztPatchOwnerRelation KztPatchOwnerRelationForNames(const char *guest_object,
+                                                    const char *owner);
 const char *KztPatchDecisionReasonName(KztPatchDecisionReason reason);
 const char *KztPatchOwnerRelationName(KztPatchOwnerRelation relation);
 const char *KztPatchShadowResultName(KztPatchShadowResult result);
