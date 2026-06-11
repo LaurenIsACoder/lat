@@ -64,6 +64,7 @@ my_file = files(
   'fileutils.c',
   'elfmap.c',
   'guestdynamic.c',
+  'guestpatch.c',
   'elfparser.c',
   'elfloader.c',
   'elfload_dump.c',

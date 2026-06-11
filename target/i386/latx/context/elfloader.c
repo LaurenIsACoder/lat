@@ -30,6 +30,7 @@
 #include "library_private.h"
 #include "dictionnary.h"
 #include "symbols.h"
+#include "guestpatch.h"
 #include "lsenv.h"
 
 void* my__IO_2_1_stderr_ = NULL;
@@ -636,6 +637,123 @@ static int FindR64COPYRel(elfheader_t* h, const char* name, uintptr_t *offs, uin
 }
 */
 
+static void kzt_patch_fill_owner(lib_t *maplib, uintptr_t target,
+                                 const char **owner,
+                                 uintptr_t *owner_base)
+{
+    const char *name = NULL;
+    void *base = NULL;
+
+    *owner = NULL;
+    *owner_base = 0;
+
+    if (!maplib || !target)
+        return;
+
+    FindSymbolName(maplib, (void *)target, NULL, NULL, &name, &base, NULL);
+    *owner = name;
+    *owner_base = (uintptr_t)base;
+}
+
+static lib_t *kzt_resolve_global_symbol_for_patch(lib_t *maplib,
+                                                  lib_t *local_maplib,
+                                                  const char *symbol,
+                                                  uintptr_t *start,
+                                                  uintptr_t *end,
+                                                  elfheader_t *self,
+                                                  int version,
+                                                  const char *version_name)
+{
+    GetGlobalSymbolStartEnd(maplib, symbol, start, end, self, version,
+                            version_name);
+    if ((*start || *end) || !local_maplib)
+        return maplib;
+
+    GetGlobalSymbolStartEnd(local_maplib, symbol, start, end, self, version,
+                            version_name);
+    if (*start || *end)
+        return local_maplib;
+
+    return maplib;
+}
+
+static KztPatchDecision kzt_make_patch_decision(lib_t *old_owner_maplib,
+                                                lib_t *new_owner_maplib,
+                                                elfheader_t *head,
+                                                const Elf64_Rela *rela,
+                                                size_t relocation_index,
+                                                int relocation_type,
+                                                const char *symbol,
+                                                int version,
+                                                const char *version_name,
+                                                uintptr_t slot,
+                                                uintptr_t old_target,
+                                                uintptr_t new_target,
+                                                KztPatchDecisionReason reason)
+{
+    KztPatchDecision decision;
+
+    KztPatchDecisionInit(&decision);
+    decision.object = head ? ElfName(head) : NULL;
+    decision.object_base = head ? head->delta : 0;
+    decision.relocation = rela;
+    decision.relocation_index = relocation_index;
+    decision.relocation_type = relocation_type;
+    decision.symbol = symbol;
+    decision.symbol_version = version;
+    decision.symbol_version_name = version_name;
+    decision.slot = slot;
+    decision.old_target = old_target;
+    decision.new_bridge = new_target;
+    decision.reason = reason;
+
+    kzt_patch_fill_owner(old_owner_maplib, old_target, &decision.old_owner,
+                         &decision.old_owner_base);
+    kzt_patch_fill_owner(new_owner_maplib, new_target, &decision.new_owner,
+                         &decision.new_owner_base);
+
+    return decision;
+}
+
+static void kzt_emit_patch_decision(const KztPatchDecision *decision)
+{
+    char buffer[512];
+
+    if (!decision)
+        return;
+
+    KztFormatPatchDecision(buffer, sizeof(buffer), decision);
+    printf_log(LOG_DEBUG, "KZT patch planner: %s\n", buffer);
+}
+
+static void kzt_apply_patch_decision(const KztPatchDecision *decision)
+{
+    kzt_emit_patch_decision(decision);
+    *(uintptr_t *)decision->slot = decision->new_bridge;
+}
+
+static void kzt_log_patch_decision(lib_t *old_owner_maplib,
+                                   lib_t *new_owner_maplib,
+                                   elfheader_t *head,
+                                   const Elf64_Rela *rela,
+                                   size_t relocation_index,
+                                   int relocation_type,
+                                   const char *symbol,
+                                   int version,
+                                   const char *version_name,
+                                   uintptr_t slot,
+                                   uintptr_t old_target,
+                                   uintptr_t new_target,
+                                   KztPatchDecisionReason reason)
+{
+    KztPatchDecision decision = kzt_make_patch_decision(
+        old_owner_maplib, new_owner_maplib, head, rela, relocation_index,
+        relocation_type, symbol, version, version_name, slot, old_target,
+        new_target, reason);
+
+    kzt_emit_patch_decision(&decision);
+}
+
 int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t* head, int cnt, Elf64_Rela *rela, int* need_resolv)
 {
 //    int ret_ok = 0;
@@ -651,6 +769,7 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
         uint64_t *p = (uint64_t*)(rela[i].r_offset + head->delta);
         uintptr_t offs = 0;
         uintptr_t end = 0;
+        lib_t *target_maplib = maplib;
         int version = head->VerSym?((Elf64_Half*)((uintptr_t)head->VerSym+head->delta))[ELF64_R_SYM(rela[i].r_info)]:-1;
         if(version!=-1) version &=0x7fff;
         const char* vername = GetSymbolVersion(head, version);
@@ -666,10 +785,9 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
             }*/
             // so weak symbol are the one left
             if(!offs && !end) {
-                GetGlobalSymbolStartEnd(maplib, symname, &offs, &end, head, version, vername);
-                if(!offs && !end && local_maplib) {
-                    GetGlobalSymbolStartEnd(local_maplib, symname, &offs, &end, head, version, vername);
-                }
+                target_maplib = kzt_resolve_global_symbol_for_patch(
+                    maplib, local_maplib, symname, &offs, &end, head,
+                    version, vername);
             }
         }
 
@@ -684,7 +802,18 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
                    // }
                     if (offs) {
                         printf_log(LOG_INFO, "Apply %s R_X86_64_GLOB_DAT @%p (%p -> %p) on sym=%s (ver=%d/%s)\n", (bind==STB_LOCAL)?"Local":"Global", p, (void*)(p?(*p):0), (void*)offs, symname, version, vername?vername:"(none)");
-                        *p = offs/* + rela[i].r_addend*/;   // not addend it seems
+                        KztPatchDecision decision = kzt_make_patch_decision(
+                            maplib, target_maplib, head, &rela[i], i, t,
+                            symname, version, vername, (uintptr_t)p, *p, offs,
+                            bind == STB_LOCAL
+                                ? KZT_PATCH_REASON_LOCAL_SYMBOL
+                                : KZT_PATCH_REASON_GLOBAL_SYMBOL);
+                        kzt_apply_patch_decision(&decision);
+                    } else {
+                        kzt_log_patch_decision(
+                            maplib, target_maplib, head, &rela[i], i, t,
+                            symname, version, vername, (uintptr_t)p,
+                            p ? *p : 0, 0, KZT_PATCH_REASON_SYMBOL_MISSING);
                     }
                 break;
             case R_X86_64_JUMP_SLOT:
@@ -699,15 +828,31 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
                     if (offs){
                         if(p) {
                             printf_log(LOG_INFO, "RelocateElfRELA : Apply %s R_X86_64_JUMP_SLOT @%p with sym=%s (%p -> %p)\n", (bind==STB_LOCAL)?"Local":"Global", p, symname, *(void**)p, (void*)(offs+rela[i].r_addend));
-                            *p =(uint64_t) (offs + rela[i].r_addend);
+                            KztPatchDecision decision = kzt_make_patch_decision(
+                                maplib, target_maplib, head, &rela[i], i, t,
+                                symname, version, vername, (uintptr_t)p, *p,
+                                offs + rela[i].r_addend,
+                                bind == STB_LOCAL
+                                    ? KZT_PATCH_REASON_LOCAL_SYMBOL
+                                    : KZT_PATCH_REASON_GLOBAL_SYMBOL);
+                            kzt_apply_patch_decision(&decision);
                         } else {
                             printf_log(LOG_INFO, "Warning, Symbol %s found, but Jump Slot Offset is NULL \n", symname);
                         }
+                    } else {
+                        kzt_log_patch_decision(
+                            maplib, target_maplib, head, &rela[i], i, t,
+                            symname, version, vername, (uintptr_t)p,
+                            p ? *p : 0, 0, KZT_PATCH_REASON_SYMBOL_MISSING);
                     }
                 } else {
                     printf_log(LOG_INFO, "Preparing (if needed) %s R_X86_64_JUMP_SLOT @%p (0x%lx->0x%0lx) with sym=%s to be apply later (addend=%ld)\n", 
                         (bind==STB_LOCAL)?"Local":"Global", p, *p, *p+head->delta, symname, rela[i].r_addend);
-                    *p += head->delta;
+                    KztPatchDecision decision = kzt_make_patch_decision(
+                        maplib, maplib, head, &rela[i], i, t, symname,
+                        version, vername, (uintptr_t)p, *p,
+                        *p + head->delta, KZT_PATCH_REASON_LAZY_BINDING_DEFERRED);
+                    kzt_apply_patch_decision(&decision);
                     *need_resolv = 1;
                 }
                 break;
@@ -759,17 +904,37 @@ int RelocateElfPlt(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t*
                 if(dl_runtime_resolver ==~0LL){
                     dl_runtime_resolver =  *(uintptr_t*)(head->pltgot+head->delta+16);
                 }
-                *(uintptr_t*)(head->pltgot+head->delta+16) = pltResolver;
+                KztPatchDecision resolver_decision = kzt_make_patch_decision(
+                    maplib, maplib, head, NULL, 0, 0, "plt-resolver", -1, NULL,
+                    head->pltgot + head->delta + 16,
+                    *(uintptr_t *)(head->pltgot + head->delta + 16),
+                    pltResolver, KZT_PATCH_REASON_PLT_RESOLVER);
+                kzt_apply_patch_decision(&resolver_decision);
                 head->self_link_map = *(uintptr_t*)(head->pltgot+head->delta+8);
-                *(uintptr_t*)(head->pltgot+head->delta+8) = (uintptr_t)head;
+                KztPatchDecision link_map_decision = kzt_make_patch_decision(
+                    maplib, maplib, head, NULL, 0, 0, "plt-link-map", -1, NULL,
+                    head->pltgot + head->delta + 8,
+                    head->self_link_map, (uintptr_t)head,
+                    KZT_PATCH_REASON_PLT_RESOLVER);
+                kzt_apply_patch_decision(&link_map_decision);
                 printf_log(LOG_INFO, "PLT Resolver injected in plt.got at %p\n", (void*)(head->pltgot+head->delta+16));
             } else if(head->got) {
                 if(dl_runtime_resolver ==~0LL){
                     dl_runtime_resolver =  *(uintptr_t*)(head->got+head->delta+16);
                 }
-                *(uintptr_t*)(head->got+head->delta+16) = pltResolver;
+                KztPatchDecision resolver_decision = kzt_make_patch_decision(
+                    maplib, maplib, head, NULL, 0, 0, "plt-resolver", -1, NULL,
+                    head->got + head->delta + 16,
+                    *(uintptr_t *)(head->got + head->delta + 16),
+                    pltResolver, KZT_PATCH_REASON_PLT_RESOLVER);
+                kzt_apply_patch_decision(&resolver_decision);
                 head->self_link_map = *(uintptr_t*)(head->got+head->delta+8);
-                *(uintptr_t*)(head->got+head->delta+8) = (uintptr_t)head;
+                KztPatchDecision link_map_decision = kzt_make_patch_decision(
+                    maplib, maplib, head, NULL, 0, 0, "plt-link-map", -1, NULL,
+                    head->got + head->delta + 8,
+                    head->self_link_map, (uintptr_t)head,
+                    KZT_PATCH_REASON_PLT_RESOLVER);
+                kzt_apply_patch_decision(&link_map_decision);
                 printf_log(LOG_INFO, "PLT Resolver injected in got at %p\n", (void*)(head->got+head->delta+16));
             }
         }
@@ -1316,12 +1481,12 @@ void PltResolver(void)
 
     library_t* lib = h->lib;
     lib_t* local_maplib = GetMaplib(lib);
-    GetGlobalSymbolStartEnd(my_context->maplib, symname, &offs, &end, h, version, vername);
-    if(!offs && !end && local_maplib) {
-        GetGlobalSymbolStartEnd(local_maplib, symname, &offs, &end, h, version, vername);
-    }
+    lib_t *target_maplib = kzt_resolve_global_symbol_for_patch(
+        my_context->maplib, local_maplib, symname, &offs, &end, h,
+        version, vername);
     if(!offs && !end && !version)
-        GetGlobalSymbolStartEnd(my_context->maplib, symname, &offs, &end, h, -1, NULL);
+        target_maplib = kzt_resolve_global_symbol_for_patch(
+            my_context->maplib, NULL, symname, &offs, &end, h, -1, NULL);
 
     if (!offs) {
 //        printf_log(LOG_INFO, "Error: PltResolver: Symbol %s(ver %d: %s%s%s) not found, cannot apply R_X86_64_JUMP_SLOT %p (%p) in %s\n", symname, version, symname, vername?"@":"", vername?vername:"", p, *(void**)p, h->name);
@@ -1334,7 +1499,12 @@ void PltResolver(void)
         offs = (uintptr_t)getAlternate((void*)offs);
         if(p) {
             printf_log(LOG_INFO, "            Apply %s R_X86_64_JUMP_SLOT %p with sym=%s(ver %d: %s%s%s) (%p -> %p / %s)\n", (bind==STB_LOCAL)?"Local":"Global", p, symname, version, symname, vername?"@":"", vername?vername:"",*(void**)p, (void*)offs, ElfName(FindElfAddress(my_context, offs)));
-            *p = offs;
+            KztPatchDecision decision = kzt_make_patch_decision(
+                my_context->maplib, target_maplib, h, rel, slot,
+                R_X86_64_JUMP_SLOT, symname, version, vername,
+                (uintptr_t)p, *p, offs,
+                KZT_PATCH_REASON_LAZY_BINDING_RESOLVED);
+            kzt_apply_patch_decision(&decision);
         } else {
             printf_log(LOG_INFO, "PltResolver: Warning, Symbol %s(ver %d: %s%s%s) found, but Jump Slot Offset is NULL \n", symname, version, symname, vername?"@":"", vername?vername:"");
         }
