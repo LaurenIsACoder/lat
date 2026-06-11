@@ -12,6 +12,7 @@
 #include "elfmap.h"
 #include "elfloader.h"
 #include "elfloader_private.h"
+#include "guestdynamic.h"
 #include "guestobject.h"
 #include <sys/epoll.h>
 #include <sys/sem.h>
@@ -2239,7 +2240,20 @@ typedef struct KztGuestObject {
     int is_loader;
     uintptr_t map_start;
     uintptr_t map_end;
+    KztDynamicView dynamic_view;
+    KztDynamicInfo dynamic_info;
+    int has_dynamic_info;
 } KztGuestObject;
+
+static int kzt_guest_dynamic_range_is_readable(const void *addr, size_t size,
+                                               void *opaque)
+{
+    (void)opaque;
+    if (!addr)
+        return 0;
+
+    return access_ok_untagged(VERIFY_READ, (abi_ulong)(uintptr_t)addr, size);
+}
 
 static struct link_map_x64 *kzt_get_callback_link_map(CPUX86State *env)
 {
@@ -2285,6 +2299,23 @@ static char *kzt_get_object_name(struct link_map_x64 *my_lm)
     return object_name;
 }
 
+static void kzt_parse_guest_object_dynamic(KztGuestObject *object)
+{
+    KztParseDynamicView(&object->dynamic_view, object->link_map->l_ld,
+                        KZT_DYNAMIC_SCAN_MAX);
+
+    if (object->dynamic_view.status != KZT_DYNAMIC_VIEW_READY)
+        return;
+
+    KztBuildDynamicInfo(&object->dynamic_info, &object->dynamic_view);
+    KztDynamicInfoSetRangeValidator(&object->dynamic_info,
+                                    kzt_guest_dynamic_range_is_readable,
+                                    NULL);
+    KztResolveDynamicSymbolCount(&object->dynamic_info,
+                                 object->link_map->l_addr);
+    object->has_dynamic_info = 1;
+}
+
 static int kzt_register_callback_guest_object(CPUX86State *env,
                                               KztGuestObject *object)
 {
@@ -2318,6 +2349,7 @@ static int kzt_register_callback_guest_object(CPUX86State *env,
                    object->link_map->l_ld, object->object_name);
     }
 
+    kzt_parse_guest_object_dynamic(object);
     return 1;
 }
 
@@ -2377,6 +2409,964 @@ static elfheader_t *kzt_open_guest_elf(KztGuestObject *object)
     return h;
 }
 
+static int kzt_dynamic_ptr_matches(uintptr_t old_value, uintptr_t new_value,
+                                   uintptr_t load_bias)
+{
+    if (old_value == new_value)
+        return 1;
+    if (load_bias && old_value && old_value <= UINTPTR_MAX - load_bias
+        && old_value + load_bias == new_value)
+        return 1;
+    if (load_bias && new_value >= load_bias
+        && new_value - load_bias == old_value)
+        return 1;
+    return 0;
+}
+
+static int kzt_dynamic_note_size_mismatch(const char *name, size_t old_value,
+                                          size_t new_value)
+{
+    if (old_value == new_value)
+        return 0;
+
+    printf_log(LOG_INFO,
+               "%s Dynamic mismatch %s: old=0x%zx new=0x%zx\n",
+               "kzt_tb_callback", name, old_value, new_value);
+    return 1;
+}
+
+static int kzt_dynamic_note_ptr_mismatch(const char *name, uintptr_t old_value,
+                                         uintptr_t new_value,
+                                         uintptr_t load_bias)
+{
+    if (kzt_dynamic_ptr_matches(old_value, new_value, load_bias))
+        return 0;
+
+    printf_log(LOG_INFO,
+               "%s Dynamic mismatch %s: old=0x%lx new=0x%lx bias=0x%lx\n",
+               "kzt_tb_callback", name, old_value, new_value, load_bias);
+    return 1;
+}
+
+static int kzt_dynamic_note_error_mismatch(const char *name,
+                                           unsigned old_errors,
+                                           unsigned new_errors)
+{
+    if (old_errors == new_errors)
+        return 0;
+
+    printf_log(LOG_INFO,
+               "%s Dynamic mismatch %s: old=0x%x new=0x%x\n",
+               "kzt_tb_callback", name, old_errors, new_errors);
+    return 1;
+}
+
+#define KZT_DYNAMIC_SYMBOL_MISMATCH_LOG_LIMIT 32
+
+static int kzt_compare_dynamic_string_tag(const char *name, int tag,
+                                          KztDynamicView *old_view,
+                                          KztDynamicStringTable *old_strtab,
+                                          KztDynamicView *new_view,
+                                          KztDynamicStringTable *new_strtab)
+{
+    size_t new_index = 0;
+    int mismatches = 0;
+
+    for (size_t old_index = 0; old_index < old_view->entry_count;) {
+        KztDynamicStringEntry old_entry;
+        KztDynamicStringEntry new_entry;
+
+        if (!KztNextDynamicString(old_view, tag, &old_index, old_strtab,
+                                  &old_entry))
+            break;
+
+        if (!KztNextDynamicString(new_view, tag, &new_index, new_strtab,
+                                  &new_entry)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic mismatch %s: missing new entry for old offset=0x%lx\n",
+                       "kzt_tb_callback", name, old_entry.offset);
+            ++mismatches;
+            continue;
+        }
+
+        if (!old_entry.value || !new_entry.value) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic mismatch %s: invalid string offset old=0x%lx new=0x%lx\n",
+                       "kzt_tb_callback", name, old_entry.offset,
+                       new_entry.offset);
+            ++mismatches;
+            continue;
+        }
+        if (strcmp(old_entry.value, new_entry.value)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic mismatch %s: old=\"%s\" new=\"%s\"\n",
+                       "kzt_tb_callback", name, old_entry.value,
+                       new_entry.value);
+            ++mismatches;
+        }
+    }
+
+    return mismatches;
+}
+
+static int kzt_note_dynamic_symbol_mismatch(const char *name, size_t index,
+                                            int *mismatches)
+{
+    ++*mismatches;
+    if (*mismatches == KZT_DYNAMIC_SYMBOL_MISMATCH_LOG_LIMIT) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic symbol compare reached mismatch log limit at %s[%zu]\n",
+                   "kzt_tb_callback", name, index);
+    }
+    return *mismatches >= KZT_DYNAMIC_SYMBOL_MISMATCH_LOG_LIMIT;
+}
+
+static int kzt_compare_dynamic_symbols(elfheader_t *h,
+                                       KztDynamicInfo *old_info,
+                                       KztDynamicInfo *new_info,
+                                       uintptr_t load_bias)
+{
+    KztDynamicSymbolTable old_symbols = {
+        .symbols = h->DynSym,
+        .count = old_info->dynsym_count,
+        .strings = {
+            .data = h->DynStr,
+            .size = h->szDynStrTab,
+        },
+    };
+    KztDynamicSymbolTable new_symbols;
+    int has_new_symbols =
+        KztDynamicSymbolTableFromInfo(new_info, load_bias, &new_symbols);
+    size_t count = old_symbols.count < new_symbols.count
+                       ? old_symbols.count
+                       : new_symbols.count;
+    int mismatches = 0;
+
+    if (!old_info->has_dynsym_count || !new_info->has_dynsym_count
+        || !old_symbols.symbols || !has_new_symbols
+        || !old_symbols.strings.data || !new_symbols.strings.data) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic symbol compare skipped: old_symbols=%p old_count=%zu new_symbols=%p new_count=%zu\n",
+                   "kzt_tb_callback", old_symbols.symbols, old_symbols.count,
+                   new_symbols.symbols, new_symbols.count);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        KztDynamicSymbolEntry old_entry;
+        KztDynamicSymbolEntry new_entry;
+
+        if (!KztDynamicSymbolAt(&old_symbols, i, &old_entry)
+            || !KztDynamicSymbolAt(&new_symbols, i, &new_entry)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic symbol mismatch entry[%zu]: missing symbol\n",
+                       "kzt_tb_callback", i);
+            if (kzt_note_dynamic_symbol_mismatch("entry", i, &mismatches))
+                break;
+            continue;
+        }
+
+        if (!old_entry.name || !new_entry.name) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic symbol mismatch name[%zu]: old_off=0x%x new_off=0x%x\n",
+                       "kzt_tb_callback", i, old_entry.symbol->st_name,
+                       new_entry.symbol->st_name);
+            if (kzt_note_dynamic_symbol_mismatch("name", i, &mismatches))
+                break;
+            continue;
+        }
+
+        if (strcmp(old_entry.name, new_entry.name)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic symbol mismatch name[%zu]: old=\"%s\" new=\"%s\"\n",
+                       "kzt_tb_callback", i, old_entry.name,
+                       new_entry.name);
+            if (kzt_note_dynamic_symbol_mismatch("name", i, &mismatches))
+                break;
+        }
+        if (old_entry.symbol->st_info != new_entry.symbol->st_info) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic symbol mismatch info[%zu]: old=0x%x new=0x%x\n",
+                       "kzt_tb_callback", i, old_entry.symbol->st_info,
+                       new_entry.symbol->st_info);
+            if (kzt_note_dynamic_symbol_mismatch("info", i, &mismatches))
+                break;
+        }
+        if (old_entry.symbol->st_other != new_entry.symbol->st_other) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic symbol mismatch other[%zu]: old=0x%x new=0x%x\n",
+                       "kzt_tb_callback", i, old_entry.symbol->st_other,
+                       new_entry.symbol->st_other);
+            if (kzt_note_dynamic_symbol_mismatch("other", i, &mismatches))
+                break;
+        }
+        if (old_entry.symbol->st_shndx != new_entry.symbol->st_shndx) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic symbol mismatch shndx[%zu]: old=0x%x new=0x%x\n",
+                       "kzt_tb_callback", i, old_entry.symbol->st_shndx,
+                       new_entry.symbol->st_shndx);
+            if (kzt_note_dynamic_symbol_mismatch("shndx", i, &mismatches))
+                break;
+        }
+        if (!kzt_dynamic_ptr_matches(old_entry.symbol->st_value,
+                                     new_entry.symbol->st_value,
+                                     load_bias)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic symbol mismatch value[%zu]: old=0x%lx new=0x%lx bias=0x%lx\n",
+                       "kzt_tb_callback", i, old_entry.symbol->st_value,
+                       new_entry.symbol->st_value, load_bias);
+            if (kzt_note_dynamic_symbol_mismatch("value", i, &mismatches))
+                break;
+        }
+        if (old_entry.symbol->st_size != new_entry.symbol->st_size) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic symbol mismatch size[%zu]: old=0x%lx new=0x%lx\n",
+                       "kzt_tb_callback", i, old_entry.symbol->st_size,
+                       new_entry.symbol->st_size);
+            if (kzt_note_dynamic_symbol_mismatch("size", i, &mismatches))
+                break;
+        }
+    }
+
+    return mismatches;
+}
+
+static int kzt_note_dynamic_relocation_mismatch(const char *name,
+                                                size_t index,
+                                                int *mismatches)
+{
+    ++*mismatches;
+    if (*mismatches == KZT_DYNAMIC_SYMBOL_MISMATCH_LOG_LIMIT) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic relocation compare reached mismatch log limit at %s[%zu]\n",
+                   "kzt_tb_callback", name, index);
+    }
+    return *mismatches >= KZT_DYNAMIC_SYMBOL_MISMATCH_LOG_LIMIT;
+}
+
+static int kzt_compare_dynamic_relocation_table(const char *name,
+                                                KztDynamicInfo *new_info,
+                                                uintptr_t old_ptr,
+                                                int old_entry_size,
+                                                size_t old_count,
+                                                uintptr_t new_ptr,
+                                                int new_entry_size,
+                                                size_t new_count,
+                                                uintptr_t load_bias)
+{
+    KztDynamicRelocationTable old_table = {
+        .entries = KztDynamicRelocationsFromPtr(old_ptr, load_bias),
+        .count = old_count,
+        .entry_size = old_entry_size,
+    };
+    KztDynamicRelocationTable new_table = {
+        .entries = KztDynamicRelocationsFromInfo(
+            new_info, new_ptr, load_bias, new_count, new_entry_size),
+        .count = new_count,
+        .entry_size = new_entry_size,
+    };
+    size_t count = old_count < new_count ? old_count : new_count;
+    int mismatches = 0;
+
+    if (!count)
+        return 0;
+
+    if (old_entry_size != new_entry_size) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic relocation compare skipped %s: old_entry=0x%x new_entry=0x%x\n",
+                   "kzt_tb_callback", name, old_entry_size, new_entry_size);
+        return 0;
+    }
+
+    if (!old_table.entries || !new_table.entries) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic relocation compare skipped %s: old=%p new=%p old_count=%zu new_count=%zu\n",
+                   "kzt_tb_callback", name, old_table.entries,
+                   new_table.entries, old_count, new_count);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        KztDynamicRelocationEntry old_entry;
+        KztDynamicRelocationEntry new_entry;
+
+        if (!KztDynamicRelocationAt(&old_table, i, &old_entry)
+            || !KztDynamicRelocationAt(&new_table, i, &new_entry)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic relocation mismatch %s[%zu]: missing entry\n",
+                       "kzt_tb_callback", name, i);
+            if (kzt_note_dynamic_relocation_mismatch(name, i,
+                                                     &mismatches))
+                break;
+            continue;
+        }
+
+        if (!kzt_dynamic_ptr_matches(old_entry.offset, new_entry.offset,
+                                     load_bias)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic relocation mismatch %s[%zu].offset: old=0x%lx new=0x%lx bias=0x%lx\n",
+                       "kzt_tb_callback", name, i, old_entry.offset,
+                       new_entry.offset, load_bias);
+            if (kzt_note_dynamic_relocation_mismatch(name, i,
+                                                     &mismatches))
+                break;
+        }
+        if (old_entry.info != new_entry.info) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic relocation mismatch %s[%zu].info: old=0x%lx new=0x%lx\n",
+                       "kzt_tb_callback", name, i,
+                       (unsigned long)old_entry.info,
+                       (unsigned long)new_entry.info);
+            if (kzt_note_dynamic_relocation_mismatch(name, i,
+                                                     &mismatches))
+                break;
+        }
+        if (old_entry.has_addend != new_entry.has_addend) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic relocation mismatch %s[%zu].addend-kind: old=%d new=%d\n",
+                       "kzt_tb_callback", name, i, old_entry.has_addend,
+                       new_entry.has_addend);
+            if (kzt_note_dynamic_relocation_mismatch(name, i,
+                                                     &mismatches))
+                break;
+        }
+        if (old_entry.has_addend && new_entry.has_addend
+            && old_entry.addend != new_entry.addend) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic relocation mismatch %s[%zu].addend: old=0x%lx new=0x%lx\n",
+                       "kzt_tb_callback", name, i,
+                       (unsigned long)old_entry.addend,
+                       (unsigned long)new_entry.addend);
+            if (kzt_note_dynamic_relocation_mismatch(name, i,
+                                                     &mismatches))
+                break;
+        }
+    }
+
+    return mismatches;
+}
+
+static int kzt_compare_dynamic_relocations(KztDynamicInfo *old_info,
+                                           KztDynamicInfo *new_info,
+                                           uintptr_t load_bias)
+{
+    int mismatches = 0;
+
+    if (old_info->has_rel_count && new_info->has_rel_count) {
+        mismatches += kzt_compare_dynamic_relocation_table(
+            "DT_REL", new_info, old_info->rel, old_info->relent,
+            old_info->rel_count, new_info->rel, new_info->relent,
+            new_info->rel_count, load_bias);
+    }
+
+    if (old_info->has_rela_count && new_info->has_rela_count) {
+        mismatches += kzt_compare_dynamic_relocation_table(
+            "DT_RELA", new_info, old_info->rela, old_info->relaent,
+            old_info->rela_count, new_info->rela, new_info->relaent,
+            new_info->rela_count, load_bias);
+    }
+
+    if (old_info->has_plt_count && new_info->has_plt_count) {
+        mismatches += kzt_compare_dynamic_relocation_table(
+            "DT_JMPREL", new_info, old_info->jmprel, old_info->pltent,
+            old_info->plt_count, new_info->jmprel, new_info->pltent,
+            new_info->plt_count, load_bias);
+    }
+
+    return mismatches;
+}
+
+static int kzt_compare_dynamic_versym(elfheader_t *h,
+                                      KztDynamicInfo *old_info,
+                                      KztDynamicInfo *new_info,
+                                      uintptr_t load_bias)
+{
+    const Elf64_Half *old_versym =
+        KztDynamicVersymFromPtr((uintptr_t)h->VerSym, load_bias);
+    const Elf64_Half *new_versym =
+        KztDynamicVersymFromInfo(new_info, load_bias);
+    size_t count = old_info->dynsym_count < new_info->dynsym_count
+                       ? old_info->dynsym_count
+                       : new_info->dynsym_count;
+    int mismatches = 0;
+
+    if (!old_info->has_dynsym_count || !new_info->has_dynsym_count
+        || !old_versym || !new_versym) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic versym compare skipped: old=%p new=%p old_count=%zu new_count=%zu\n",
+                   "kzt_tb_callback", old_versym, new_versym,
+                   old_info->dynsym_count, new_info->dynsym_count);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        if (old_versym[i] == new_versym[i])
+            continue;
+
+        printf_log(LOG_INFO,
+                   "%s Dynamic versym mismatch[%zu]: old=0x%x new=0x%x\n",
+                   "kzt_tb_callback", i, old_versym[i], new_versym[i]);
+        if (kzt_note_dynamic_symbol_mismatch("versym", i, &mismatches))
+            break;
+    }
+
+    return mismatches;
+}
+
+static int kzt_compare_dynamic_verneed(elfheader_t *h,
+                                       KztDynamicInfo *old_info,
+                                       KztDynamicInfo *new_info,
+                                       uintptr_t load_bias)
+{
+    const Elf64_Verneed *old_base =
+        KztDynamicVerneedFromPtr((uintptr_t)h->VerNeed, load_bias);
+    const Elf64_Verneed *new_base =
+        KztDynamicVerneedFromInfo(new_info, load_bias);
+    KztDynamicStringTable old_strtab = {
+        .data = h->DynStr,
+        .size = h->szDynStrTab,
+    };
+    KztDynamicStringTable new_strtab;
+    size_t old_count = old_info->verneed_count > 0
+                           ? (size_t)old_info->verneed_count
+                           : 0;
+    size_t new_count = new_info->verneed_count > 0
+                           ? (size_t)new_info->verneed_count
+                           : 0;
+    size_t count = old_count < new_count ? old_count : new_count;
+    int mismatches = 0;
+
+    KztDynamicStringTableFromInfo(new_info, load_bias, &new_strtab);
+
+    if (!old_base || !new_base || !old_strtab.data || !new_strtab.data) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic verneed compare skipped: old=%p new=%p old_count=%zu new_count=%zu\n",
+                   "kzt_tb_callback", old_base, new_base, old_count,
+                   new_count);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        KztDynamicVerneedEntry old_need;
+        KztDynamicVerneedEntry new_need;
+        size_t aux_count;
+
+        if (!KztDynamicVerneedAt(old_base, i, &old_strtab, &old_need)
+            || !KztDynamicVerneedAtFromInfo(new_info, new_base, i,
+                                            &new_strtab, &new_need)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verneed mismatch entry[%zu]: missing record\n",
+                       "kzt_tb_callback", i);
+            if (kzt_note_dynamic_symbol_mismatch("verneed", i,
+                                                 &mismatches))
+                break;
+            continue;
+        }
+
+        if (!old_need.file || !new_need.file
+            || strcmp(old_need.file, new_need.file)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verneed mismatch file[%zu]: old=\"%s\" new=\"%s\"\n",
+                       "kzt_tb_callback", i,
+                       old_need.file ? old_need.file : "<invalid>",
+                       new_need.file ? new_need.file : "<invalid>");
+            if (kzt_note_dynamic_symbol_mismatch("verneed-file", i,
+                                                 &mismatches))
+                break;
+        }
+        if (old_need.record->vn_version != new_need.record->vn_version) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verneed mismatch version[%zu]: old=0x%x new=0x%x\n",
+                       "kzt_tb_callback", i, old_need.record->vn_version,
+                       new_need.record->vn_version);
+            if (kzt_note_dynamic_symbol_mismatch("verneed-version", i,
+                                                 &mismatches))
+                break;
+        }
+        if (old_need.record->vn_cnt != new_need.record->vn_cnt) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verneed mismatch aux-count[%zu]: old=0x%x new=0x%x\n",
+                       "kzt_tb_callback", i, old_need.record->vn_cnt,
+                       new_need.record->vn_cnt);
+            if (kzt_note_dynamic_symbol_mismatch("verneed-count", i,
+                                                 &mismatches))
+                break;
+        }
+
+        aux_count = old_need.record->vn_cnt < new_need.record->vn_cnt
+                        ? old_need.record->vn_cnt
+                        : new_need.record->vn_cnt;
+        for (size_t j = 0; j < aux_count; ++j) {
+            KztDynamicVernauxEntry old_aux;
+            KztDynamicVernauxEntry new_aux;
+
+            if (!KztDynamicVernauxAt(&old_need, j, &old_strtab, &old_aux)
+                || !KztDynamicVernauxAt(&new_need, j, &new_strtab,
+                                        &new_aux)) {
+                printf_log(LOG_INFO,
+                           "%s Dynamic verneed mismatch aux[%zu:%zu]: missing record\n",
+                           "kzt_tb_callback", i, j);
+                if (kzt_note_dynamic_symbol_mismatch("vernaux", i,
+                                                     &mismatches))
+                    return mismatches;
+                continue;
+            }
+
+            if (!old_aux.name || !new_aux.name
+                || strcmp(old_aux.name, new_aux.name)) {
+                printf_log(LOG_INFO,
+                           "%s Dynamic verneed mismatch aux-name[%zu:%zu]: old=\"%s\" new=\"%s\"\n",
+                           "kzt_tb_callback", i, j,
+                           old_aux.name ? old_aux.name : "<invalid>",
+                           new_aux.name ? new_aux.name : "<invalid>");
+                if (kzt_note_dynamic_symbol_mismatch("vernaux-name", i,
+                                                     &mismatches))
+                    return mismatches;
+            }
+            if (old_aux.record->vna_hash != new_aux.record->vna_hash) {
+                printf_log(LOG_INFO,
+                           "%s Dynamic verneed mismatch aux-hash[%zu:%zu]: old=0x%x new=0x%x\n",
+                           "kzt_tb_callback", i, j,
+                           old_aux.record->vna_hash,
+                           new_aux.record->vna_hash);
+                if (kzt_note_dynamic_symbol_mismatch("vernaux-hash", i,
+                                                     &mismatches))
+                    return mismatches;
+            }
+            if (old_aux.record->vna_flags != new_aux.record->vna_flags) {
+                printf_log(LOG_INFO,
+                           "%s Dynamic verneed mismatch aux-flags[%zu:%zu]: old=0x%x new=0x%x\n",
+                           "kzt_tb_callback", i, j,
+                           old_aux.record->vna_flags,
+                           new_aux.record->vna_flags);
+                if (kzt_note_dynamic_symbol_mismatch("vernaux-flags", i,
+                                                     &mismatches))
+                    return mismatches;
+            }
+            if (old_aux.record->vna_other != new_aux.record->vna_other) {
+                printf_log(LOG_INFO,
+                           "%s Dynamic verneed mismatch aux-other[%zu:%zu]: old=0x%x new=0x%x\n",
+                           "kzt_tb_callback", i, j,
+                           old_aux.record->vna_other,
+                           new_aux.record->vna_other);
+                if (kzt_note_dynamic_symbol_mismatch("vernaux-other", i,
+                                                     &mismatches))
+                    return mismatches;
+            }
+        }
+    }
+
+    return mismatches;
+}
+
+static int kzt_compare_dynamic_verdef(elfheader_t *h,
+                                      KztDynamicInfo *old_info,
+                                      KztDynamicInfo *new_info,
+                                      uintptr_t load_bias)
+{
+    const Elf64_Verdef *old_base =
+        KztDynamicVerdefFromPtr((uintptr_t)h->VerDef, load_bias);
+    const Elf64_Verdef *new_base =
+        KztDynamicVerdefFromInfo(new_info, load_bias);
+    KztDynamicStringTable old_strtab = {
+        .data = h->DynStr,
+        .size = h->szDynStrTab,
+    };
+    KztDynamicStringTable new_strtab;
+    size_t old_count = old_info->verdef_count > 0
+                           ? (size_t)old_info->verdef_count
+                           : 0;
+    size_t new_count = new_info->verdef_count > 0
+                           ? (size_t)new_info->verdef_count
+                           : 0;
+    size_t count = old_count < new_count ? old_count : new_count;
+    int mismatches = 0;
+
+    KztDynamicStringTableFromInfo(new_info, load_bias, &new_strtab);
+
+    if (!old_base || !new_base || !old_strtab.data || !new_strtab.data) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic verdef compare skipped: old=%p new=%p old_count=%zu new_count=%zu\n",
+                   "kzt_tb_callback", old_base, new_base, old_count,
+                   new_count);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        KztDynamicVerdefEntry old_def;
+        KztDynamicVerdefEntry new_def;
+        size_t aux_count;
+
+        if (!KztDynamicVerdefAt(old_base, i, &old_def)
+            || !KztDynamicVerdefAtFromInfo(new_info, new_base, i,
+                                           &new_def)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verdef mismatch entry[%zu]: missing record\n",
+                       "kzt_tb_callback", i);
+            if (kzt_note_dynamic_symbol_mismatch("verdef", i,
+                                                 &mismatches))
+                break;
+            continue;
+        }
+
+        if (old_def.record->vd_version != new_def.record->vd_version) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verdef mismatch version[%zu]: old=0x%x new=0x%x\n",
+                       "kzt_tb_callback", i, old_def.record->vd_version,
+                       new_def.record->vd_version);
+            if (kzt_note_dynamic_symbol_mismatch("verdef-version", i,
+                                                 &mismatches))
+                break;
+        }
+        if (old_def.record->vd_flags != new_def.record->vd_flags) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verdef mismatch flags[%zu]: old=0x%x new=0x%x\n",
+                       "kzt_tb_callback", i, old_def.record->vd_flags,
+                       new_def.record->vd_flags);
+            if (kzt_note_dynamic_symbol_mismatch("verdef-flags", i,
+                                                 &mismatches))
+                break;
+        }
+        if (old_def.record->vd_ndx != new_def.record->vd_ndx) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verdef mismatch index[%zu]: old=0x%x new=0x%x\n",
+                       "kzt_tb_callback", i, old_def.record->vd_ndx,
+                       new_def.record->vd_ndx);
+            if (kzt_note_dynamic_symbol_mismatch("verdef-index", i,
+                                                 &mismatches))
+                break;
+        }
+        if (old_def.record->vd_cnt != new_def.record->vd_cnt) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verdef mismatch aux-count[%zu]: old=0x%x new=0x%x\n",
+                       "kzt_tb_callback", i, old_def.record->vd_cnt,
+                       new_def.record->vd_cnt);
+            if (kzt_note_dynamic_symbol_mismatch("verdef-count", i,
+                                                 &mismatches))
+                break;
+        }
+        if (old_def.record->vd_hash != new_def.record->vd_hash) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verdef mismatch hash[%zu]: old=0x%x new=0x%x\n",
+                       "kzt_tb_callback", i, old_def.record->vd_hash,
+                       new_def.record->vd_hash);
+            if (kzt_note_dynamic_symbol_mismatch("verdef-hash", i,
+                                                 &mismatches))
+                break;
+        }
+
+        aux_count = old_def.record->vd_cnt < new_def.record->vd_cnt
+                        ? old_def.record->vd_cnt
+                        : new_def.record->vd_cnt;
+        for (size_t j = 0; j < aux_count; ++j) {
+            KztDynamicVerdauxEntry old_aux;
+            KztDynamicVerdauxEntry new_aux;
+
+            if (!KztDynamicVerdauxAt(&old_def, j, &old_strtab, &old_aux)
+                || !KztDynamicVerdauxAt(&new_def, j, &new_strtab,
+                                        &new_aux)) {
+                printf_log(LOG_INFO,
+                           "%s Dynamic verdef mismatch aux[%zu:%zu]: missing record\n",
+                           "kzt_tb_callback", i, j);
+                if (kzt_note_dynamic_symbol_mismatch("verdaux", i,
+                                                     &mismatches))
+                    return mismatches;
+                continue;
+            }
+
+            if (!old_aux.name || !new_aux.name
+                || strcmp(old_aux.name, new_aux.name)) {
+                printf_log(LOG_INFO,
+                           "%s Dynamic verdef mismatch aux-name[%zu:%zu]: old=\"%s\" new=\"%s\"\n",
+                           "kzt_tb_callback", i, j,
+                           old_aux.name ? old_aux.name : "<invalid>",
+                           new_aux.name ? new_aux.name : "<invalid>");
+                if (kzt_note_dynamic_symbol_mismatch("verdaux-name", i,
+                                                     &mismatches))
+                    return mismatches;
+            }
+        }
+    }
+
+    return mismatches;
+}
+
+static int kzt_compare_dynamic_strings(elfheader_t *h,
+                                       KztDynamicView *old_view,
+                                       KztDynamicInfo *new_info,
+                                       KztDynamicView *new_view,
+                                       uintptr_t load_bias)
+{
+    KztDynamicStringTable old_strtab = {
+        .data = h->DynStr,
+        .size = h->szDynStrTab,
+    };
+    KztDynamicStringTable new_strtab;
+    int mismatches = 0;
+
+    KztDynamicStringTableFromInfo(new_info, load_bias, &new_strtab);
+
+    if (!old_strtab.data || !old_strtab.size || !new_strtab.data
+        || !new_strtab.size) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic string compare skipped: old_strtab=%p old_size=0x%zx new_strtab=%p new_size=0x%zx\n",
+                   "kzt_tb_callback", old_strtab.data, old_strtab.size,
+                   new_strtab.data, new_strtab.size);
+        return 0;
+    }
+
+    mismatches += kzt_compare_dynamic_string_tag(
+        "DT_NEEDED", DT_NEEDED, old_view, &old_strtab, new_view,
+        &new_strtab);
+    mismatches += kzt_compare_dynamic_string_tag(
+        "DT_RPATH", DT_RPATH, old_view, &old_strtab, new_view, &new_strtab);
+    mismatches += kzt_compare_dynamic_string_tag(
+        "DT_RUNPATH", DT_RUNPATH, old_view, &old_strtab, new_view,
+        &new_strtab);
+
+    return mismatches;
+}
+
+static void kzt_build_legacy_dynamic_info(KztDynamicInfo *info,
+                                          const KztDynamicView *view,
+                                          elfheader_t *h)
+{
+    KztBuildDynamicInfo(info, view);
+    info->dynsym_count = h->numDynSym;
+    info->has_dynsym_count = h->DynSym && h->numDynSym;
+}
+
+static int kzt_compare_guest_dynamic_info(KztDynamicInfo *old_info,
+                                          KztDynamicInfo *new_info,
+                                          uintptr_t load_bias)
+{
+    int mismatches = 0;
+
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_STRTAB", old_info->strtab, new_info->strtab, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_STRSZ", old_info->strsz, new_info->strsz);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_SYMTAB", old_info->symtab, new_info->symtab, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.dynsym_count_available", old_info->has_dynsym_count,
+        new_info->has_dynsym_count);
+    if (old_info->has_dynsym_count && new_info->has_dynsym_count) {
+        mismatches += kzt_dynamic_note_size_mismatch(
+            "info.dynsym_count", old_info->dynsym_count,
+            new_info->dynsym_count);
+    }
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_REL", old_info->rel, new_info->rel, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_RELSZ", old_info->relsz, new_info->relsz);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_RELENT", old_info->relent, new_info->relent);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.rel_count_available", old_info->has_rel_count,
+        new_info->has_rel_count);
+    if (old_info->has_rel_count && new_info->has_rel_count) {
+        mismatches += kzt_dynamic_note_size_mismatch(
+            "info.rel_count", old_info->rel_count, new_info->rel_count);
+    }
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_RELA", old_info->rela, new_info->rela, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_RELASZ", old_info->relasz, new_info->relasz);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_RELAENT", old_info->relaent, new_info->relaent);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.rela_count_available", old_info->has_rela_count,
+        new_info->has_rela_count);
+    if (old_info->has_rela_count && new_info->has_rela_count) {
+        mismatches += kzt_dynamic_note_size_mismatch(
+            "info.rela_count", old_info->rela_count, new_info->rela_count);
+    }
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_JMPREL", old_info->jmprel, new_info->jmprel, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_PLTRELSZ", old_info->pltsz, new_info->pltsz);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.plt_entry", old_info->pltent, new_info->pltent);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.plt_count_available", old_info->has_plt_count,
+        new_info->has_plt_count);
+    if (old_info->has_plt_count && new_info->has_plt_count) {
+        mismatches += kzt_dynamic_note_size_mismatch(
+            "info.plt_count", old_info->plt_count, new_info->plt_count);
+    }
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_PLTREL", old_info->pltrel, new_info->pltrel);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_PLTGOT", old_info->pltgot, new_info->pltgot, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_INIT", old_info->initentry, new_info->initentry, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_INIT_ARRAY", old_info->initarray, new_info->initarray,
+        load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_INIT_ARRAYSZ", old_info->initarray_count,
+        new_info->initarray_count);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_FINI", old_info->finientry, new_info->finientry, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_FINI_ARRAY", old_info->finiarray, new_info->finiarray,
+        load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_FINI_ARRAYSZ", old_info->finiarray_count,
+        new_info->finiarray_count);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_VERSYM", old_info->versym, new_info->versym, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_VERNEED", old_info->verneed, new_info->verneed, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_VERNEEDNUM", old_info->verneed_count,
+        new_info->verneed_count);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_VERDEF", old_info->verdef, new_info->verdef, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_VERDEFNUM", old_info->verdef_count,
+        new_info->verdef_count);
+    mismatches += kzt_dynamic_note_error_mismatch(
+        "info.errors", old_info->errors, new_info->errors);
+
+    return mismatches;
+}
+
+static void kzt_compare_guest_dynamic(KztGuestObject *object, elfheader_t *h)
+{
+    KztDynamicView old_view;
+    KztDynamicInfo old_info;
+    KztDynamicSummary *old_dynamic = &old_view.summary;
+    KztDynamicView *new_view = &object->dynamic_view;
+    KztDynamicInfo *new_info = &object->dynamic_info;
+    KztDynamicSummary *new_dynamic = &new_view->summary;
+    uintptr_t load_bias = object->link_map->l_addr;
+    int mismatches = 0;
+
+    KztParseDynamicView(&old_view, h->Dynamic, h->numDynamic);
+
+    if (old_view.status == KZT_DYNAMIC_VIEW_EMPTY) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic compare skipped for \"%s\": old parser has no dynamic table\n",
+                   "kzt_tb_callback", object->filename);
+        return;
+    }
+    if (new_view->status == KZT_DYNAMIC_VIEW_EMPTY) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic compare skipped for \"%s\": link_map has no l_ld\n",
+                   "kzt_tb_callback", object->filename);
+        return;
+    }
+    if (new_view->status == KZT_DYNAMIC_VIEW_TRUNCATED) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic compare skipped for \"%s\": no DT_NULL within %d entries\n",
+                   "kzt_tb_callback", object->filename, KZT_DYNAMIC_SCAN_MAX);
+        return;
+    }
+    if (!object->has_dynamic_info) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic compare skipped for \"%s\": parser info is unavailable\n",
+                   "kzt_tb_callback", object->filename);
+        return;
+    }
+
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "entries", old_dynamic->entries, new_dynamic->entries);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "needed_count", old_dynamic->needed_count, new_dynamic->needed_count);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "rpath_count", old_dynamic->rpath_count, new_dynamic->rpath_count);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "runpath_count", old_dynamic->runpath_count, new_dynamic->runpath_count);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_STRTAB", old_dynamic->strtab, new_dynamic->strtab, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_STRSZ", old_dynamic->strsz, new_dynamic->strsz);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_SYMTAB", old_dynamic->symtab, new_dynamic->symtab, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_SYMENT", old_dynamic->syment, new_dynamic->syment);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_HASH", old_dynamic->hash, new_dynamic->hash, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_GNU_HASH", old_dynamic->gnu_hash, new_dynamic->gnu_hash, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_REL", old_dynamic->rel, new_dynamic->rel, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_RELSZ", old_dynamic->relsz, new_dynamic->relsz);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_RELENT", old_dynamic->relent, new_dynamic->relent);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_RELA", old_dynamic->rela, new_dynamic->rela, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_RELASZ", old_dynamic->relasz, new_dynamic->relasz);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_RELAENT", old_dynamic->relaent, new_dynamic->relaent);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_JMPREL", old_dynamic->jmprel, new_dynamic->jmprel, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_PLTRELSZ", old_dynamic->pltrelsz, new_dynamic->pltrelsz);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_PLTREL", old_dynamic->pltrel, new_dynamic->pltrel);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_PLTGOT", old_dynamic->pltgot, new_dynamic->pltgot, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_INIT", old_dynamic->init, new_dynamic->init, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_INIT_ARRAY", old_dynamic->init_array, new_dynamic->init_array,
+        load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_INIT_ARRAYSZ", old_dynamic->init_arraysz,
+        new_dynamic->init_arraysz);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_FINI", old_dynamic->fini, new_dynamic->fini, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_FINI_ARRAY", old_dynamic->fini_array, new_dynamic->fini_array,
+        load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_FINI_ARRAYSZ", old_dynamic->fini_arraysz,
+        new_dynamic->fini_arraysz);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_VERSYM", old_dynamic->versym, new_dynamic->versym, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_VERNEED", old_dynamic->verneed, new_dynamic->verneed, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_VERNEEDNUM", old_dynamic->verneednum, new_dynamic->verneednum);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_VERDEF", old_dynamic->verdef, new_dynamic->verdef, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_VERDEFNUM", old_dynamic->verdefnum, new_dynamic->verdefnum);
+
+    kzt_build_legacy_dynamic_info(&old_info, &old_view, h);
+    mismatches += kzt_compare_guest_dynamic_info(&old_info, new_info,
+                                                 load_bias);
+    mismatches += kzt_compare_dynamic_strings(h, &old_view, new_info,
+                                              new_view, load_bias);
+    mismatches += kzt_compare_dynamic_symbols(h, &old_info, new_info,
+                                              load_bias);
+    mismatches += kzt_compare_dynamic_relocations(&old_info, new_info,
+                                                  load_bias);
+    mismatches += kzt_compare_dynamic_versym(h, &old_info, new_info,
+                                             load_bias);
+    mismatches += kzt_compare_dynamic_verneed(h, &old_info, new_info,
+                                              load_bias);
+    mismatches += kzt_compare_dynamic_verdef(h, &old_info, new_info,
+                                             load_bias);
+
+    if (mismatches) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic compare found %d mismatches for \"%s\"\n",
+                   "kzt_tb_callback", mismatches, object->filename);
+        return;
+    }
+
+    printf_log(LOG_DEBUG,
+               "%s Dynamic compare matched for \"%s\": entries=%zu needed=%zu bias=0x%lx\n",
+               "kzt_tb_callback", object->filename, new_dynamic->entries,
+               new_dynamic->needed_count, load_bias);
+}
+
 static void kzt_record_guest_load_range(KztGuestObject *object,
                                         elfheader_t *h)
 {
@@ -2426,6 +3416,7 @@ static void kzt_process_guest_object_legacy(KztGuestObject *object)
     if (!h)
         return;
 
+    kzt_compare_guest_dynamic(object, h);
     kzt_record_guest_load_range(object, h);
 
     if (object->is_loader) {

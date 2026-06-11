@@ -63,6 +63,7 @@ my_file = files(
   'pathcoll.c',
   'fileutils.c',
   'elfmap.c',
+  'guestdynamic.c',
   'elfparser.c',
   'elfloader.c',
   'elfload_dump.c',
