@@ -2061,6 +2061,19 @@ static int CalcLoadAddrNative(elfheader_t* head, size_t align)
     head->stackalign = 16;   // default align for stack
     return 0;
 }
+
+/*
+ * Stage 5 lets the guest loader own ordinary guest dependencies.  KZT still
+ * registers wrappers for objects after the guest loader maps them, but it no
+ * longer expands a guest object's DT_NEEDED list or RPATH/RUNPATH itself.
+ */
+static void kzt_skip_guest_needed_side_load(const char *scope,
+                                           const char *path)
+{
+    printf_log(LOG_DEBUG, "%s Skip guest DT_NEEDED side loading for \"%s\"\n",
+               scope, path ? path : "(unknown)");
+}
+
 static void init_main_elf(elfheader_t* elf_header,int fd, uintptr_t load_addr,
         size_t align)
 {
@@ -2081,9 +2094,7 @@ static void init_main_elf(elfheader_t* elf_header,int fd, uintptr_t load_addr,
 
     AddMainElfToLinkmap(elf_header);
 
-    if (LoadNeededLibs(elf_header, my_context->maplib, &my_context->neededlibs, NULL, 0, 0, my_context)) {
-        printf_log(LOG_INFO, "Error: loading needed libs in elf %s\n", my_context->argv[0]);
-    }
+    kzt_skip_guest_needed_side_load("kzt_init", my_context->argv[0]);
     ResetSpecialCaseMainElf(elf_header);
 }
 int wine_option_kzt;
@@ -3385,22 +3396,18 @@ static void kzt_record_guest_load_range(KztGuestObject *object,
 
 static library_t *kzt_register_guest_library_policy(KztGuestObject *object)
 {
-    library_t *lib = NewLibrary(object->basename, my_context);
-    if (lib) {
-        const char *libs[] = {object->basename};
-        AddNeededLib(my_context->maplib, &my_context->neededlibs, NULL, 0,
-                     1, libs, 1, my_context);
+    if (!object->basename || !FindLibIsWrapped((char *)object->basename)) {
+        return NULL;
     }
-    if (!lib && (!strncmp(object->basename, "libSDL", 6)
-                 || !strncmp(object->basename, "libCgGL.so",
-                             strlen("libCgGL.so")))) {
-        printf_log(LOG_DEBUG, "%s libSDL need libGL.so.1\n",
-                   "kzt_tb_callback");
-        const char *libs[] = {"libGL.so.1"};
-        AddNeededLib(my_context->maplib, &my_context->neededlibs, NULL, 0,
-                     1, libs, 1, my_context);
+
+    const char *libs[] = {object->basename};
+    if (AddNeededLib(my_context->maplib, &my_context->neededlibs, NULL, 0,
+                     1, libs, 1, my_context)) {
+        printf_log(LOG_INFO, "%s Error: registering wrapper for \"%s\"\n",
+                   "kzt_tb_callback", object->basename);
+        return NULL;
     }
-    return lib;
+    return GetLibInternal(object->basename);
 }
 
 static void kzt_process_guest_object_legacy(KztGuestObject *object)
@@ -3444,15 +3451,7 @@ static void kzt_process_guest_object_legacy(KztGuestObject *object)
         findx86pthread_setcanceltype(h);
     }
     AddElfHeader(my_context, h);
-    if (LoadNeededLibs(h, my_context->maplib, &my_context->neededlibs, NULL,
-                       0, 0, my_context)) {
-        printf_log(LOG_INFO, "%s Error: loading needed libs for \"%s\"\n",
-                   "kzt_tb_callback", object->filename);
-        SetGuestObjectState(my_context->guest_objects,
-                            (uintptr_t)object->link_map,
-                            GUEST_OBJECT_FAILED);
-        return;
-    }
+    kzt_skip_guest_needed_side_load("kzt_tb_callback", object->filename);
     if (RelocateElf(my_context->maplib, NULL, 0, h)) {
         printf_log(LOG_INFO, "%s Error: relocating symbols for \"%s\"\n",
                    "kzt_tb_callback", object->filename);
