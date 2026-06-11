@@ -66,6 +66,10 @@ static void test_patch_decision_names(void)
                  KztPatchDecisionReasonName(
                      KZT_PATCH_REASON_LAZY_BINDING_RESOLVED),
                  "lazy-binding-resolved");
+    check_string("reason.lazy-current-target",
+                 KztPatchDecisionReasonName(
+                     KZT_PATCH_REASON_LAZY_BINDING_CURRENT_TARGET),
+                 "lazy-binding-current-target");
     check_string("reason.plt-resolver",
                  KztPatchDecisionReasonName(KZT_PATCH_REASON_PLT_RESOLVER),
                  "plt-resolver");

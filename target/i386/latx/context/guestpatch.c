@@ -133,6 +133,8 @@ const char *KztPatchDecisionReasonName(KztPatchDecisionReason reason)
             return "lazy-binding-deferred";
         case KZT_PATCH_REASON_LAZY_BINDING_RESOLVED:
             return "lazy-binding-resolved";
+        case KZT_PATCH_REASON_LAZY_BINDING_CURRENT_TARGET:
+            return "lazy-binding-current-target";
         case KZT_PATCH_REASON_PLT_RESOLVER:
             return "plt-resolver";
         case KZT_PATCH_REASON_GUEST_OWNER_TARGET:
