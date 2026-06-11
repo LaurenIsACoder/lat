@@ -26,6 +26,17 @@ typedef enum guest_object_process_result_e {
     GUEST_OBJECT_PROCESS_IN_PROGRESS,
 } guest_object_process_result_t;
 
+typedef struct guest_object_lookup_s {
+    uintptr_t link_map_addr;
+    uintptr_t load_bias;
+    uintptr_t dynamic_addr;
+    uintptr_t map_start;
+    uintptr_t map_end;
+    const char *name;
+    guest_object_state_t state;
+    unsigned long generation;
+} guest_object_lookup_t;
+
 guest_object_registry_t *NewGuestObjectRegistry(void);
 void FreeGuestObjectRegistry(guest_object_registry_t **registry);
 
@@ -41,6 +52,11 @@ int SetGuestObjectMapRange(
     uintptr_t link_map_addr,
     uintptr_t map_start,
     uintptr_t map_end);
+
+int LookupGuestObjectByAddress(
+    guest_object_registry_t *registry,
+    uintptr_t addr,
+    guest_object_lookup_t *lookup);
 
 guest_object_process_result_t BeginGuestObjectProcessing(
     guest_object_registry_t *registry,

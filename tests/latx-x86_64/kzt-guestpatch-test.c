@@ -35,8 +35,22 @@ static void test_patch_decision_defaults(void)
     check_int("defaults.version", (unsigned long)decision.symbol_version,
               (unsigned long)-1);
     check_int("defaults.reason", decision.reason, KZT_PATCH_REASON_NONE);
+    check_int("defaults.owner-relation", decision.owner_relation,
+              KZT_PATCH_OWNER_RELATION_UNKNOWN);
+    check_int("defaults.shadow-result", decision.shadow_result,
+              KZT_PATCH_SHADOW_DISABLED);
+    check_int("defaults.target-source", decision.target_source,
+              KZT_PATCH_TARGET_MAPLIB);
     check_string("defaults.reason-name",
                  KztPatchDecisionReasonName(decision.reason), "none");
+    check_string("defaults.owner-relation-name",
+                 KztPatchOwnerRelationName(decision.owner_relation),
+                 "unknown");
+    check_string("defaults.shadow-result-name",
+                 KztPatchShadowResultName(decision.shadow_result),
+                 "disabled");
+    check_string("defaults.target-source-name",
+                 KztPatchTargetSourceName(decision.target_source), "maplib");
 }
 
 static void test_patch_decision_names(void)
@@ -62,12 +76,38 @@ static void test_patch_decision_names(void)
                  "R_X86_64_JUMP_SLOT");
     check_string("reloc.unknown", KztPatchRelocationTypeName(-1),
                  "unknown");
+    check_string("owner-relation.match",
+                 KztPatchOwnerRelationName(KZT_PATCH_OWNER_RELATION_MATCH),
+                 "match");
+    check_string("owner-relation.mismatch",
+                 KztPatchOwnerRelationName(KZT_PATCH_OWNER_RELATION_MISMATCH),
+                 "mismatch");
+    check_string("shadow.match",
+                 KztPatchShadowResultName(KZT_PATCH_SHADOW_MATCH), "match");
+    check_string("shadow.no-maplib-target",
+                 KztPatchShadowResultName(
+                     KZT_PATCH_SHADOW_NO_MAPLIB_TARGET),
+                 "no-maplib-target");
+    check_string("shadow.self-plt",
+                 KztPatchShadowResultName(KZT_PATCH_SHADOW_SELF_PLT),
+                 "self-plt");
+    check_string("shadow.no-wrapper",
+                 KztPatchShadowResultName(KZT_PATCH_SHADOW_NO_WRAPPER),
+                 "no-wrapper");
+    check_string("shadow.missing",
+                 KztPatchShadowResultName(KZT_PATCH_SHADOW_SYMBOL_MISSING),
+                 "symbol-missing");
+    check_string("target-source.maplib",
+                 KztPatchTargetSourceName(KZT_PATCH_TARGET_MAPLIB), "maplib");
+    check_string("target-source.guest",
+                 KztPatchTargetSourceName(KZT_PATCH_TARGET_GUEST_OWNER),
+                 "guest-owner");
 }
 
 static void test_patch_decision_format(void)
 {
     KztPatchDecision decision;
-    char buffer[512];
+    char buffer[1024];
     size_t size;
 
     KztPatchDecisionInit(&decision);
@@ -83,10 +123,21 @@ static void test_patch_decision_format(void)
     decision.old_target = 0x4000;
     decision.old_owner = "libEGL.so.1";
     decision.old_owner_base = 0x5000;
+    decision.old_guest_object = "guest-libEGL.so.1";
+    decision.old_guest_object_base = 0x5500;
+    decision.maplib_bridge = 0x5800;
+    decision.maplib_owner = "maplibegl";
+    decision.maplib_owner_base = 0x5900;
     decision.new_bridge = 0x6000;
     decision.new_owner = "wrappedlibegl";
     decision.new_owner_base = 0x7000;
+    decision.guest_owner_bridge = 0x8000;
+    decision.guest_owner = "guest-libEGL.so.1";
+    decision.guest_owner_base = 0x5500;
     decision.reason = KZT_PATCH_REASON_GLOBAL_SYMBOL;
+    decision.owner_relation = KZT_PATCH_OWNER_RELATION_MISMATCH;
+    decision.shadow_result = KZT_PATCH_SHADOW_MATCH;
+    decision.target_source = KZT_PATCH_TARGET_GUEST_OWNER;
 
     size = KztFormatPatchDecision(buffer, sizeof(buffer), &decision);
     check_int("format.nonempty", size > 0, 1);
@@ -96,6 +147,49 @@ static void test_patch_decision_format(void)
               strstr(buffer, "reason=global-symbol") != NULL, 1);
     check_int("format.contains-bridge",
               strstr(buffer, "new_bridge=0x6000") != NULL, 1);
+    check_int("format.contains-maplib-bridge",
+              strstr(buffer, "maplib_bridge=0x5800") != NULL, 1);
+    check_int("format.contains-maplib-owner",
+              strstr(buffer, "maplib_owner=maplibegl") != NULL, 1);
+    check_int("format.contains-guest-object",
+              strstr(buffer, "old_guest_object=guest-libEGL.so.1") != NULL,
+              1);
+    check_int("format.contains-owner-relation",
+              strstr(buffer, "owner_relation=mismatch") != NULL, 1);
+    check_int("format.contains-guest-owner-bridge",
+              strstr(buffer, "guest_owner_bridge=0x8000") != NULL, 1);
+    check_int("format.contains-shadow-result",
+              strstr(buffer, "shadow_result=match") != NULL, 1);
+    check_int("format.contains-target-source",
+              strstr(buffer, "target_source=guest-owner") != NULL, 1);
+}
+
+static void test_patch_decision_select_guest_owner(void)
+{
+    KztPatchDecision decision;
+
+    KztPatchDecisionInit(&decision);
+    decision.maplib_bridge = 0x1000;
+    decision.maplib_owner = "maplib-owner";
+    decision.maplib_owner_base = 0x2000;
+    decision.new_bridge = decision.maplib_bridge;
+    decision.new_owner = decision.maplib_owner;
+    decision.new_owner_base = decision.maplib_owner_base;
+    decision.guest_owner_bridge = 0x3000;
+    decision.guest_owner = "guest-owner";
+    decision.guest_owner_base = 0x4000;
+
+    KztPatchDecisionSelectGuestOwnerTarget(&decision);
+
+    check_int("select-guest.bridge", decision.new_bridge, 0x3000);
+    check_string("select-guest.owner", decision.new_owner, "guest-owner");
+    check_int("select-guest.owner-base", decision.new_owner_base, 0x4000);
+    check_int("select-guest.source", decision.target_source,
+              KZT_PATCH_TARGET_GUEST_OWNER);
+    check_int("select-guest.maplib-preserved", decision.maplib_bridge,
+              0x1000);
+    check_string("select-guest.maplib-owner-preserved",
+                 decision.maplib_owner, "maplib-owner");
 }
 
 int main(void)
@@ -103,6 +197,7 @@ int main(void)
     test_patch_decision_defaults();
     test_patch_decision_names();
     test_patch_decision_format();
+    test_patch_decision_select_guest_owner();
 
     if (failures)
         return 1;

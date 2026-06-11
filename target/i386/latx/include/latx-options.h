@@ -96,6 +96,11 @@ extern unsigned long long counter_tb_tr;
 extern unsigned long long counter_ir1_tr;
 extern unsigned long long counter_mips_tr;
 
+#if defined(CONFIG_LATX_KZT)
+extern int option_kzt_patch_guest_owner;
+extern int option_kzt_patch_shadow;
+#endif
+
 #ifdef CONFIG_LATX
 #define ENVSUP_LATX \
     ENVFUN(LATX_OPTIMIZE, handle_arg_optimize) \
@@ -131,7 +136,9 @@ extern unsigned long long counter_mips_tr;
 
 #if defined(CONFIG_LATX) && defined(CONFIG_LATX_KZT)
 #define ENVSUP_KZT \
-    ENVFUN(LATX_KZT, handle_arg_latx_kzt)
+    ENVFUN(LATX_KZT, handle_arg_latx_kzt) \
+    ENVFUN(LATX_KZT_PATCH_GUEST_OWNER, handle_arg_latx_kzt_patch_guest_owner) \
+    ENVFUN(LATX_KZT_PATCH_SHADOW, handle_arg_latx_kzt_patch_shadow)
 #else
 #define ENVSUP_KZT
 #endif

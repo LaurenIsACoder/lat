@@ -31,7 +31,7 @@ struct guest_object_registry_s {
  * or reused, while a live link_map entry is the stable object handle observed
  * from the guest loader.
  */
-static guest_object_t *FindGuestObject(
+static guest_object_t *FindGuestObjectByLinkMap(
     guest_object_registry_t *registry,
     uintptr_t link_map_addr)
 {
@@ -41,6 +41,20 @@ static guest_object_t *FindGuestObject(
         }
     }
     return NULL;
+}
+
+static void FillGuestObjectLookup(
+    const guest_object_t *object,
+    guest_object_lookup_t *lookup)
+{
+    lookup->link_map_addr = object->link_map_addr;
+    lookup->load_bias = object->load_bias;
+    lookup->dynamic_addr = object->dynamic_addr;
+    lookup->map_start = object->map_start;
+    lookup->map_end = object->map_end;
+    lookup->name = object->name;
+    lookup->state = object->state;
+    lookup->generation = object->generation;
 }
 
 static int GuestObjectChanged(
@@ -121,7 +135,7 @@ guest_object_observation_t ObserveGuestObject(
     const char *object_name = name ? name : "";
     pthread_mutex_lock(&registry->lock);
 
-    guest_object_t *object = FindGuestObject(registry, link_map_addr);
+    guest_object_t *object = FindGuestObjectByLinkMap(registry, link_map_addr);
     if (object) {
         ++object->observations;
         if (!GuestObjectChanged(object, load_bias, dynamic_addr, object_name)) {
@@ -186,7 +200,7 @@ int SetGuestObjectMapRange(
     }
 
     pthread_mutex_lock(&registry->lock);
-    guest_object_t *object = FindGuestObject(registry, link_map_addr);
+    guest_object_t *object = FindGuestObjectByLinkMap(registry, link_map_addr);
     if (!object) {
         pthread_mutex_unlock(&registry->lock);
         return -1;
@@ -198,6 +212,29 @@ int SetGuestObjectMapRange(
     return 0;
 }
 
+int LookupGuestObjectByAddress(
+    guest_object_registry_t *registry,
+    uintptr_t addr,
+    guest_object_lookup_t *lookup)
+{
+    if (!registry || !addr || !lookup) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&registry->lock);
+    for (size_t i = 0; i < registry->size; ++i) {
+        const guest_object_t *object = &registry->objects[i];
+        if (object->map_start && addr >= object->map_start
+            && addr < object->map_end) {
+            FillGuestObjectLookup(object, lookup);
+            pthread_mutex_unlock(&registry->lock);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&registry->lock);
+    return -1;
+}
+
 guest_object_process_result_t BeginGuestObjectProcessing(
     guest_object_registry_t *registry,
     uintptr_t link_map_addr)
@@ -207,7 +244,7 @@ guest_object_process_result_t BeginGuestObjectProcessing(
     }
 
     pthread_mutex_lock(&registry->lock);
-    guest_object_t *object = FindGuestObject(registry, link_map_addr);
+    guest_object_t *object = FindGuestObjectByLinkMap(registry, link_map_addr);
     if (!object) {
         pthread_mutex_unlock(&registry->lock);
         return GUEST_OBJECT_PROCESS_INVALID;
@@ -244,7 +281,7 @@ int SetGuestObjectState(
     }
 
     pthread_mutex_lock(&registry->lock);
-    guest_object_t *object = FindGuestObject(registry, link_map_addr);
+    guest_object_t *object = FindGuestObjectByLinkMap(registry, link_map_addr);
     if (!object) {
         pthread_mutex_unlock(&registry->lock);
         return -1;
