@@ -3562,8 +3562,27 @@ int init_x86dlfun(void)
     kzt_wine_init_x86();
     return 0;
 }
+
+static uintptr_t kzt_call_guest_dlopen(void *filename, int flag)
+{
+    return RunFunctionWithState(
+        (uintptr_t)my_context->dlprivate->x86dlopen, 2, filename, flag);
+}
+
+static uintptr_t kzt_call_guest_dlsym(void *handle, void *symbol)
+{
+    return RunFunctionWithState(
+        (uintptr_t)my_context->dlprivate->x86dlsym, 2, handle, symbol);
+}
+
+static void kzt_forward_guest_dlclose(CPUX86State *cpu)
+{
+    Push64(cpu, (uint64_t)my_context->dlprivate->x86dlclose);
+}
+
 static int callx86dlopen(void *filename, int flag, elfheader_t * h, int is_local) {
-    struct link_map* ret = (struct link_map*)(uintptr_t)RunFunctionWithState((uintptr_t)my_context->dlprivate->x86dlopen, 2, filename, flag);
+    struct link_map* ret =
+        (struct link_map*)(uintptr_t)kzt_call_guest_dlopen(filename, flag);
     if (ret) {
         printf_dlsym(LOG_DEBUG, "latx RunFunctionWithState dlopen %s addr %p\n", (char *)filename, (void *)ret->l_addr);
         h->lib->x86linkmap = ret;
@@ -3679,7 +3698,7 @@ void* my_dlopen(void *filename, int flag){
             printf_dlsym(LOG_DEBUG, "warning call x86dlopen filename is %s %x\n", (char *)filename, flag);
             return NULL;
 #else
-            uint64_t ret = RunFunctionWithState((uintptr_t)my_context->dlprivate->x86dlopen, 2, filename, flag);
+            uint64_t ret = kzt_call_guest_dlopen(filename, flag);
             printf_dlsym(LOG_DEBUG, "warning call call x86dlopen filename %s %x ret=0x%lx\n",  (char *)filename, flag, ret);
             //lsassert(0);
             if (ret) {
@@ -3792,6 +3811,26 @@ static int my_dlsym_lib(library_t* lib, const char* rsymbol, uintptr_t *start, u
     return ret;
 }
 
+static int kzt_dl_handle_matches_guest_link_map(library_t *lib, void *handle)
+{
+    return lib && lib->active && lib->type == LIB_EMULATED
+        && ((size_t)lib->x86linkmap) == (size_t)handle;
+}
+
+static size_t kzt_dl_handle_index(dlprivate_t *dl, void *handle)
+{
+    size_t nlib = (size_t)handle;
+
+    if (nlib > dl->lib_sz) {
+        for (size_t i = 0; i < dl->lib_sz; i++) {
+            if (kzt_dl_handle_matches_guest_link_map(dl->libs[i], handle))
+                return i;
+        }
+    }
+
+    return nlib - 1;
+}
+
 void* my_dlsym(void *handle, void *symbol){
     dlprivate_t *dl = my_context->dlprivate;
     uintptr_t start = 0, end = 0;
@@ -3819,7 +3858,7 @@ void* my_dlsym(void *handle, void *symbol){
         printf_dlsym(LOG_DEBUG, "warning call x86dlsym filename is NULL\n");
         return NULL;
 #else
-        uint64_t ret = RunFunctionWithState((uintptr_t)my_context->dlprivate->x86dlsym, 2, handle, symbol);
+        uint64_t ret = kzt_call_guest_dlsym(handle, symbol);
         printf_dlsym(LOG_DEBUG, "warning call x86dlsym filename is NULL ret=0x%lx\n", ret);
         if (ret) {
             return (void *)ret;
@@ -3845,16 +3884,7 @@ void* my_dlsym(void *handle, void *symbol){
         printf_dlsym(LOG_DEBUG, "warning call x86dlsym filename is RTLD_NEXT\n");
         return NULL;
     }
-    size_t nlib = (size_t)handle;
-    if(nlib > dl->lib_sz) {
-        for (int i = 0; i < dl->lib_sz; i++) {
-            if (dl->libs[i] && dl->libs[i]->active && dl->libs[i]->type == LIB_EMULATED && ((size_t)dl->libs[i]->x86linkmap) == nlib) {
-                nlib = i + 1;
-                break;
-            }
-        }
-    }
-    --nlib;
+    size_t nlib = kzt_dl_handle_index(dl, handle);
     // size_t is unsigned
     if(nlib>=dl->lib_sz) {
 #ifdef LATX_RELOCATION_SAVE_SYMBOLS
@@ -3902,7 +3932,8 @@ void* my_dlsym(void *handle, void *symbol){
         printf_dlsym(LOG_DEBUG, "warning call x86dlsym filename is %s 0x%lx %s\n", strlen(lmfile)?lmfile:"NULL", cpu->regs[R_EDI], (char*)symbol);
         return NULL;
 #else
-        uint64_t ret = RunFunctionWithState((uintptr_t)my_context->dlprivate->x86dlsym, 2, cpu->regs[R_EDI], symbol);
+        uint64_t ret = kzt_call_guest_dlsym(
+            (void *)cpu->regs[R_EDI], symbol);
         printf_dlsym(LOG_DEBUG, "warning call call x86dlsym filename is %s handle 0x%lx ret=0x%lx\n", strlen(lmfile)?lmfile:"NULL", cpu->regs[R_EDI], ret);
         if (ret) {
             return (void *)ret;
@@ -3928,14 +3959,16 @@ void* my_dlsym(void *handle, void *symbol){
             #if 1
             if(!dl->libs[nlib]->x86linkmap) {
                 //redlopen
-                uint64_t ret = RunFunctionWithState((uintptr_t)my_context->dlprivate->x86dlopen, 2, dl->libs[nlib]->name, dl->libs[nlib]->x86dlopenflag);
+                uint64_t ret = kzt_call_guest_dlopen(
+                    dl->libs[nlib]->name, dl->libs[nlib]->x86dlopenflag);
                 if (!ret) {//user sometime test for finding a func.
                     printf_dlsym(LOG_NEVER, "redlopen %p return %p\n", rsymbol, (void*)NULL);
                     return NULL;
                 }
 		lsassert(ret);
                 dl->libs[nlib]->x86linkmap = (void *)ret;
-                ret = RunFunctionWithState((uintptr_t)my_context->dlprivate->x86dlsym, 2, dl->libs[nlib]->x86linkmap , cpu->regs[R_ESI]);
+                ret = kzt_call_guest_dlsym(
+                    dl->libs[nlib]->x86linkmap, (void *)cpu->regs[R_ESI]);
                 printf_dlsym(LOG_DEBUG, "call x86dlsym filename %s is wrapped but not find symbol, dlsym(%p, %s) ret=0x%lx\n",
                 dl->libs[nlib]->name, dl->libs[nlib]->x86linkmap, (char *)cpu->regs[R_ESI], ret);
                 return (void *)ret;
@@ -3950,7 +3983,8 @@ void* my_dlsym(void *handle, void *symbol){
             printf_dlsym(LOG_DEBUG, "warning call x86dlsym filename is %s %lx\n", dl->libs[nlib]->x86linkmap->l_name, cpu->regs[R_EDI]);
             return NULL;
 #else
-            uint64_t ret = RunFunctionWithState((uintptr_t)my_context->dlprivate->x86dlsym, 2, cpu->regs[R_EDI], cpu->regs[R_ESI]);
+            uint64_t ret = kzt_call_guest_dlsym(
+                (void *)cpu->regs[R_EDI], (void *)cpu->regs[R_ESI]);
             printf_dlsym(LOG_DEBUG, "call x86dlsym filename is %s %s ret=0x%lx\n", dl->libs[nlib]->x86linkmap->l_name, (char *)cpu->regs[R_ESI], ret);
             if (ret) {
                 return (void *)ret;
@@ -3991,22 +4025,13 @@ int my_dlclose(void *handle)
         init_x86dlfun();
         lsassert(dl->x86dlclose);
     }
-    size_t nlib = (size_t)handle;
-    if(nlib > dl->lib_sz) {
-        for (int i = 0; i < dl->lib_sz; i++) {
-            if (dl->libs[i] && dl->libs[i]->active && dl->libs[i]->type == LIB_EMULATED && ((size_t)dl->libs[i]->x86linkmap) == nlib) {
-                nlib = i + 1;
-                break;
-            }
-        }
-    }
-    --nlib;
+    size_t nlib = kzt_dl_handle_index(dl, handle);
     // size_t is unsigned
     if(nlib>=dl->lib_sz) {
         int ret = -1;
         if (dl->x86dlclose) {
             __MY_CPU;
-            Push64(cpu, (uint64_t)dl->x86dlclose);
+            kzt_forward_guest_dlclose(cpu);
             return 0;
         }
         if(!dl->last_error)
@@ -4034,7 +4059,7 @@ int my_dlclose(void *handle)
                 if (dl->libs[nlib]->x86linkmap != handle) {
                     cpu->regs[R_EDI] = (uintptr_t)dl->libs[nlib]->x86linkmap;
                 }
-                Push64(cpu, (uint64_t)dl->x86dlclose);
+                kzt_forward_guest_dlclose(cpu);
                 return 0;
             }
         }
@@ -4120,16 +4145,7 @@ int my_dlinfo(void* handle, int request, void* info)
         init_x86dlfun();
         lsassert(dl->x86dlopen);
     }
-    size_t nlib = (size_t)handle;
-    if(nlib > dl->lib_sz) {
-        for (int i = 0; i < dl->lib_sz; i++) {
-            if (dl->libs[i] && dl->libs[i]->active && dl->libs[i]->type == LIB_EMULATED && ((size_t)dl->libs[i]->x86linkmap) == nlib) {
-                nlib = i + 1;
-                break;
-            }
-        }
-    }
-    --nlib;
+    size_t nlib = kzt_dl_handle_index(dl, handle);
     // size_t is unsigned
     if(nlib>=dl->lib_sz) {
         if(!dl->last_error)
