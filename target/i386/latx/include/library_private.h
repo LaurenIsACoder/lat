@@ -82,7 +82,7 @@ typedef struct library_s {
     needed_libs_t       depended;   // used to free library
     lib_t               *maplib;    // local maplib, for dlopen'd library with LOCAL binding (most of the dlopen)
     struct link_map     *x86linkmap;
-    int               x86dlopenflag; //for redlopen
+    int               x86dlopenflag; // guest dlopen flags for dlsym reopen
 } library_t;
 
 // type for map elements

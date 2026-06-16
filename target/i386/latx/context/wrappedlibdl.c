@@ -34,6 +34,9 @@ dlprivate_t *NewDLPrivate(void) {
     return dl;
 }
 void FreeDLPrivate(dlprivate_t **lib) {
+    box_free((*lib)->libs);
+    box_free((*lib)->count);
+    box_free((*lib)->dlopened);
     box_free((*lib)->last_error);
     box_free(*lib);
 }
@@ -643,4 +646,3 @@ int my_dlinfo(void* handle, int request, void* info)
 }
 
 #include "wrappedlib_init.h"
-

@@ -13,6 +13,10 @@ if [ ! -x "$latx" ]; then
     echo "missing executable LATX binary: $latx" >&2
     exit 2
 fi
+case $latx in
+    /*) ;;
+    *) latx=$(pwd)/$latx ;;
+esac
 
 if ! command -v clang >/dev/null 2>&1; then
     echo "skip: clang is required to build x86_64 guest fixtures" >&2
@@ -35,10 +39,16 @@ run_guest()
     name=$1
     expected=$2
     program=$3
+    workdir=${4:-}
 
     set +e
-    LATX_KZT=1 "$latx" -L "$ld_prefix" "$program" \
-        >"$tmpdir/$name.out" 2>"$tmpdir/$name.err"
+    if [ -n "$workdir" ]; then
+        (cd "$workdir" && LATX_KZT=1 "$latx" -L "$ld_prefix" "$program") \
+            >"$tmpdir/$name.out" 2>"$tmpdir/$name.err"
+    else
+        LATX_KZT=1 "$latx" -L "$ld_prefix" "$program" \
+            >"$tmpdir/$name.out" 2>"$tmpdir/$name.err"
+    fi
     status=$?
     set -e
 
@@ -114,8 +124,12 @@ _start:
     jne fail_call
     mov %r13, %rdi
     call dlclose@PLT
+    test %eax, %eax
+    jne fail_close
     mov %r12, %rdi
     call dlclose@PLT
+    test %eax, %eax
+    jne fail_close
     lea plugin_path(%rip), %rdi
     mov \$2, %esi
     call dlopen@PLT
@@ -132,6 +146,26 @@ _start:
     jne fail_call_after_close
     mov %r12, %rdi
     call dlclose@PLT
+    test %eax, %eax
+    jne fail_close_after_reopen
+    lea plugin_path(%rip), %rdi
+    mov \$0x102, %esi
+    call dlopen@PLT
+    test %rax, %rax
+    je fail_global_open
+    mov %rax, %r12
+    xor %rdi, %rdi
+    lea sym_name(%rip), %rsi
+    call dlsym@PLT
+    test %rax, %rax
+    je fail_global_sym
+    call *%rax
+    cmp \$123, %eax
+    jne fail_global_call
+    mov %r12, %rdi
+    call dlclose@PLT
+    test %eax, %eax
+    jne fail_global_close
     xor %edi, %edi
     call exit@PLT
 fail_open:
@@ -155,6 +189,24 @@ fail_sym_after_close:
 fail_call_after_close:
     mov \$99, %edi
     call exit@PLT
+fail_global_open:
+    mov \$100, %edi
+    call exit@PLT
+fail_global_sym:
+    mov \$101, %edi
+    call exit@PLT
+fail_global_call:
+    mov \$102, %edi
+    call exit@PLT
+fail_close:
+    mov \$107, %edi
+    call exit@PLT
+fail_close_after_reopen:
+    mov \$108, %edi
+    call exit@PLT
+fail_global_close:
+    mov \$109, %edi
+    call exit@PLT
     .section .rodata
 plugin_path:
     .asciz "$tmpdir/libplugin.so"
@@ -174,6 +226,224 @@ EOF
         "$guest_lib_dir/libc.so.6" -o "$tmpdir/mixed-main"
 
     run_guest mixed-soname-dlopen-dlsym 0 "$tmpdir/mixed-main"
+
+    cat >"$tmpdir/self-main.S" <<'EOF'
+    .text
+    .global _start
+_start:
+    xor %edi, %edi
+    mov $2, %esi
+    call dlopen@PLT
+    test %rax, %rax
+    je fail_self_open
+    mov %rax, %r12
+    xor %edi, %edi
+    mov $2, %esi
+    call dlopen@PLT
+    test %rax, %rax
+    je fail_self_reopen
+    cmp %r12, %rax
+    jne fail_self_reopen
+    mov %rax, %rdi
+    lea self_sym(%rip), %rsi
+    call dlsym@PLT
+    test %rax, %rax
+    je fail_self_sym
+    call *%rax
+    cmp $77, %eax
+    jne fail_self_call
+    xor %edi, %edi
+    call exit@PLT
+fail_self_open:
+    mov $103, %edi
+    call exit@PLT
+fail_self_reopen:
+    mov $104, %edi
+    call exit@PLT
+fail_self_sym:
+    mov $105, %edi
+    call exit@PLT
+fail_self_call:
+    mov $106, %edi
+    call exit@PLT
+    .global self_value
+    .type self_value,@function
+self_value:
+    mov $77, %eax
+    ret
+    .section .rodata
+self_sym:
+    .asciz "self_value"
+EOF
+
+    clang --target=x86_64-linux-gnu -nostdlib -pie -fuse-ld=lld \
+        -Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
+        -Wl,--export-dynamic \
+        "$tmpdir/self-main.S" "$guest_lib_dir/libdl.so.2" \
+        "$guest_lib_dir/libc.so.6" -o "$tmpdir/self-main"
+
+    run_guest self-dlopen-dlsym 0 "$tmpdir/self-main"
+
+    cat >"$tmpdir/dladdr-main.S" <<'EOF'
+    .text
+    .global _start
+_start:
+    sub $64, %rsp
+    lea dladdr_target(%rip), %rdi
+    mov %rsp, %rsi
+    call dladdr@PLT
+    test %eax, %eax
+    je fail_dladdr
+    add $64, %rsp
+    xor %edi, %edi
+    call exit@PLT
+fail_dladdr:
+    add $64, %rsp
+    mov $112, %edi
+    call exit@PLT
+dladdr_target:
+    ret
+EOF
+
+    clang --target=x86_64-linux-gnu -nostdlib -pie -fuse-ld=lld \
+        -Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
+        -Wl,--export-dynamic \
+        "$tmpdir/dladdr-main.S" "$guest_lib_dir/libdl.so.2" \
+        "$guest_lib_dir/libc.so.6" -o "$tmpdir/dladdr-main"
+
+    run_guest dladdr-explicit-args 0 "$tmpdir/dladdr-main"
+
+    cat >"$tmpdir/dlinfo-main.S" <<'EOF'
+    .text
+    .global _start
+_start:
+    xor %edi, %edi
+    mov $2, %esi
+    call dlopen@PLT
+    test %rax, %rax
+    je fail_open
+    mov %rax, %rdi
+    mov $2, %esi
+    lea link_map_slot(%rip), %rdx
+    call dlinfo@PLT
+    test %eax, %eax
+    jne fail_dlinfo
+    mov link_map_slot(%rip), %rax
+    test %rax, %rax
+    je fail_link_map
+    xor %edi, %edi
+    call exit@PLT
+fail_open:
+    mov $113, %edi
+    call exit@PLT
+fail_dlinfo:
+    mov $114, %edi
+    call exit@PLT
+fail_link_map:
+    mov $115, %edi
+    call exit@PLT
+    .bss
+    .align 8
+link_map_slot:
+    .quad 0
+EOF
+
+    clang --target=x86_64-linux-gnu -nostdlib -pie -fuse-ld=lld \
+        -Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
+        "$tmpdir/dlinfo-main.S" "$guest_lib_dir/libdl.so.2" \
+        "$guest_lib_dir/libc.so.6" -o "$tmpdir/dlinfo-main"
+
+    run_guest dlinfo-linkmap 0 "$tmpdir/dlinfo-main"
+
+    cat >"$tmpdir/dlvsym-main.S" <<'EOF'
+    .text
+    .global _start
+_start:
+    xor %edi, %edi
+    lea exit_sym(%rip), %rsi
+    lea bad_ver(%rip), %rdx
+    call dlvsym@PLT
+    test %rax, %rax
+    jne fail_bad_version
+    xor %edi, %edi
+    lea exit_sym(%rip), %rsi
+    lea good_ver(%rip), %rdx
+    call dlvsym@PLT
+    test %rax, %rax
+    je fail_good_version
+    lea plugin_name(%rip), %rdi
+    mov $2, %esi
+    call dlopen@PLT
+    test %rax, %rax
+    je fail_plugin_open
+    mov %rax, %r12
+    mov %rax, %rdi
+    lea plugin_sym(%rip), %rsi
+    lea bad_ver(%rip), %rdx
+    call dlvsym@PLT
+    test %rax, %rax
+    jne fail_handle_bad_version
+    mov %r12, %rdi
+    lea plugin_sym(%rip), %rsi
+    lea plugin_ver(%rip), %rdx
+    call dlvsym@PLT
+    test %rax, %rax
+    je fail_handle_good_version
+    xor %edi, %edi
+    call exit@PLT
+fail_bad_version:
+    mov $116, %edi
+    call exit@PLT
+fail_good_version:
+    mov $117, %edi
+    call exit@PLT
+fail_plugin_open:
+    mov $118, %edi
+    call exit@PLT
+fail_handle_bad_version:
+    mov $119, %edi
+    call exit@PLT
+fail_handle_good_version:
+    mov $120, %edi
+    call exit@PLT
+    .section .rodata
+exit_sym:
+    .asciz "exit"
+plugin_name:
+    .asciz "./libversplugin.so"
+plugin_sym:
+    .asciz "versioned_value"
+bad_ver:
+    .asciz "GLIBC_999.0"
+good_ver:
+    .asciz "GLIBC_2.2.5"
+plugin_ver:
+    .asciz "VERS_1"
+EOF
+
+    cat >"$tmpdir/vers-plugin.S" <<'EOF'
+    .text
+    .global versioned_value
+versioned_value:
+    mov $9, %eax
+    ret
+EOF
+
+    cat >"$tmpdir/vers-plugin.map" <<'EOF'
+VERS_1 {
+    global: versioned_value;
+};
+EOF
+
+    clang --target=x86_64-linux-gnu -nostdlib -shared -fPIC -fuse-ld=lld \
+        "$tmpdir/vers-plugin.S" -Wl,--version-script,"$tmpdir/vers-plugin.map" \
+        -Wl,-soname,libversplugin.so -o "$tmpdir/libversplugin.so"
+    clang --target=x86_64-linux-gnu -nostdlib -pie -fuse-ld=lld \
+        -Wl,-dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
+        "$tmpdir/dlvsym-main.S" "$guest_lib_dir/libdl.so.2" \
+        "$guest_lib_dir/libc.so.6" -o "$tmpdir/dlvsym-main"
+
+    run_guest dlvsym-versioned-default 0 "$tmpdir/dlvsym-main" "$tmpdir"
 else
     echo "skip: guest libc/libdl not found under $guest_lib_dir" >&2
 fi
@@ -190,12 +460,28 @@ _start:
     je fail_gl_open
     mov %rax, %r12
     mov %rax, %rdi
+    mov $2, %esi
+    lea gl_link_map_slot(%rip), %rdx
+    call dlinfo@PLT
+    test %eax, %eax
+    jne fail_gl_dlinfo
+    mov gl_link_map_slot(%rip), %rax
+    test %rax, %rax
+    je fail_gl_dlinfo
+    mov %r12, %rax
+    mov %rax, %rdi
     lea glx_proc(%rip), %rsi
     call dlsym@PLT
     test %rax, %rax
     je fail_gl_sym
     mov %r12, %rdi
     call dlclose@PLT
+    mov %r12, %rdi
+    mov $2, %esi
+    lea gl_link_map_slot(%rip), %rdx
+    call dlinfo@PLT
+    test %eax, %eax
+    je fail_gl_closed_dlinfo
 
     lea egl_name(%rip), %rdi
     mov $2, %esi
@@ -219,6 +505,12 @@ fail_gl_open:
 fail_gl_sym:
     mov $97, %edi
     call exit@PLT
+fail_gl_dlinfo:
+    mov $100, %edi
+    call exit@PLT
+fail_gl_closed_dlinfo:
+    mov $101, %edi
+    call exit@PLT
 fail_egl_open:
     mov $98, %edi
     call exit@PLT
@@ -234,6 +526,10 @@ egl_name:
     .asciz "libEGL.so.1"
 egl_proc:
     .asciz "eglGetProcAddress"
+    .bss
+    .align 8
+gl_link_map_slot:
+    .quad 0
 EOF
 
     clang --target=x86_64-linux-gnu -nostdlib -pie -fuse-ld=lld \
