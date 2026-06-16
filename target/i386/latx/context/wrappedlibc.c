@@ -3580,6 +3580,135 @@ static void kzt_forward_guest_dlclose(CPUX86State *cpu)
     Push64(cpu, (uint64_t)my_context->dlprivate->x86dlclose);
 }
 
+static void *kzt_dl_return_handle(library_t *lib, size_t index)
+{
+    if (lib && lib->type == LIB_EMULATED)
+        return lib->x86linkmap;
+
+    return (void *)(index + 1);
+}
+
+static void kzt_dl_retain_handle(dlprivate_t *dl, size_t index, int flag)
+{
+    if (!(flag & 0x4))
+        dl->count[index]++;
+}
+
+static void kzt_dl_reserve_handle(dlprivate_t *dl)
+{
+    if (dl->lib_sz != dl->lib_cap)
+        return;
+
+    dl->lib_cap += 4;
+    dl->libs = (library_t**)box_realloc(
+        dl->libs, sizeof(library_t*) * dl->lib_cap);
+    dl->count = (size_t*)box_realloc(
+        dl->count, sizeof(size_t) * dl->lib_cap);
+    dl->dlopened = (size_t*)box_realloc(
+        dl->dlopened, sizeof(size_t) * dl->lib_cap);
+    memset(dl->count + dl->lib_sz, 0,
+           (dl->lib_cap - dl->lib_sz) * sizeof(size_t));
+}
+
+static size_t kzt_dl_add_handle(dlprivate_t *dl, library_t *lib,
+                                size_t dlopened)
+{
+    kzt_dl_reserve_handle(dl);
+
+    size_t index = dl->lib_sz++;
+    dl->libs[index] = lib;
+    dl->count[index]++;
+    dl->dlopened[index] = dlopened;
+    return index;
+}
+
+static int kzt_dl_handle_is_closed(dlprivate_t *dl, size_t index)
+{
+    return dl->count[index] == 0;
+}
+
+static int kzt_dl_release_handle(dlprivate_t *dl, size_t index)
+{
+    dl->count[index]--;
+    return dl->count[index] == 0 && dl->dlopened[index];
+}
+
+static library_t *kzt_dl_handle_library(dlprivate_t *dl, size_t index)
+{
+    return dl->libs[index];
+}
+
+static size_t kzt_dl_handle_count(dlprivate_t *dl, size_t index)
+{
+    return dl->count[index];
+}
+
+static size_t kzt_dl_handle_dlopened(dlprivate_t *dl, size_t index)
+{
+    return dl->dlopened[index];
+}
+
+static int kzt_dl_find_handle_by_name(dlprivate_t *dl, const char *name,
+                                      size_t *index)
+{
+    for (size_t i = 0; i < dl->lib_sz; i++) {
+        if (IsSameLib(kzt_dl_handle_library(dl, i), name)) {
+            *index = i;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int kzt_dl_find_self_handle(dlprivate_t *dl, size_t *index)
+{
+    for (size_t i = 0; i < dl->lib_sz; i++) {
+        if (!kzt_dl_handle_library(dl, i)) {
+            *index = i;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int kzt_dl_handle_needs_guest_reopen(dlprivate_t *dl, size_t index)
+{
+    return kzt_dl_handle_is_closed(dl, index)
+        && kzt_dl_handle_dlopened(dl, index);
+}
+
+static void kzt_dl_deactivate_library(library_t *lib)
+{
+    if (IsEmuLib(lib))
+        return;
+
+    InactiveLibrary(lib);
+}
+
+static void kzt_dlopen_set_name_too_long_error(dlprivate_t *dl,
+                                               const char *filename)
+{
+    size_t name_len = filename ? strnlen(filename, MAX_PATH) : 0;
+
+    if(!dl->last_error)
+        dl->last_error = box_malloc(129);
+    snprintf(dl->last_error, 129, "filename too long, length >= %zu\n",
+             name_len);
+}
+
+static int kzt_dlopen_replace_filename(char *rfilename,
+                                       size_t rfilename_size,
+                                       const char *replacement)
+{
+    if (strlen(replacement) >= rfilename_size)
+        return 0;
+
+    strcpy(rfilename, replacement);
+    return 1;
+}
+
 static int callx86dlopen(void *filename, int flag, elfheader_t * h, int is_local) {
     struct link_map* ret =
         (struct link_map*)(uintptr_t)kzt_call_guest_dlopen(filename, flag);
@@ -3603,14 +3732,6 @@ static int callx86dlopen(void *filename, int flag, elfheader_t * h, int is_local
     }
     return 0;
 }
-static void LatxResetElf(elfheader_t * h)
-{
-    h->latx_hasfix = 0;
-    h->had_RelocateElfPlt = 0;
-    h->had_RelocateElf = 0;
-    h->latx_type = 0;
-    h->latx_hasfix = 0;
-}
 void* my_dlopen(void *filename, int flag){
     // TODO, handling special values for filename, like RTLD_SELF?
     // TODO, handling flags?
@@ -3625,6 +3746,10 @@ void* my_dlopen(void *filename, int flag){
     }
     if(filename) {
         char* rfilename = (char*)alloca(MAX_PATH);
+        if (strnlen((char *)filename, MAX_PATH) == MAX_PATH) {
+            kzt_dlopen_set_name_too_long_error(dl, filename);
+            return NULL;
+        }
         strcpy(rfilename, (char*)filename);
         printf_dlsym(LOG_DEBUG, "Call to dlopen(\"%s\"/%p, %X)\n", rfilename, filename, flag);
         while(strstr(rfilename, "${ORIGIN}")) {
@@ -3636,7 +3761,12 @@ void* my_dlopen(void *filename, int flag){
             memcpy(tmp, rfilename, p-rfilename);
             strcat(tmp, origin);
             strcat(tmp, p+strlen("${ORIGIN}"));
-            strcpy(rfilename, tmp);
+            if (!kzt_dlopen_replace_filename(rfilename, MAX_PATH, tmp)) {
+                box_free(tmp);
+                box_free(origin);
+                kzt_dlopen_set_name_too_long_error(dl, filename);
+                return NULL;
+            }
             box_free(tmp);
             box_free(origin);
         }
@@ -3649,38 +3779,47 @@ void* my_dlopen(void *filename, int flag){
             memcpy(tmp, rfilename, p-rfilename);
             strcat(tmp, platform);
             strcat(tmp, p+strlen("${PLATFORM}"));
-            strcpy(rfilename, tmp);
+            if (!kzt_dlopen_replace_filename(rfilename, MAX_PATH, tmp)) {
+                box_free(tmp);
+                box_free(platform);
+                kzt_dlopen_set_name_too_long_error(dl, filename);
+                return NULL;
+            }
             box_free(tmp);
             box_free(platform);
         }
         if (rfilename[0] == '/' && !FileExist(rfilename, IS_FILE)) {
             char filetmp[PATH_MAX] = {0};
             snprintf(filetmp , PATH_MAX, "%s%s", interp_prefix, rfilename);
-            strcpy(rfilename, filetmp);
+            if (!kzt_dlopen_replace_filename(rfilename, MAX_PATH, filetmp)) {
+                kzt_dlopen_set_name_too_long_error(dl, filename);
+                return NULL;
+            }
             printf_dlsym(LOG_DEBUG, "dlopen filename change to \"%s\"\n", rfilename);
         }
-        // check if alread dlopenned...
-        for (size_t i=0; i<dl->lib_sz; ++i) {
-            if(IsSameLib(dl->libs[i], rfilename)) {
-                if(dl->count[i]==0 && dl->dlopened[i]) {   // need to lauch init again!
-                    int idx = GetElfIndex(dl->libs[i]);
-                    if(idx!=-1) {
-                        printf_dlsym(LOG_DEBUG, "dlopen: Recycling, calling Init for %p (%s)\n", (void*)(i+1), rfilename);
-                        //TODO
-                        if (IsEmuLib(dl->libs[i])) {
-                            elfheader_t * h = my_context->elfs[idx];
-                            lsassert(h);
-                            LatxResetElf(h);
-                            callx86dlopen(rfilename, flag, h, is_local);
-                        }
-                        ReloadLibrary(dl->libs[i]);    // reset memory image, redo reloc, run inits
+        size_t handle_index = 0;
+        if (kzt_dl_find_handle_by_name(dl, rfilename, &handle_index)) {
+            library_t *handle_lib =
+                kzt_dl_handle_library(dl, handle_index);
+            if(kzt_dl_handle_needs_guest_reopen(dl, handle_index)) {
+                int idx = GetElfIndex(handle_lib);
+                if(idx!=-1) {
+                    printf_dlsym(LOG_DEBUG, "dlopen: Recycling guest handle for %p (%s)\n",
+                                 (void*)(handle_index+1), rfilename);
+                    if (IsEmuLib(handle_lib)) {
+                        elfheader_t * h = my_context->elfs[idx];
+                        lsassert(h);
+                        callx86dlopen(rfilename, flag, h, is_local);
                     }
                 }
-                if(!(flag&0x4))
-                    dl->count[i] = dl->count[i]+1;
-                printf_dlsym(LOG_DEBUG, "dlopen: Recycling %s/%p count=%ld (dlopened=%ld, elf_index=%d)\n", rfilename, (void*)(i+1), dl->count[i], dl->dlopened[i], GetElfIndex(dl->libs[i]));
-                return (void*)(i+1);
             }
+            kzt_dl_retain_handle(dl, handle_index, flag);
+            printf_dlsym(LOG_DEBUG, "dlopen: Recycling %s/%p count=%ld (dlopened=%ld, elf_index=%d)\n",
+                         rfilename, (void*)(handle_index+1),
+                         kzt_dl_handle_count(dl, handle_index),
+                         kzt_dl_handle_dlopened(dl, handle_index),
+                         GetElfIndex(handle_lib));
+            return kzt_dl_return_handle(handle_lib, handle_index);
         }
         if(strstr(rfilename, "libGL.so")){
             strcpy(rfilename, "libGL.so.1");
@@ -3733,12 +3872,10 @@ void* my_dlopen(void *filename, int flag){
         }
         //TODO:RunDeferedElfInit;
     } else {
-        // check if already dlopenned...
-        for (size_t i=0; i<dl->lib_sz; ++i) {
-            if(!dl->libs[i]) {
-                dl->count[i] = dl->count[i]+1;
-                return (void*)(i+1);
-            }
+        size_t handle_index = 0;
+        if (kzt_dl_find_self_handle(dl, &handle_index)) {
+            kzt_dl_retain_handle(dl, handle_index, 0);
+            return kzt_dl_return_handle(NULL, handle_index);
         }
         printf_dlsym(LOG_DEBUG, "Call to dlopen(NULL, %X) forword call x86dlopen \n", flag);
         lsassert(dl->x86dlopen);
@@ -3748,23 +3885,9 @@ void* my_dlopen(void *filename, int flag){
     }
     //get the lib and add it to the collection
 
-    if(dl->lib_sz == dl->lib_cap) {
-        dl->lib_cap += 4;
-        dl->libs = (library_t**)box_realloc(dl->libs, sizeof(library_t*)*dl->lib_cap);
-        dl->count = (size_t*)box_realloc(dl->count, sizeof(size_t)*dl->lib_cap);
-        dl->dlopened = (size_t*)box_realloc(dl->dlopened, sizeof(size_t)*dl->lib_cap);
-        // memset count...
-        memset(dl->count+dl->lib_sz, 0, (dl->lib_cap-dl->lib_sz)*sizeof(size_t));
-    }
-    intptr_t idx = dl->lib_sz++;
-    dl->libs[idx] = lib;
-    dl->count[idx] = dl->count[idx]+1;
-    dl->dlopened[idx] = dlopened;
+    size_t idx = kzt_dl_add_handle(dl, lib, dlopened);
     printf_dlsym(LOG_DEBUG, "dlopen: New handle %p (%s), dlopened=%ld\n", (void*)(idx+1), (char*)filename, dlopened);
-    if (lib && lib->type == LIB_EMULATED) {
-        return lib->x86linkmap;
-    }
-    return (void*)(idx+1);
+    return kzt_dl_return_handle(lib, idx);
 }
 
 void* my_dlmopen(void* lmid, void *filename, int flag)
@@ -3823,7 +3946,8 @@ static size_t kzt_dl_handle_index(dlprivate_t *dl, void *handle)
 
     if (nlib > dl->lib_sz) {
         for (size_t i = 0; i < dl->lib_sz; i++) {
-            if (kzt_dl_handle_matches_guest_link_map(dl->libs[i], handle))
+            if (kzt_dl_handle_matches_guest_link_map(
+                    kzt_dl_handle_library(dl, i), handle))
                 return i;
         }
     }
@@ -3945,47 +4069,48 @@ void* my_dlsym(void *handle, void *symbol){
         return NULL;
 #endif
     }
-    if(dl->count[nlib]==0) {
+    if(kzt_dl_handle_is_closed(dl, nlib)) {
         if(!dl->last_error)
             dl->last_error = box_malloc(129);
         snprintf(dl->last_error, 129, "Bad handle %p (already closed))\n", handle);
         printf_dlsym(LOG_NEVER, "%p return %p\n", dl->last_error, (void*)NULL);
         return NULL;
     }
-    if(dl->libs[nlib]) {
-        if(my_dlsym_lib(dl->libs[nlib], rsymbol, &start, &end, -1, NULL)==0) {
+    library_t *lib = kzt_dl_handle_library(dl, nlib);
+    if(lib) {
+        if(my_dlsym_lib(lib, rsymbol, &start, &end, -1, NULL)==0) {
             // not found
             __MY_CPU;
             #if 1
-            if(!dl->libs[nlib]->x86linkmap) {
+            if(!lib->x86linkmap) {
                 //redlopen
                 uint64_t ret = kzt_call_guest_dlopen(
-                    dl->libs[nlib]->name, dl->libs[nlib]->x86dlopenflag);
+                    lib->name, lib->x86dlopenflag);
                 if (!ret) {//user sometime test for finding a func.
                     printf_dlsym(LOG_NEVER, "redlopen %p return %p\n", rsymbol, (void*)NULL);
                     return NULL;
                 }
 		lsassert(ret);
-                dl->libs[nlib]->x86linkmap = (void *)ret;
+                lib->x86linkmap = (void *)ret;
                 ret = kzt_call_guest_dlsym(
-                    dl->libs[nlib]->x86linkmap, (void *)cpu->regs[R_ESI]);
+                    lib->x86linkmap, (void *)cpu->regs[R_ESI]);
                 printf_dlsym(LOG_DEBUG, "call x86dlsym filename %s is wrapped but not find symbol, dlsym(%p, %s) ret=0x%lx\n",
-                dl->libs[nlib]->name, dl->libs[nlib]->x86linkmap, (char *)cpu->regs[R_ESI], ret);
+                lib->name, lib->x86linkmap, (char *)cpu->regs[R_ESI], ret);
                 return (void *)ret;
             }
             #endif
             lsassert(dl->x86dlsym);
-            if (dl->libs[nlib]->x86linkmap != handle) {
-                cpu->regs[R_EDI] = (uintptr_t)dl->libs[nlib]->x86linkmap;
+            if (lib->x86linkmap != handle) {
+                cpu->regs[R_EDI] = (uintptr_t)lib->x86linkmap;
             }
 #if FORWORDBACK
             Push64(cpu, (uint64_t)dl->x86dlsym);
-            printf_dlsym(LOG_DEBUG, "warning call x86dlsym filename is %s %lx\n", dl->libs[nlib]->x86linkmap->l_name, cpu->regs[R_EDI]);
+            printf_dlsym(LOG_DEBUG, "warning call x86dlsym filename is %s %lx\n", lib->x86linkmap->l_name, cpu->regs[R_EDI]);
             return NULL;
 #else
             uint64_t ret = kzt_call_guest_dlsym(
                 (void *)cpu->regs[R_EDI], (void *)cpu->regs[R_ESI]);
-            printf_dlsym(LOG_DEBUG, "call x86dlsym filename is %s %s ret=0x%lx\n", dl->libs[nlib]->x86linkmap->l_name, (char *)cpu->regs[R_ESI], ret);
+            printf_dlsym(LOG_DEBUG, "call x86dlsym filename is %s %s ret=0x%lx\n", lib->x86linkmap->l_name, (char *)cpu->regs[R_ESI], ret);
             if (ret) {
                 return (void *)ret;
             }
@@ -4041,23 +4166,23 @@ int my_dlclose(void *handle)
         lsassertm(0,"%s",dl->last_error);
         return -1;
     }
-    if(dl->count[nlib]==0) {
+    if(kzt_dl_handle_is_closed(dl, nlib)) {
         if(!dl->last_error)
             dl->last_error = box_malloc(129);
         snprintf(dl->last_error, 129, "Bad handle %p (already closed))\n", handle);
         printf_dlsym(LOG_DEBUG, "dlclose: %s\n", dl->last_error);
         return -1;
     }
-    dl->count[nlib] = dl->count[nlib]-1;
-    if(dl->count[nlib]==0 && dl->dlopened[nlib]) {   // need to call Fini...
-        int idx = GetElfIndex(dl->libs[nlib]);
+    library_t *lib = kzt_dl_handle_library(dl, nlib);
+    if(kzt_dl_release_handle(dl, nlib)) {
+        int idx = GetElfIndex(lib);
         if(idx!=-1) {
             printf_dlsym(LOG_DEBUG, "dlclose: Call to Fini for %p\n", handle);
-            InactiveLibrary(dl->libs[nlib]);
+            kzt_dl_deactivate_library(lib);
             if (dl->x86dlclose) {
                 __MY_CPU;
-                if (dl->libs[nlib]->x86linkmap != handle) {
-                    cpu->regs[R_EDI] = (uintptr_t)dl->libs[nlib]->x86linkmap;
+                if (lib->x86linkmap != handle) {
+                    cpu->regs[R_EDI] = (uintptr_t)lib->x86linkmap;
                 }
                 kzt_forward_guest_dlclose(cpu);
                 return 0;
@@ -4163,7 +4288,7 @@ int my_dlinfo(void* handle, int request, void* info)
         return -1;
     }
     #endif
-    library_t *lib = dl->libs[nlib];
+    library_t *lib = kzt_dl_handle_library(dl, nlib);
     switch(request) {
         case 2: // RTLD_DI_LINKMAP
             {

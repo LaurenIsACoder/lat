@@ -96,6 +96,14 @@ _start:
     test %rax, %rax
     je fail_open
     mov %rax, %r12
+    lea plugin_path(%rip), %rdi
+    mov \$2, %esi
+    call dlopen@PLT
+    test %rax, %rax
+    je fail_open
+    mov %rax, %r13
+    cmp %r12, %r13
+    jne fail_reopen
     mov %rax, %rdi
     lea sym_name(%rip), %rsi
     call dlsym@PLT
@@ -104,6 +112,24 @@ _start:
     call *%rax
     cmp \$123, %eax
     jne fail_call
+    mov %r13, %rdi
+    call dlclose@PLT
+    mov %r12, %rdi
+    call dlclose@PLT
+    lea plugin_path(%rip), %rdi
+    mov \$2, %esi
+    call dlopen@PLT
+    test %rax, %rax
+    je fail_reopen_after_close
+    mov %rax, %r12
+    mov %rax, %rdi
+    lea sym_name(%rip), %rsi
+    call dlsym@PLT
+    test %rax, %rax
+    je fail_sym_after_close
+    call *%rax
+    cmp \$123, %eax
+    jne fail_call_after_close
     mov %r12, %rdi
     call dlclose@PLT
     xor %edi, %edi
@@ -116,6 +142,18 @@ fail_sym:
     call exit@PLT
 fail_call:
     mov \$95, %edi
+    call exit@PLT
+fail_reopen:
+    mov \$96, %edi
+    call exit@PLT
+fail_reopen_after_close:
+    mov \$97, %edi
+    call exit@PLT
+fail_sym_after_close:
+    mov \$98, %edi
+    call exit@PLT
+fail_call_after_close:
+    mov \$99, %edi
     call exit@PLT
     .section .rodata
 plugin_path:
