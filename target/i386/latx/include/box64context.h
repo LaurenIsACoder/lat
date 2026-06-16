@@ -43,19 +43,22 @@ void free_dependedlib(needed_libs_t* depended);
 
 typedef struct dlprivate_s {
     library_t   **libs;
+    void        **handles;
     size_t      *count;
     size_t      *dlopened;
-    struct link_map  *dlx86handle;
     size_t      lib_sz;
     size_t      lib_cap;
     char*       last_error;
+    char*       last_error_returned;
     void *     x86dlopen;
+    void *     x86dlmopen;
     void *     x86dlclose;
     void *     x86dlsym;
     void *     x86dladdr1;
     void *     x86dladdr;
     void *     x86dlinfo;
     void *     x86dlvsym;
+    void *     x86dlerror;
 } dlprivate_t;
 struct latx_kzt_debug {
     char *name;

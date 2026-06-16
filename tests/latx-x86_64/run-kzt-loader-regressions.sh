@@ -166,6 +166,34 @@ _start:
     call dlclose@PLT
     test %eax, %eax
     jne fail_global_close
+    mov \$-1, %rdi
+    lea plugin_path(%rip), %rsi
+    mov \$2, %edx
+    call dlmopen@PLT
+    test %rax, %rax
+    je fail_dlmopen
+    mov %rax, %r12
+    mov %rax, %rdi
+    mov \$1, %esi
+    lea lmid_slot(%rip), %rdx
+    call dlinfo@PLT
+    test %eax, %eax
+    jne fail_dlmopen_lmid
+    mov lmid_slot(%rip), %rax
+    test %rax, %rax
+    je fail_dlmopen_lmid
+    mov %r12, %rdi
+    lea sym_name(%rip), %rsi
+    call dlsym@PLT
+    test %rax, %rax
+    je fail_dlmopen_sym
+    call *%rax
+    cmp \$123, %eax
+    jne fail_dlmopen_call
+    mov %r12, %rdi
+    call dlclose@PLT
+    test %eax, %eax
+    jne fail_dlmopen_close
     xor %edi, %edi
     call exit@PLT
 fail_open:
@@ -207,11 +235,30 @@ fail_close_after_reopen:
 fail_global_close:
     mov \$109, %edi
     call exit@PLT
+fail_dlmopen:
+    mov \$110, %edi
+    call exit@PLT
+fail_dlmopen_lmid:
+    mov \$111, %edi
+    call exit@PLT
+fail_dlmopen_sym:
+    mov \$112, %edi
+    call exit@PLT
+fail_dlmopen_call:
+    mov \$113, %edi
+    call exit@PLT
+fail_dlmopen_close:
+    mov \$114, %edi
+    call exit@PLT
     .section .rodata
 plugin_path:
     .asciz "$tmpdir/libplugin.so"
 sym_name:
     .asciz "plugin_value"
+    .bss
+    .align 8
+lmid_slot:
+    .quad 0
 EOF
 
     clang --target=x86_64-linux-gnu -nostdlib -shared -fPIC -fuse-ld=lld \
@@ -359,18 +406,44 @@ EOF
     .text
     .global _start
 _start:
+    lea missing_name(%rip), %rdi
+    mov $2, %esi
+    call dlopen@PLT
+    test %rax, %rax
+    jne fail_missing_open
+    call dlerror@PLT
+    test %rax, %rax
+    je fail_missing_error
     xor %edi, %edi
     lea exit_sym(%rip), %rsi
     lea bad_ver(%rip), %rdx
     call dlvsym@PLT
     test %rax, %rax
     jne fail_bad_version
+    call dlerror@PLT
+    test %rax, %rax
+    je fail_bad_version_error
     xor %edi, %edi
     lea exit_sym(%rip), %rsi
     lea good_ver(%rip), %rdx
     call dlvsym@PLT
     test %rax, %rax
     je fail_good_version
+    mov $-1, %rdi
+    lea exit_sym(%rip), %rsi
+    lea bad_ver(%rip), %rdx
+    call dlvsym@PLT
+    test %rax, %rax
+    jne fail_next_bad_version
+    call dlerror@PLT
+    test %rax, %rax
+    je fail_next_bad_version_error
+    mov $-1, %rdi
+    lea exit_sym(%rip), %rsi
+    lea good_ver(%rip), %rdx
+    call dlvsym@PLT
+    test %rax, %rax
+    je fail_next_good_version
     lea plugin_name(%rip), %rdi
     mov $2, %esi
     call dlopen@PLT
@@ -394,6 +467,9 @@ _start:
 fail_bad_version:
     mov $116, %edi
     call exit@PLT
+fail_bad_version_error:
+    mov $121, %edi
+    call exit@PLT
 fail_good_version:
     mov $117, %edi
     call exit@PLT
@@ -406,9 +482,26 @@ fail_handle_bad_version:
 fail_handle_good_version:
     mov $120, %edi
     call exit@PLT
+fail_missing_open:
+    mov $122, %edi
+    call exit@PLT
+fail_missing_error:
+    mov $123, %edi
+    call exit@PLT
+fail_next_bad_version:
+    mov $124, %edi
+    call exit@PLT
+fail_next_bad_version_error:
+    mov $125, %edi
+    call exit@PLT
+fail_next_good_version:
+    mov $126, %edi
+    call exit@PLT
     .section .rodata
 exit_sym:
     .asciz "exit"
+missing_name:
+    .asciz "./libdoesnotexist-kzt.so"
 plugin_name:
     .asciz "./libversplugin.so"
 plugin_sym:
@@ -454,6 +547,11 @@ if [ -e "$guest_lib_dir/libGL.so.1" ] && [ -e "$guest_lib_dir/libEGL.so.1" ] &&
     .global _start
 _start:
     lea gl_name(%rip), %rdi
+    mov $6, %esi
+    call dlopen@PLT
+    test %rax, %rax
+    jne fail_gl_unloaded_noload
+    lea gl_name(%rip), %rdi
     mov $2, %esi
     call dlopen@PLT
     test %rax, %rax
@@ -468,6 +566,19 @@ _start:
     mov gl_link_map_slot(%rip), %rax
     test %rax, %rax
     je fail_gl_dlinfo
+    cmp %r12, %rax
+    jne fail_gl_dlopen_handle
+    mov %rax, %rdi
+    lea glx_proc(%rip), %rsi
+    call dlsym@PLT
+    test %rax, %rax
+    je fail_gl_dlinfo_handle
+    mov %r12, %rdi
+    mov $1, %esi
+    lea gl_lmid_slot(%rip), %rdx
+    call dlinfo@PLT
+    test %eax, %eax
+    jne fail_gl_dlinfo_lmid
     mov %r12, %rax
     mov %rax, %rdi
     lea glx_proc(%rip), %rsi
@@ -475,13 +586,78 @@ _start:
     test %rax, %rax
     je fail_gl_sym
     mov %r12, %rdi
+    lea gl_missing_proc(%rip), %rsi
+    call dlsym@PLT
+    test %rax, %rax
+    jne fail_gl_missing_sym
+    call dlerror@PLT
+    test %rax, %rax
+    je fail_gl_missing_sym_error
+    mov %r12, %rdi
+    lea glx_proc(%rip), %rsi
+    lea gl_bad_ver(%rip), %rdx
+    call dlvsym@PLT
+    test %rax, %rax
+    jne fail_gl_bad_dlvsym
+    call dlerror@PLT
+    test %rax, %rax
+    je fail_gl_bad_dlvsym_error
+    lea gl_name(%rip), %rdi
+    mov $6, %esi
+    call dlopen@PLT
+    test %rax, %rax
+    je fail_gl_noload
+    cmp %r12, %rax
+    jne fail_gl_noload
+    mov %rax, %r13
+    mov %r13, %rdi
     call dlclose@PLT
+    test %eax, %eax
+    jne fail_gl_noload_close
+    mov %r12, %rdi
+    lea glx_proc(%rip), %rsi
+    call dlsym@PLT
+    test %rax, %rax
+    je fail_gl_noload_ref
+    mov %r12, %rdi
+    call dlclose@PLT
+    mov %r12, %rdi
+    lea glx_proc(%rip), %rsi
+    lea gl_bad_ver(%rip), %rdx
+    call dlvsym@PLT
+    test %rax, %rax
+    jne fail_gl_closed_dlvsym
     mov %r12, %rdi
     mov $2, %esi
     lea gl_link_map_slot(%rip), %rdx
     call dlinfo@PLT
     test %eax, %eax
     je fail_gl_closed_dlinfo
+    call dlerror@PLT
+    test %rax, %rax
+    je fail_gl_closed_dlinfo_error
+    call dlerror@PLT
+    test %rax, %rax
+    jne fail_gl_closed_dlinfo_error
+    lea gl_name(%rip), %rdi
+    mov $2, %esi
+    call dlopen@PLT
+    test %rax, %rax
+    je fail_gl_reopen
+    mov %rax, %r12
+    mov %rax, %rdi
+    lea glx_proc(%rip), %rsi
+    call dlsym@PLT
+    test %rax, %rax
+    je fail_gl_reopen_sym
+    mov %r12, %rdi
+    call dlclose@PLT
+    test %eax, %eax
+    jne fail_gl_reopen_close
+    mov %r12, %rdi
+    call dlclose@PLT
+    test %eax, %eax
+    je fail_gl_double_close
 
     lea egl_name(%rip), %rdi
     mov $2, %esi
@@ -502,14 +678,65 @@ _start:
 fail_gl_open:
     mov $96, %edi
     call exit@PLT
+fail_gl_unloaded_noload:
+    mov $109, %edi
+    call exit@PLT
 fail_gl_sym:
     mov $97, %edi
+    call exit@PLT
+fail_gl_missing_sym:
+    mov $118, %edi
+    call exit@PLT
+fail_gl_missing_sym_error:
+    mov $119, %edi
+    call exit@PLT
+fail_gl_bad_dlvsym:
+    mov $116, %edi
+    call exit@PLT
+fail_gl_bad_dlvsym_error:
+    mov $117, %edi
+    call exit@PLT
+fail_gl_noload:
+    mov $106, %edi
+    call exit@PLT
+fail_gl_noload_close:
+    mov $107, %edi
+    call exit@PLT
+fail_gl_noload_ref:
+    mov $108, %edi
     call exit@PLT
 fail_gl_dlinfo:
     mov $100, %edi
     call exit@PLT
+fail_gl_dlopen_handle:
+    mov $115, %edi
+    call exit@PLT
+fail_gl_dlinfo_handle:
+    mov $111, %edi
+    call exit@PLT
+fail_gl_dlinfo_lmid:
+    mov $110, %edi
+    call exit@PLT
 fail_gl_closed_dlinfo:
     mov $101, %edi
+    call exit@PLT
+fail_gl_closed_dlinfo_error:
+    mov $114, %edi
+    call exit@PLT
+fail_gl_closed_dlvsym:
+    mov $112, %edi
+    call exit@PLT
+fail_gl_reopen:
+    mov $102, %edi
+    call exit@PLT
+fail_gl_reopen_sym:
+    mov $103, %edi
+    call exit@PLT
+fail_gl_reopen_close:
+    mov $104, %edi
+    call exit@PLT
+fail_gl_double_close:
+    mov $105, %edi
     call exit@PLT
 fail_egl_open:
     mov $98, %edi
@@ -522,6 +749,10 @@ gl_name:
     .asciz "libGL.so.1"
 glx_proc:
     .asciz "glXGetProcAddressARB"
+gl_missing_proc:
+    .asciz "kztDefinitelyMissingGLSymbol"
+gl_bad_ver:
+    .asciz "GLIBC_999.0"
 egl_name:
     .asciz "libEGL.so.1"
 egl_proc:
@@ -529,6 +760,8 @@ egl_proc:
     .bss
     .align 8
 gl_link_map_slot:
+    .quad 0
+gl_lmid_slot:
     .quad 0
 EOF
 

@@ -3508,9 +3508,11 @@ dlprivate_t *NewDLPrivate(void) {
 }
 void FreeDLPrivate(dlprivate_t **lib) {
     box_free((*lib)->libs);
+    box_free((*lib)->handles);
     box_free((*lib)->count);
     box_free((*lib)->dlopened);
     box_free((*lib)->last_error);
+    box_free((*lib)->last_error_returned);
     box_free(*lib);
 }
 
@@ -3525,7 +3527,12 @@ void* my_dlvsym(void *handle, void *symbol, const char *vername) EXPORT;
 int my_dlinfo(void* handle, int request, void* info) EXPORT;
 
 
-#define CLEARERR    if(dl->last_error) box_free(dl->last_error); dl->last_error = NULL;
+#define CLEARERR do {                   \
+    box_free(dl->last_error);           \
+    dl->last_error = NULL;              \
+    box_free(dl->last_error_returned);  \
+    dl->last_error_returned = NULL;     \
+} while (0);
 static void Push64(CPUX86State *cpu, uint64_t v)
 {
     cpu->regs[R_ESP] -= 8;
@@ -3546,24 +3553,26 @@ int init_x86dlfun(void)
     h = loadElfFromFile("libc.so.6");
     lsassert(h);
     const char* syms[] = {
-        "dlopen", "dlsym", "dlclose", "dladdr", "dladdr1", "dlinfo",
-        "dlvsym"
+        "dlopen", "dlmopen", "dlsym", "dlclose", "dladdr", "dladdr1",
+        "dlinfo", "dlvsym", "dlerror"
     };
-    void *rsyms[7] = {0};
+    void *rsyms[9] = {0};
     int rrsyms = 0;
-    ResetSpecialCaseElf(h, syms, 7, rsyms, &rrsyms);
-    if (rrsyms != 7) {
+    ResetSpecialCaseElf(h, syms, 9, rsyms, &rrsyms);
+    if (rrsyms != 9) {
         h = loadElfFromFile("libdl.so.2");
-        ResetSpecialCaseElf(h, syms, 7, rsyms, &rrsyms);
+        ResetSpecialCaseElf(h, syms, 9, rsyms, &rrsyms);
     }
-    lsassert(rrsyms == 7);
+    lsassert(rrsyms == 9);
     my_context->dlprivate->x86dlopen = rsyms[0];
-    my_context->dlprivate->x86dlsym = rsyms[1];
-    my_context->dlprivate->x86dlclose = rsyms[2];
-    my_context->dlprivate->x86dladdr = rsyms[3];
-    my_context->dlprivate->x86dladdr1 = rsyms[4];
-    my_context->dlprivate->x86dlinfo = rsyms[5];
-    my_context->dlprivate->x86dlvsym = rsyms[6];
+    my_context->dlprivate->x86dlmopen = rsyms[1];
+    my_context->dlprivate->x86dlsym = rsyms[2];
+    my_context->dlprivate->x86dlclose = rsyms[3];
+    my_context->dlprivate->x86dladdr = rsyms[4];
+    my_context->dlprivate->x86dladdr1 = rsyms[5];
+    my_context->dlprivate->x86dlinfo = rsyms[6];
+    my_context->dlprivate->x86dlvsym = rsyms[7];
+    my_context->dlprivate->x86dlerror = rsyms[8];
     kzt_wine_init_x86();
     return 0;
 }
@@ -3572,6 +3581,13 @@ static uintptr_t kzt_call_guest_dlopen(void *filename, int flag)
 {
     return RunFunctionWithState(
         (uintptr_t)my_context->dlprivate->x86dlopen, 2, filename, flag);
+}
+
+static uintptr_t kzt_call_guest_dlmopen(void *lmid, void *filename, int flag)
+{
+    return RunFunctionWithState(
+        (uintptr_t)my_context->dlprivate->x86dlmopen, 3, lmid, filename,
+        flag);
 }
 
 static uintptr_t kzt_call_guest_dlsym(void *handle, void *symbol)
@@ -3586,6 +3602,20 @@ static int kzt_call_guest_dlclose(void *handle)
         (uintptr_t)my_context->dlprivate->x86dlclose, 1, handle);
 }
 
+static uintptr_t kzt_call_guest_dlerror(void)
+{
+    return RunFunctionWithState(
+        (uintptr_t)my_context->dlprivate->x86dlerror, 0);
+}
+
+static char *kzt_dlerror_take_local(dlprivate_t *dl)
+{
+    box_free(dl->last_error_returned);
+    dl->last_error_returned = dl->last_error;
+    dl->last_error = NULL;
+    return dl->last_error_returned;
+}
+
 static int kzt_call_guest_dladdr(void *addr, void *info)
 {
     return RunFunctionWithState(
@@ -3598,6 +3628,29 @@ static int kzt_call_guest_dladdr1(void *addr, void *info, void **extra_info,
     return RunFunctionWithState(
         (uintptr_t)my_context->dlprivate->x86dladdr1, 4, addr, info,
         extra_info, flags);
+}
+
+static int kzt_dladdr1_set_link_map_result(void **extra_info, library_t *lib)
+{
+    /*
+     * The local fallback resolves native wrapper addresses that guest dladdr1()
+     * cannot see.  If the wrapper already has a guest identity, keep the
+     * externally visible link_map in the same guest namespace as dlinfo().
+     */
+    if (!extra_info)
+        return 0;
+
+    if (lib && lib->x86linkmap) {
+        *(struct link_map **)extra_info = lib->x86linkmap;
+        return 1;
+    }
+
+    linkmap_t *local_map = getLinkMapLib(lib);
+    if (!local_map)
+        return 0;
+
+    *(linkmap_t **)extra_info = local_map;
+    return 1;
 }
 
 static int kzt_call_guest_dlinfo(void *handle, int request, void *info)
@@ -3619,25 +3672,39 @@ static void kzt_forward_guest_dlsym(CPUX86State *cpu)
     Push64(cpu, (uint64_t)my_context->dlprivate->x86dlsym);
 }
 
-static void *kzt_dl_return_handle(library_t *lib, size_t index)
+static void kzt_forward_guest_dlvsym(CPUX86State *cpu)
 {
-    if (lib && lib->type == LIB_EMULATED)
+    Push64(cpu, (uint64_t)my_context->dlprivate->x86dlvsym);
+}
+
+static void *kzt_dl_make_handle(library_t *lib, size_t index)
+{
+    if (lib && lib->x86linkmap)
         return lib->x86linkmap;
 
     return (void *)(index + 1);
 }
 
-static int kzt_dl_is_synthetic_handle(library_t *lib, void *handle,
-                                      size_t index)
+static void *kzt_dl_return_handle(dlprivate_t *dl, size_t index)
 {
-    return lib && lib->type != LIB_EMULATED
-        && kzt_dl_return_handle(lib, index) == handle;
+    return dl->handles[index];
 }
 
-static void kzt_dl_retain_handle(dlprivate_t *dl, size_t index, int flag)
+static void kzt_dl_set_return_handle(dlprivate_t *dl, size_t index,
+                                     library_t *lib)
 {
-    if (!(flag & 0x4))
-        dl->count[index]++;
+    dl->handles[index] = kzt_dl_make_handle(lib, index);
+}
+
+static int kzt_dl_is_local_synthetic_handle(library_t *lib, void *handle,
+                                            size_t index)
+{
+    return lib && lib->type != LIB_EMULATED && handle == (void *)(index + 1);
+}
+
+static void kzt_dl_retain_handle(dlprivate_t *dl, size_t index)
+{
+    dl->count[index]++;
 }
 
 static void kzt_dl_reserve_handle(dlprivate_t *dl)
@@ -3648,23 +3715,32 @@ static void kzt_dl_reserve_handle(dlprivate_t *dl)
     dl->lib_cap += 4;
     dl->libs = (library_t**)box_realloc(
         dl->libs, sizeof(library_t*) * dl->lib_cap);
+    dl->handles = (void**)box_realloc(
+        dl->handles, sizeof(void*) * dl->lib_cap);
     dl->count = (size_t*)box_realloc(
         dl->count, sizeof(size_t) * dl->lib_cap);
     dl->dlopened = (size_t*)box_realloc(
         dl->dlopened, sizeof(size_t) * dl->lib_cap);
+    memset(dl->libs + dl->lib_sz, 0,
+           (dl->lib_cap - dl->lib_sz) * sizeof(library_t*));
     memset(dl->count + dl->lib_sz, 0,
+           (dl->lib_cap - dl->lib_sz) * sizeof(size_t));
+    memset(dl->handles + dl->lib_sz, 0,
+           (dl->lib_cap - dl->lib_sz) * sizeof(void*));
+    memset(dl->dlopened + dl->lib_sz, 0,
            (dl->lib_cap - dl->lib_sz) * sizeof(size_t));
 }
 
 static size_t kzt_dl_add_handle(dlprivate_t *dl, library_t *lib,
-                                size_t dlopened)
+                                size_t local_owner)
 {
     kzt_dl_reserve_handle(dl);
 
     size_t index = dl->lib_sz++;
     dl->libs[index] = lib;
     dl->count[index]++;
-    dl->dlopened[index] = dlopened;
+    dl->dlopened[index] = local_owner;
+    kzt_dl_set_return_handle(dl, index, lib);
     return index;
 }
 
@@ -3675,8 +3751,11 @@ static int kzt_dl_handle_is_closed(dlprivate_t *dl, size_t index)
 
 static int kzt_dl_release_handle(dlprivate_t *dl, size_t index)
 {
+    if (kzt_dl_handle_is_closed(dl, index))
+        return 0;
+
     dl->count[index]--;
-    return dl->count[index] == 0 && dl->dlopened[index];
+    return dl->count[index] == 0;
 }
 
 static library_t *kzt_dl_handle_library(dlprivate_t *dl, size_t index)
@@ -3689,7 +3768,7 @@ static size_t kzt_dl_handle_count(dlprivate_t *dl, size_t index)
     return dl->count[index];
 }
 
-static size_t kzt_dl_handle_dlopened(dlprivate_t *dl, size_t index)
+static size_t kzt_dl_handle_local_owner(dlprivate_t *dl, size_t index)
 {
     return dl->dlopened[index];
 }
@@ -3707,10 +3786,11 @@ static int kzt_dl_find_handle_by_name(dlprivate_t *dl, const char *name,
     return 0;
 }
 
-static int kzt_dl_handle_needs_guest_reopen(dlprivate_t *dl, size_t index)
+static int kzt_dl_handle_needs_guest_reopen(dlprivate_t *dl, size_t index,
+                                            library_t *lib)
 {
     return kzt_dl_handle_is_closed(dl, index)
-        && kzt_dl_handle_dlopened(dl, index);
+        && lib && !lib->x86linkmap;
 }
 
 static void kzt_dl_deactivate_library(library_t *lib)
@@ -3721,8 +3801,8 @@ static void kzt_dl_deactivate_library(library_t *lib)
     InactiveLibrary(lib);
 }
 
-static void kzt_dlopen_set_guest_error(dlprivate_t *dl, void *filename,
-                                       int flag)
+static void kzt_dlopen_set_sync_error(dlprivate_t *dl, void *filename,
+                                      int flag)
 {
     const char *name = filename ? (char *)filename : "NULL";
 
@@ -3732,8 +3812,7 @@ static void kzt_dlopen_set_guest_error(dlprivate_t *dl, void *filename,
              name, flag);
 }
 
-static void *kzt_dlopen_guest_library(dlprivate_t *dl, void *filename,
-                                      int flag)
+static void *kzt_dlopen_guest_library(void *filename, int flag)
 {
     const char *name = filename ? (char *)filename : "NULL";
     uint64_t ret = kzt_call_guest_dlopen(filename, flag);
@@ -3743,9 +3822,13 @@ static void *kzt_dlopen_guest_library(dlprivate_t *dl, void *filename,
     if (ret)
         return (void *)ret;
 
-    kzt_dlopen_set_guest_error(dl, filename, flag);
-    printf_dlsym(LOG_NEVER, "%p return %p\n", dl->last_error, (void*)NULL);
+    printf_dlsym(LOG_NEVER, "%p return %p\n", (void*)NULL, (void*)NULL);
     return NULL;
+}
+
+static int kzt_dlopen_is_noload(int flag)
+{
+    return flag & 0x4;
 }
 
 static int kzt_dlopen_add_wrapped_library(dlprivate_t *dl, void *filename,
@@ -3810,8 +3893,37 @@ static int kzt_dlopen_sync_guest_link_map(void *filename, int flag,
     lib_t *maplib = (is_local)?h->lib->maplib:my_context->maplib;
     if(AddSymbolsLibrary(maplib, h->lib)) {   // also add needed libs
         printf_dlsym(LOG_INFO, "Failure to Add lib => fail\n");
+        (void)kzt_call_guest_dlclose(ret);
+        h->lib->x86linkmap = NULL;
+        h->latx_hasfix = 0;
         return -1;
     }
+    return 0;
+}
+
+static int kzt_dlopen_sync_native_guest_link_map(void *filename, int flag,
+                                                 library_t *lib)
+{
+    struct link_map *ret =
+        (struct link_map *)(uintptr_t)kzt_call_guest_dlopen(filename, flag);
+    if (!ret)
+        return -1;
+
+    printf_dlsym(LOG_DEBUG, "latx RunFunctionWithState dlopen %s native addr %p\n",
+                 (char *)filename, (void *)ret->l_addr);
+    lib->x86linkmap = ret;
+    return 0;
+}
+
+static int kzt_dlopen_retain_guest_link_map(void *filename, int flag,
+                                            library_t *lib)
+{
+    struct link_map *ret =
+        (struct link_map *)(uintptr_t)kzt_call_guest_dlopen(filename, flag);
+    if (!ret)
+        return -1;
+
+    lib->x86linkmap = ret;
     return 0;
 }
 
@@ -3819,7 +3931,7 @@ static int kzt_dlopen_sync_wrapped_guest(library_t *lib, char *rfilename,
                                          int flag, int is_local)
 {
     if (lib->type != LIB_EMULATED)
-        return 0;
+        return kzt_dlopen_sync_native_guest_link_map(rfilename, flag, lib);
 
     int libidx = GetElfIndex(lib);
     lsassert(libidx >= 0);
@@ -3830,7 +3942,12 @@ static int kzt_dlopen_sync_wrapped_guest(library_t *lib, char *rfilename,
         return kzt_dlopen_sync_guest_link_map(rfilename, flag, h, is_local);
     }
 
-    return 0;
+    /*
+     * The library may already be present as a guest dependency.  An explicit
+     * dlopen still has to retain the guest loader reference because dlclose()
+     * will release it through the guest handle.
+     */
+    return kzt_dlopen_retain_guest_link_map(rfilename, flag, lib);
 }
 
 static void *kzt_dlopen_existing_handle(dlprivate_t *dl, char *rfilename,
@@ -3838,43 +3955,52 @@ static void *kzt_dlopen_existing_handle(dlprivate_t *dl, char *rfilename,
                                         size_t handle_index)
 {
     library_t *handle_lib = kzt_dl_handle_library(dl, handle_index);
-    if(kzt_dl_handle_needs_guest_reopen(dl, handle_index)) {
+    if(kzt_dl_handle_needs_guest_reopen(dl, handle_index, handle_lib)) {
         int idx = GetElfIndex(handle_lib);
-        if(idx!=-1) {
-            printf_dlsym(LOG_DEBUG, "dlopen: Recycling guest handle for %p (%s)\n",
-                         (void*)(handle_index+1), rfilename);
-            if (IsEmuLib(handle_lib)) {
-                elfheader_t * h = my_context->elfs[idx];
-                lsassert(h);
-                if (kzt_dlopen_sync_guest_link_map(rfilename, flag, h,
-                                                   is_local)) {
-                    kzt_dlopen_set_guest_error(dl, rfilename, flag);
-                    return NULL;
-                }
+        printf_dlsym(LOG_DEBUG, "dlopen: Recycling guest handle for %p (%s)\n",
+                     (void*)(handle_index+1), rfilename);
+        if (IsEmuLib(handle_lib)) {
+            lsassert(idx != -1);
+            elfheader_t * h = my_context->elfs[idx];
+            lsassert(h);
+            if (kzt_dlopen_sync_guest_link_map(rfilename, flag, h,
+                                               is_local)) {
+                kzt_dlopen_set_sync_error(dl, rfilename, flag);
+                return NULL;
             }
+        } else if (kzt_dlopen_sync_native_guest_link_map(
+                       rfilename, flag, handle_lib)) {
+            kzt_dlopen_set_sync_error(dl, rfilename, flag);
+            return NULL;
         }
+        kzt_dl_set_return_handle(dl, handle_index, handle_lib);
+    } else if (handle_lib && handle_lib->x86linkmap
+               && kzt_dlopen_retain_guest_link_map(rfilename, flag,
+                                                   handle_lib)) {
+        kzt_dlopen_set_sync_error(dl, rfilename, flag);
+        return NULL;
     }
-    kzt_dl_retain_handle(dl, handle_index, flag);
-    printf_dlsym(LOG_DEBUG, "dlopen: Recycling %s/%p count=%ld (dlopened=%ld, elf_index=%d)\n",
+    kzt_dl_retain_handle(dl, handle_index);
+    printf_dlsym(LOG_DEBUG, "dlopen: Recycling %s/%p count=%ld (local_owner=%ld, elf_index=%d)\n",
                  rfilename, (void*)(handle_index+1),
                  kzt_dl_handle_count(dl, handle_index),
-                 kzt_dl_handle_dlopened(dl, handle_index),
+                 kzt_dl_handle_local_owner(dl, handle_index),
                  GetElfIndex(handle_lib));
-    return kzt_dl_return_handle(handle_lib, handle_index);
+    return kzt_dl_return_handle(dl, handle_index);
 }
 
 static void *kzt_dlopen_self_handle(dlprivate_t *dl, int flag)
 {
-    return kzt_dlopen_guest_library(dl, NULL, flag);
+    return kzt_dlopen_guest_library(NULL, flag);
 }
 
 static void *kzt_dlopen_new_handle(dlprivate_t *dl, library_t *lib,
-                                   void *filename, size_t dlopened)
+                                   void *filename, size_t local_owner)
 {
-    size_t idx = kzt_dl_add_handle(dl, lib, dlopened);
-    printf_dlsym(LOG_DEBUG, "dlopen: New handle %p (%s), dlopened=%ld\n",
-                 (void*)(idx+1), (char*)filename, dlopened);
-    return kzt_dl_return_handle(lib, idx);
+    size_t idx = kzt_dl_add_handle(dl, lib, local_owner);
+    printf_dlsym(LOG_DEBUG, "dlopen: New handle %p (%s), local_owner=%ld\n",
+                 (void*)(idx+1), (char*)filename, local_owner);
+    return kzt_dl_return_handle(dl, idx);
 }
 
 static int kzt_dlopen_expand_filename(char *rfilename, size_t rfilename_size)
@@ -3931,7 +4057,7 @@ typedef enum {
 
 static KztDlopenLoadResult kzt_dlopen_load_named_library(
     dlprivate_t *dl, void *filename, char *rfilename, int flag, int is_local,
-    size_t *dlopened, library_t **lib, void **direct_return)
+    size_t *local_owner, library_t **lib, void **direct_return)
 {
     *lib = NULL;
     *direct_return = NULL;
@@ -3939,13 +4065,17 @@ static KztDlopenLoadResult kzt_dlopen_load_named_library(
     if(strstr(rfilename, "libGL.so")){
         strcpy(rfilename, "libGL.so.1");
     }
-    *dlopened = (GetLibInternal(rfilename)==NULL);
+    *local_owner = (GetLibInternal(rfilename)==NULL);
     // Then open the lib
     const char* libs[] = {rfilename};
     my_context->deferedInit = 1;
     int bindnow = (flag&0x2)?1:0;
     if (!FindLibIsWrapped(basename(rfilename))) {
-        *direct_return = kzt_dlopen_guest_library(dl, filename, flag);
+        *direct_return = kzt_dlopen_guest_library(filename, flag);
+        return KZT_DLOPEN_LOAD_DIRECT;
+    }
+    if (kzt_dlopen_is_noload(flag)) {
+        *direct_return = kzt_dlopen_guest_library(filename, flag);
         return KZT_DLOPEN_LOAD_DIRECT;
     }
     if(kzt_dlopen_add_wrapped_library(dl, filename, rfilename, flag,
@@ -3954,9 +4084,8 @@ static KztDlopenLoadResult kzt_dlopen_load_named_library(
     }
     *lib = GetLibInternal(rfilename);
     if (!*lib) return KZT_DLOPEN_LOAD_ERROR;
-    (*lib)->x86dlopenflag = flag;
     if (kzt_dlopen_sync_wrapped_guest(*lib, rfilename, flag, is_local)) {
-        kzt_dlopen_set_guest_error(dl, rfilename, flag);
+        kzt_dlopen_set_sync_error(dl, rfilename, flag);
         return KZT_DLOPEN_LOAD_ERROR;
     }
     //TODO:RunDeferedElfInit;
@@ -3968,7 +4097,7 @@ void* my_dlopen(void *filename, int flag){
     // TODO, handling flags?
     library_t *lib = NULL;
     dlprivate_t *dl = my_context->dlprivate;
-    size_t dlopened = 0;
+    size_t local_owner = 0;
     int is_local = (flag&0x100)?0:1;  // if not global, then local, and that means symbols are not put in the global "pot" for other libs
     CLEARERR
     if (!dl->x86dlopen) {
@@ -3995,7 +4124,7 @@ void* my_dlopen(void *filename, int flag){
         void *direct_return = NULL;
         KztDlopenLoadResult load_result =
             kzt_dlopen_load_named_library(dl, filename, rfilename, flag,
-                                          is_local, &dlopened, &lib,
+                                          is_local, &local_owner, &lib,
                                           &direct_return);
         if (load_result == KZT_DLOPEN_LOAD_DIRECT)
             return direct_return;
@@ -4006,16 +4135,24 @@ void* my_dlopen(void *filename, int flag){
     }
     //get the lib and add it to the collection
 
-    return kzt_dlopen_new_handle(dl, lib, filename, dlopened);
+    return kzt_dlopen_new_handle(dl, lib, filename, local_owner);
 }
 
 void* my_dlmopen(void* lmid, void *filename, int flag)
 {
-    if(lmid) {
-        printf_dlsym(LOG_INFO, "Warning, dlmopen(%p, %p(\"%s\"), 0x%x) called with lmid not LMID_ID_BASE (unsupported)\n", lmid, filename, filename?(char*)filename:"self", flag);
+    if (!lmid)
+        return my_dlopen(filename, flag);
+
+    dlprivate_t *dl = my_context->dlprivate;
+    CLEARERR
+    if (!dl->x86dlmopen) {
+        init_x86dlfun();
+        lsassert(dl->x86dlmopen);
     }
-    // lmid is ignored for now...
-    return my_dlopen(filename, flag);
+
+    printf_dlsym(LOG_DEBUG, "Call to guest dlmopen(%p, %p(\"%s\"), 0x%x)\n",
+                 lmid, filename, filename?(char*)filename:"self", flag);
+    return (void *)kzt_call_guest_dlmopen(lmid, filename, flag);
 }
 
 KHASH_SET_INIT_INT(libs);
@@ -4053,35 +4190,14 @@ static int my_dlsym_lib(library_t* lib, const char* rsymbol, uintptr_t *start, u
     return ret;
 }
 
-static int kzt_dl_handle_matches_guest_link_map(library_t *lib, void *handle)
-{
-    return lib && lib->active && lib->type == LIB_EMULATED
-        && ((size_t)lib->x86linkmap) == (size_t)handle;
-}
-
-static uint64_t kzt_dlsym_reopen_guest_library(library_t *lib, void *symbol)
-{
-    uint64_t ret = kzt_call_guest_dlopen(lib->name, lib->x86dlopenflag);
-
-    if (!ret)
-        return 0;
-
-    lib->x86linkmap = (void *)ret;
-    return kzt_call_guest_dlsym(lib->x86linkmap, symbol);
-}
-
-typedef enum {
-    KZT_DLSYM_WRAPPED_NOT_HANDLED = 0,
-    KZT_DLSYM_WRAPPED_FOUND,
-    KZT_DLSYM_WRAPPED_MISSING,
-} KztDlsymWrappedResult;
-
+#ifdef LATX_RELOCATION_SAVE_SYMBOLS
 static int kzt_dlsym_try_global_fallback(const char *rsymbol,
                                          uintptr_t *start, uintptr_t *end)
 {
     return GetGlobalSymbolStartEnd(
         my_context->maplib, rsymbol, start, end, NULL, -1, NULL);
 }
+#endif
 
 static void kzt_dlsym_set_missing_error(dlprivate_t *dl, const char *rsymbol,
                                         void *handle)
@@ -4112,8 +4228,8 @@ static void kzt_dl_set_closed_handle_error(dlprivate_t *dl, void *handle)
              handle);
 }
 
-static void kzt_dlclose_set_bad_handle_error(dlprivate_t *dl, void *handle,
-                                             int ret)
+static void kzt_dl_set_bad_handle_error(dlprivate_t *dl, void *handle,
+                                        int ret)
 {
     if(!dl->last_error)
         dl->last_error = box_malloc(129);
@@ -4121,44 +4237,30 @@ static void kzt_dlclose_set_bad_handle_error(dlprivate_t *dl, void *handle,
              handle, ret);
 }
 
-static KztDlsymWrappedResult kzt_dlsym_try_wrapped_link_map(
-    const char *lmfile, const char *rsymbol, uintptr_t *start, uintptr_t *end)
+static int kzt_dl_handle_needs_guest_close(dlprivate_t *dl, size_t index,
+                                           library_t *lib)
 {
-    if (!strlen(lmfile))
-        return KZT_DLSYM_WRAPPED_NOT_HANDLED;
-
-    const char* libs[] = {basename(lmfile)};
-
-    if (!FindLibIsWrapped((char *)libs[0]))
-        return KZT_DLSYM_WRAPPED_NOT_HANDLED;
-
-    printf_dlsym(LOG_DEBUG, "find lib \"%s\" shuold be wrapped. init it.\n", libs[0]);
-    if(AddNeededLib(NULL, NULL, NULL, 0, 1, libs, 1, my_context)) {
-        printf_dlsym(LOG_DEBUG, "Warning: Cannot AddNeededLib(\"%s\")\n", libs[0]);
-        return KZT_DLSYM_WRAPPED_MISSING;
-    }
-    printf_dlsym(LOG_DEBUG, "info: success AddNeededLib(\"%s\")\n", libs[0]);
-    if(kzt_dlsym_try_global_fallback(rsymbol, start, end))
-        return KZT_DLSYM_WRAPPED_FOUND;
-
-    return KZT_DLSYM_WRAPPED_MISSING;
+    return lib && lib->x86linkmap;
 }
 
 static void *kzt_dlsym_default_handle(dlprivate_t *dl, void *handle,
                                       void *symbol, const char *rsymbol,
                                       uintptr_t *start, uintptr_t *end)
 {
+    uint64_t ret = kzt_call_guest_dlsym(handle, symbol);
+    printf_dlsym(LOG_DEBUG,
+                 "warning call x86dlsym filename is NULL ret=0x%lx\n",
+                 ret);
+    if (ret)
+        return (void *)ret;
+
 #ifdef LATX_RELOCATION_SAVE_SYMBOLS
     if(kzt_dlsym_try_global_fallback(rsymbol, start, end)) {
         printf_dlsym(LOG_NEVER, "%p\n", (void*)*start);
         return (void*)*start;
     }
 #endif
-    uint64_t ret = kzt_call_guest_dlsym(handle, symbol);
-    printf_dlsym(LOG_DEBUG, "warning call x86dlsym filename is NULL ret=0x%lx\n", ret);
-    if (ret) {
-        return (void *)ret;
-    }
+
     printf_dlsym(LOG_NEVER, "debug my %d\n", __LINE__);
     return kzt_dlsym_return_or_missing(dl, ret, rsymbol, handle);
 }
@@ -4177,36 +4279,12 @@ static void *kzt_dlsym_next_handle(dlprivate_t *dl)
     return NULL;
 }
 
-static void *kzt_dlsym_guest_link_map_handle(dlprivate_t *dl, void *handle,
-                                             void *symbol,
-                                             const char *rsymbol,
-                                             uintptr_t *start,
-                                             uintptr_t *end)
+static void *kzt_dlsym_guest_handle(void *handle, void *symbol)
 {
-#ifdef LATX_RELOCATION_SAVE_SYMBOLS
-    if(kzt_dlsym_try_global_fallback(rsymbol, start, end)) {
-        printf_dlsym(LOG_NEVER, "%p\n", (void*)*start);
-        return (void*)*start;
-    }
-#endif
-    const char* lmfile = ((struct link_map *)handle)->l_name;
-    KztDlsymWrappedResult wrapped =
-        kzt_dlsym_try_wrapped_link_map(lmfile, rsymbol, start, end);
-    if (wrapped == KZT_DLSYM_WRAPPED_FOUND) {
-        printf_dlsym(LOG_NEVER, "%p\n", (void*)*start);
-        return (void*)*start;
-    }
-    if (wrapped == KZT_DLSYM_WRAPPED_MISSING) {
-        //Perhaps exe want to test func for earch libs, return nil.
-        printf_dlsym(LOG_NEVER, "%p\n", (void*)NULL);
-        return NULL;
-    }
     uint64_t ret = kzt_call_guest_dlsym(handle, symbol);
-    printf_dlsym(LOG_DEBUG, "warning call call x86dlsym filename is %s handle %p ret=0x%lx\n", strlen(lmfile)?lmfile:"NULL", handle, ret);
-    if (ret) {
-        return (void *)ret;
-    }
-    return kzt_dlsym_return_or_missing(dl, ret, rsymbol, handle);
+    printf_dlsym(LOG_DEBUG, "warning call x86dlsym handle %p ret=0x%lx\n",
+                 handle, ret);
+    return (void *)ret;
 }
 
 static void *kzt_dlsym_library_handle(dlprivate_t *dl, void *handle,
@@ -4214,30 +4292,30 @@ static void *kzt_dlsym_library_handle(dlprivate_t *dl, void *handle,
                                       uintptr_t *start, uintptr_t *end,
                                       library_t *lib)
 {
+    if (!lib)
+        return kzt_dlsym_return_or_missing(dl, 0, rsymbol, handle);
+
+    if(!lib->x86linkmap) {
+        printf_dlsym(LOG_NEVER, "missing guest link_map for %s return %p\n",
+                     lib->name, (void *)NULL);
+        return kzt_dlsym_return_or_missing(dl, 0, rsymbol, handle);
+    }
+    lsassert(dl->x86dlsym);
+    uint64_t ret = kzt_call_guest_dlsym(lib->x86linkmap, symbol);
+    printf_dlsym(LOG_DEBUG, "call x86dlsym filename is %s %s ret=0x%lx\n", lib->x86linkmap->l_name, (char *)symbol, ret);
+    if (!ret)
+        return kzt_dlsym_return_or_missing(dl, ret, rsymbol, handle);
+
+    /*
+     * The guest loader decides symbol existence.  A local wrapper symbol can
+     * only replace a successful guest result with the native bridge address.
+     */
     if(my_dlsym_lib(lib, rsymbol, start, end, -1, NULL)!=0) {
         printf_dlsym(LOG_NEVER, "%p\n", (void*)*start);
         return (void*)*start;
     }
 
-    if(!lib->x86linkmap) {
-        /* Recover the guest link_map before delegating the final lookup to guest dlsym. */
-        uint64_t ret = kzt_dlsym_reopen_guest_library(lib, symbol);
-        if (!ret) {//user sometime test for finding a func.
-            printf_dlsym(LOG_NEVER, "guest reopen %p return %p\n", rsymbol, (void*)NULL);
-            return NULL;
-        }
-        lsassert(ret);
-        printf_dlsym(LOG_DEBUG, "call x86dlsym filename %s is wrapped but not find symbol, dlsym(%p, %s) ret=0x%lx\n",
-        lib->name, lib->x86linkmap, (char *)symbol, ret);
-        return (void *)ret;
-    }
-    lsassert(dl->x86dlsym);
-    uint64_t ret = kzt_call_guest_dlsym(lib->x86linkmap, symbol);
-    printf_dlsym(LOG_DEBUG, "call x86dlsym filename is %s %s ret=0x%lx\n", lib->x86linkmap->l_name, (char *)symbol, ret);
-    if (ret) {
-        return (void *)ret;
-    }
-    return kzt_dlsym_return_or_missing(dl, ret, rsymbol, handle);
+    return (void *)ret;
 }
 
 static void *kzt_dlsym_missing_library_handle(dlprivate_t *dl, void *handle,
@@ -4253,8 +4331,38 @@ static void *kzt_dlsym_missing_library_handle(dlprivate_t *dl, void *handle,
 #endif
     kzt_dlsym_set_missing_error(dl, rsymbol, handle);
     printf_dlsym(LOG_NEVER, "%p\n", NULL);
-    lsassertm(0,"%s",dl->last_error);
     return NULL;
+}
+
+static void *kzt_dlvsym_library_handle(dlprivate_t *dl, void *handle,
+                                       void *symbol, const char *rsymbol,
+                                       const char *vername, library_t *lib)
+{
+    uintptr_t start = 0, end = 0;
+
+    if (lib && IsEmuLib(lib) && lib->x86linkmap)
+        return (void *)kzt_call_guest_dlvsym(lib->x86linkmap, symbol,
+                                             vername);
+
+    if (lib && lib->x86linkmap) {
+        /*
+         * Native wrapped libraries still return wrapper-aware entry points, but
+         * the guest loader must decide whether the requested version exists.
+         */
+        uint64_t ret = kzt_call_guest_dlvsym(lib->x86linkmap, symbol,
+                                             vername);
+        if (!ret)
+            return kzt_dlsym_return_or_missing(dl, 0, rsymbol, handle);
+
+        if(my_dlsym_lib(lib, rsymbol, &start, &end, -1, NULL)!=0) {
+            printf_dlsym(LOG_NEVER, "%p\n", (void*)start);
+            return (void*)start;
+        }
+
+        return (void *)ret;
+    }
+
+    return kzt_dlsym_return_or_missing(dl, 0, rsymbol, handle);
 }
 
 static int kzt_dlclose_guest_handle(dlprivate_t *dl, void *handle)
@@ -4265,7 +4373,7 @@ static int kzt_dlclose_guest_handle(dlprivate_t *dl, void *handle)
         return kzt_call_guest_dlclose(handle);
     }
 
-    kzt_dlclose_set_bad_handle_error(dl, handle, ret);
+    kzt_dl_set_bad_handle_error(dl, handle, ret);
     printf_dlsym(LOG_DEBUG, "dlclose: %s\n", dl->last_error);
     lsassertm(0,"%s",dl->last_error);
     return -1;
@@ -4274,34 +4382,55 @@ static int kzt_dlclose_guest_handle(dlprivate_t *dl, void *handle)
 static int kzt_dlclose_library_handle(dlprivate_t *dl, void *handle,
                                       size_t nlib, library_t *lib)
 {
+    if (!lib) {
+        kzt_dl_set_bad_handle_error(dl, handle, -1);
+        printf_dlsym(LOG_DEBUG, "dlclose: %s\n", dl->last_error);
+        return -1;
+    }
+
+    int idx = GetElfIndex(lib);
+    int local_owner = kzt_dl_handle_local_owner(dl, nlib);
+    if (kzt_dl_handle_needs_guest_close(dl, nlib, lib)) {
+        if (!dl->x86dlclose || !lib->x86linkmap) {
+            kzt_dl_set_bad_handle_error(dl, handle, -1);
+            printf_dlsym(LOG_DEBUG, "dlclose: %s\n", dl->last_error);
+            return -1;
+        }
+
+        /* Guest dlclose is authoritative for the final reference. */
+        int ret = kzt_call_guest_dlclose(lib->x86linkmap);
+        if (ret) {
+            kzt_dl_set_bad_handle_error(dl, handle, ret);
+            printf_dlsym(LOG_DEBUG, "dlclose: %s\n", dl->last_error);
+            return ret;
+        }
+    }
+
     if(!kzt_dl_release_handle(dl, nlib))
         return 0;
 
-    int idx = GetElfIndex(lib);
-    if(idx!=-1) {
+    if (lib)
+        lib->x86linkmap = NULL;
+
+    if(local_owner && idx!=-1) {
         printf_dlsym(LOG_DEBUG, "dlclose: Call to Fini for %p\n", handle);
         kzt_dl_deactivate_library(lib);
-        if (dl->x86dlclose) {
-            return kzt_call_guest_dlclose(lib->x86linkmap);
-        }
     }
 
     return 0;
 }
 
-static size_t kzt_dl_handle_index(dlprivate_t *dl, void *handle)
+static int kzt_dl_find_handle_by_value(dlprivate_t *dl, void *handle,
+                                       size_t *index)
 {
-    size_t nlib = (size_t)handle;
-
-    if (nlib > dl->lib_sz) {
-        for (size_t i = 0; i < dl->lib_sz; i++) {
-            if (kzt_dl_handle_matches_guest_link_map(
-                    kzt_dl_handle_library(dl, i), handle))
-                return i;
+    for (size_t i = 0; i < dl->lib_sz; i++) {
+        if (kzt_dl_return_handle(dl, i) == handle) {
+            *index = i;
+            return 1;
         }
     }
 
-    return nlib - 1;
+    return 0;
 }
 
 void* my_dlsym(void *handle, void *symbol){
@@ -4313,7 +4442,11 @@ void* my_dlsym(void *handle, void *symbol){
         init_x86dlfun();
         lsassert(dl->x86dlsym);
     }
-    printf_dlsym(LOG_DEBUG, "Call to dlsym(%p, \"%s\")%s\n", handle, rsymbol, dlsym_error?"":"\n");
+    printf_dlsym(LOG_DEBUG, "Call to dlsym(%p, \"%s\")%s\n",
+                 handle, rsymbol ? rsymbol : "<null>",
+                 dlsym_error ? "" : "\n");
+    if (!symbol)
+        return kzt_dlsym_guest_handle(handle, symbol);
    //lsassert(!strstr(rsymbol, "XcursorGetDefaultSize"));
     if(handle==NULL) {
         // special case, look globably
@@ -4325,11 +4458,9 @@ void* my_dlsym(void *handle, void *symbol){
         // special case (RTLD_NEXT) -- call x86dlsym
         return kzt_dlsym_next_handle(dl);
     }
-    size_t nlib = kzt_dl_handle_index(dl, handle);
-    // size_t is unsigned
-    if(nlib>=dl->lib_sz) {
-        return kzt_dlsym_guest_link_map_handle(dl, handle, symbol, rsymbol,
-                                               &start, &end);
+    size_t nlib = 0;
+    if(!kzt_dl_find_handle_by_value(dl, handle, &nlib)) {
+        return kzt_dlsym_guest_handle(handle, symbol);
     }
     if(kzt_dl_handle_is_closed(dl, nlib)) {
         kzt_dl_set_closed_handle_error(dl, handle);
@@ -4354,9 +4485,8 @@ int my_dlclose(void *handle)
         init_x86dlfun();
         lsassert(dl->x86dlclose);
     }
-    size_t nlib = kzt_dl_handle_index(dl, handle);
-    // size_t is unsigned
-    if(nlib>=dl->lib_sz) {
+    size_t nlib = 0;
+    if(!kzt_dl_find_handle_by_value(dl, handle, &nlib)) {
         return kzt_dlclose_guest_handle(dl, handle);
     }
     if(kzt_dl_handle_is_closed(dl, nlib)) {
@@ -4371,7 +4501,20 @@ int my_dlclose(void *handle)
 char* my_dlerror(void)
 {
     dlprivate_t *dl = my_context->dlprivate;
-    return dl->last_error;
+    if (!dl->x86dlerror) {
+        init_x86dlfun();
+        lsassert(dl->x86dlerror);
+    }
+    if (dl->last_error) {
+        /*
+         * Local wrapper errors supersede guest loader errors.  Consume the
+         * guest slot now so a second dlerror() observes the cleared state.
+         */
+        (void)kzt_call_guest_dlerror();
+        return kzt_dlerror_take_local(dl);
+    }
+
+    return (char *)kzt_call_guest_dlerror();
 }
 
 int my_dladdr1(void *addr, void *i, void** extra_info, int flags)
@@ -4386,6 +4529,9 @@ int my_dladdr1(void *addr, void *i, void** extra_info, int flags)
     Dl_info *info = (Dl_info*)i;
     printf_dlsym(LOG_DEBUG, "Warning: partially unimplement call to dladdr/dladdr1(%p, %p, %p, %d)\n", addr, info, extra_info, flags);
     uint64_t ret = 0;
+    if (!info)
+        return kzt_call_guest_dladdr1(addr, i, extra_info, flags);
+
     if (extra_info == NULL && flags == 0) {
         ret = kzt_call_guest_dladdr(addr, i);
     } else {
@@ -4405,7 +4551,8 @@ int my_dladdr1(void *addr, void *i, void** extra_info, int flags)
         printf_dlsym(LOG_INFO, "Warning, unimplement call to dladdr1 with RTLD_DL_SYMENT flags\n");
     } else if (flags==RTLD_DL_LINKMAP) {
         printf_dlsym(LOG_INFO, "Warning, partially unimplemented call to dladdr1 with RTLD_DL_LINKMAP flags\n");
-        *(linkmap_t**)extra_info = getLinkMapLib(lib);
+        if (!kzt_dladdr1_set_link_map_result(extra_info, lib))
+            return 0;
     }
     return (info->dli_sname)?1:0;   // success is non-null here...
 }
@@ -4419,6 +4566,9 @@ int my_dladdr(void *addr, void *i)
     }
     Dl_info *info = (Dl_info*)i;
     printf_dlsym(LOG_DEBUG, "Warning: partially unimplement call to dladdr(%p, %p)\n", addr, info);
+    if (!info)
+        return kzt_call_guest_dladdr(addr, i);
+
     uint64_t ret = kzt_call_guest_dladdr(addr, i);
     printf_dlsym(LOG_DEBUG, "     call to x86dladdr return saddr=%p, fname=\"%s\", sname=\"%s\" ret=%ld\n", info->dli_saddr, info->dli_sname?info->dli_sname:"", info->dli_fname?info->dli_fname:"", ret);
     if (ret == 1) {
@@ -4428,20 +4578,40 @@ int my_dladdr(void *addr, void *i)
 }
 void* my_dlvsym(void *handle, void *symbol, const char *vername)
 {
-    printf_dlsym(LOG_DEBUG, "Call to dlvsym(%p, \"%s\", %s)\n", handle, (char *)symbol, vername?vername:"(nil)");
+    char* rsymbol = (char*)symbol;
+    printf_dlsym(LOG_DEBUG, "Call to dlvsym(%p, \"%s\", %s)\n",
+                 handle, rsymbol ? rsymbol : "<null>",
+                 vername ? vername : "(nil)");
     dlprivate_t *dl = my_context->dlprivate;
     CLEARERR
     if (!dl->x86dlvsym) {
         init_x86dlfun();
         lsassert(dl->x86dlvsym);
     }
-    if (handle == (void*)~0LL)
-        return my_dlsym(handle, symbol);
+    if (!symbol)
+        return (void *)kzt_call_guest_dlvsym(handle, symbol, vername);
+    if (handle == (void*)~0LL) {
+        __MY_CPU;
+        /*
+         * Preserve the guest caller for RTLD_NEXT and keep the version
+         * argument.  Falling back to my_dlsym() would silently drop vername.
+         */
+        kzt_forward_guest_dlvsym(cpu);
+        return NULL;
+    }
 
-    if (handle == NULL || kzt_dl_handle_index(dl, handle) >= dl->lib_sz)
+    size_t nlib = 0;
+    if (handle == NULL || !kzt_dl_find_handle_by_value(dl, handle, &nlib))
         return (void *)kzt_call_guest_dlvsym(handle, symbol, vername);
 
-    return my_dlsym(handle, symbol);
+    if(kzt_dl_handle_is_closed(dl, nlib)) {
+        kzt_dl_set_closed_handle_error(dl, handle);
+        printf_dlsym(LOG_NEVER, "%p return %p\n", dl->last_error, (void*)NULL);
+        return NULL;
+    }
+    library_t *lib = kzt_dl_handle_library(dl, nlib);
+    return kzt_dlvsym_library_handle(dl, handle, symbol, rsymbol, vername,
+                                     lib);
 }
 
 int my_dlinfo(void* handle, int request, void* info)
@@ -4453,19 +4623,35 @@ int my_dlinfo(void* handle, int request, void* info)
         init_x86dlfun();
         lsassert(dl->x86dlinfo);
     }
-    size_t nlib = kzt_dl_handle_index(dl, handle);
-    if (nlib < dl->lib_sz) {
+    size_t nlib = 0;
+    if (kzt_dl_find_handle_by_value(dl, handle, &nlib)) {
         if(kzt_dl_handle_is_closed(dl, nlib)) {
             kzt_dl_set_closed_handle_error(dl, handle);
             printf_dlsym(LOG_DEBUG, "dlinfo: %s\n", dl->last_error);
             return -1;
         }
         library_t *lib = kzt_dl_handle_library(dl, nlib);
-        if (kzt_dl_is_synthetic_handle(lib, handle, nlib)
+        if (kzt_dl_is_local_synthetic_handle(lib, handle, nlib)
             && request == RTLD_DI_LINKMAP) {
-            *(linkmap_t**)info = getLinkMapLib(lib);
-            return 0;
+            if (!info) {
+                kzt_dl_set_bad_handle_error(dl, handle, -1);
+                printf_dlsym(LOG_DEBUG, "dlinfo: %s\n", dl->last_error);
+                return -1;
+            }
+            if (lib && lib->x86linkmap) {
+                *(struct link_map**)info = lib->x86linkmap;
+                return 0;
+            }
+            kzt_dl_set_bad_handle_error(dl, handle, -1);
+            printf_dlsym(LOG_DEBUG, "dlinfo: %s\n", dl->last_error);
+            return -1;
         }
+        if (lib && lib->x86linkmap)
+            return kzt_call_guest_dlinfo(lib->x86linkmap, request, info);
+
+        kzt_dl_set_bad_handle_error(dl, handle, -1);
+        printf_dlsym(LOG_DEBUG, "dlinfo: %s\n", dl->last_error);
+        return -1;
     }
     return kzt_call_guest_dlinfo(handle, request, info);
 }

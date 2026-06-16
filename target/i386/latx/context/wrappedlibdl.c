@@ -35,9 +35,11 @@ dlprivate_t *NewDLPrivate(void) {
 }
 void FreeDLPrivate(dlprivate_t **lib) {
     box_free((*lib)->libs);
+    box_free((*lib)->handles);
     box_free((*lib)->count);
     box_free((*lib)->dlopened);
     box_free((*lib)->last_error);
+    box_free((*lib)->last_error_returned);
     box_free(*lib);
 }
 
@@ -54,7 +56,20 @@ int my_dlinfo(void* handle, int request, void* info) EXPORT;
 #define LIBNAME libdl
 const char* libdlName = "libdl.so.2";
 
-#define CLEARERR    if(dl->last_error) box_free(dl->last_error); dl->last_error = NULL;
+#define CLEARERR do {                   \
+    box_free(dl->last_error);           \
+    dl->last_error = NULL;              \
+    box_free(dl->last_error_returned);  \
+    dl->last_error_returned = NULL;     \
+} while (0);
+
+static char *dlerror_take_local(dlprivate_t *dl)
+{
+    box_free(dl->last_error_returned);
+    dl->last_error_returned = dl->last_error;
+    dl->last_error = NULL;
+    return dl->last_error_returned;
+}
 //#define R_RSP cpu->regs[R_ESP]
 static void Push64(CPUX86State *cpu, uint64_t v)
 {
@@ -67,21 +82,22 @@ int init_x86dlfun(void)
 {
     elfheader_t* h = loadElfFromFile("libdl.so.2");
     lsassert(h);
-    const char* syms[] = {"dlopen", "dlsym", "dlclose", "dladdr", "dladdr1", "dlinfo"};
-    void *rsyms[6] = {0};
+    const char* syms[] = {"dlopen", "dlmopen", "dlsym", "dlclose", "dladdr", "dladdr1", "dlinfo"};
+    void *rsyms[7] = {0};
     int rrsyms = 0;
-    ResetSpecialCaseElf(h, syms, 6, rsyms, &rrsyms);
-    if (rrsyms != 6) {
+    ResetSpecialCaseElf(h, syms, 7, rsyms, &rrsyms);
+    if (rrsyms != 7) {
         h = loadElfFromFile("libc.so.6");
-        ResetSpecialCaseElf(h, syms, 6, rsyms, &rrsyms);
+        ResetSpecialCaseElf(h, syms, 7, rsyms, &rrsyms);
     }
-    lsassert(rrsyms == 6);
+    lsassert(rrsyms == 7);
     my_context->dlprivate->x86dlopen = rsyms[0];
-    my_context->dlprivate->x86dlsym = rsyms[1];
-    my_context->dlprivate->x86dlclose = rsyms[2];
-    my_context->dlprivate->x86dladdr = rsyms[3];
-    my_context->dlprivate->x86dladdr1 = rsyms[4];
-    my_context->dlprivate->x86dlinfo = rsyms[5];
+    my_context->dlprivate->x86dlmopen = rsyms[1];
+    my_context->dlprivate->x86dlsym = rsyms[2];
+    my_context->dlprivate->x86dlclose = rsyms[3];
+    my_context->dlprivate->x86dladdr = rsyms[4];
+    my_context->dlprivate->x86dladdr1 = rsyms[5];
+    my_context->dlprivate->x86dlinfo = rsyms[6];
     return 0;
 }
 static int callx86dlopen(void *filename, int flag, elfheader_t * h, int is_local) {
@@ -272,11 +288,20 @@ void* my_dlopen(void *filename, int flag){
 
 void* my_dlmopen(void* lmid, void *filename, int flag)
 {
-    if(lmid) {
-        printf_dlsym(LOG_INFO, "Warning, dlmopen(%p, %p(\"%s\"), 0x%x) called with lmid not LMID_ID_BASE (unsupported)\n", lmid, filename, filename?(char*)filename:"self", flag);
+    if (!lmid)
+        return my_dlopen(filename, flag);
+
+    dlprivate_t *dl = my_context->dlprivate;
+    CLEARERR
+    if (!dl->x86dlmopen) {
+        init_x86dlfun();
+        lsassert(dl->x86dlmopen);
     }
-    // lmid is ignored for now...
-    return my_dlopen(filename, flag);
+
+    printf_dlsym(LOG_DEBUG, "Call to guest dlmopen(%p, %p(\"%s\"), 0x%x)\n",
+                 lmid, filename, filename?(char*)filename:"self", flag);
+    return (void *)RunFunctionWithState((uintptr_t)dl->x86dlmopen, 3,
+                                        lmid, filename, flag);
 }
 
 KHASH_SET_INIT_INT(libs);
@@ -566,7 +591,10 @@ int my_dlclose(void *handle)
 char* my_dlerror(void)
 {
     dlprivate_t *dl = my_context->dlprivate;
-    return dl->last_error;
+    if (!dl->last_error)
+        return NULL;
+
+    return dlerror_take_local(dl);
 }
 
 int my_dladdr1(void *addr, void *i, void** extra_info, int flags)
