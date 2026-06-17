@@ -2135,7 +2135,17 @@ struct x86_ld_info {
     int reg;
     intptr_t addr;
 };
-static struct x86_ld_info * ld_info = NULL;
+
+typedef struct KztGlibcLoaderEventSource {
+    const char *name;
+    struct x86_ld_info *hook;
+} KztGlibcLoaderEventSource;
+
+#define KZT_GLIBC_LOADER_EVENT_SOURCE "kzt_tb_callback"
+
+static KztGlibcLoaderEventSource kzt_glibc_loader_event_source = {
+    .name = KZT_GLIBC_LOADER_EVENT_SOURCE,
+};
 extern void* x86free;
 extern void* x86realloc;
 extern void* x86pthread_setcanceltype;
@@ -2244,6 +2254,9 @@ static const char *kzt_object_basename(const char *path)
 
 typedef struct KztGuestObject {
     struct link_map_x64 *link_map;
+    const char *event_source;
+    uintptr_t load_bias;
+    uintptr_t dynamic_addr;
     char *object_name;
     char *filename;
     const char *basename;
@@ -2256,37 +2269,60 @@ typedef struct KztGuestObject {
     int has_dynamic_info;
 } KztGuestObject;
 
-static int kzt_guest_dynamic_range_is_readable(const void *addr, size_t size,
-                                               void *opaque)
+/*
+ * Stage 8 keeps the private glibc hook as an event source first.  Everything
+ * below this structure should be reusable when the source becomes r_debug,
+ * mmap/RELRO observation, or another loader notification path.
+ */
+typedef struct KztLoaderEvent {
+    const char *source;
+    struct link_map_x64 *link_map;
+    uintptr_t load_bias;
+    uintptr_t dynamic_addr;
+    char *object_name;
+} KztLoaderEvent;
+
+static int kzt_guest_range_is_readable(const void *addr, size_t size)
 {
-    (void)opaque;
     if (!addr)
         return 0;
 
     return access_ok_untagged(VERIFY_READ, (abi_ulong)(uintptr_t)addr, size);
 }
 
-static struct link_map_x64 *kzt_get_callback_link_map(CPUX86State *env)
+static int kzt_guest_dynamic_range_is_readable(const void *addr, size_t size,
+                                               void *opaque)
 {
-    struct link_map_x64 *my_lm =
-        (struct link_map_x64 *)env->regs[R_EAX + ld_info->reg];
-
-    if (!my_lm) {
-        printf_log(LOG_DEBUG, "error %d debug %s link_map = NULL\n",
-                   getpid(), "kzt_tb_callback");
-        return NULL;
-    }
-    if (!my_lm->l_addr && my_lm->l_addr != info1.load_addr) {
-        printf_log(LOG_DEBUG,
-                   "error %d debug %s link_map = %p{0x%lx, %s}\n",
-                   getpid(), "kzt_tb_callback", my_lm, my_lm->l_addr,
-                   my_lm->l_name ? my_lm->l_name : "<null>");
-        return NULL;
-    }
-    return my_lm;
+    (void)opaque;
+    return kzt_guest_range_is_readable(addr, size);
 }
 
-static char *kzt_get_object_name(struct link_map_x64 *my_lm)
+static int kzt_loader_link_map_is_valid(struct link_map_x64 *link_map,
+                                        const char *source)
+{
+    if (!link_map) {
+        printf_log(LOG_DEBUG, "error %d debug %s link_map = NULL\n",
+                   getpid(), source);
+        return 0;
+    }
+    if (!link_map->l_addr && link_map->l_addr != info1.load_addr) {
+        printf_log(LOG_DEBUG,
+                   "error %d debug %s link_map = %p{0x%lx, %s}\n",
+                   getpid(), source, link_map, link_map->l_addr,
+                   link_map->l_name ? link_map->l_name : "<null>");
+        return 0;
+    }
+    return 1;
+}
+
+static struct link_map_x64 *kzt_get_glibc_loader_link_map(CPUX86State *env)
+{
+    return (struct link_map_x64 *)env->regs[
+        R_EAX + kzt_glibc_loader_event_source.hook->reg];
+}
+
+static char *kzt_get_object_name(struct link_map_x64 *my_lm,
+                                 const char *source)
 {
     char *object_name = my_lm->l_name;
 
@@ -2294,7 +2330,7 @@ static char *kzt_get_object_name(struct link_map_x64 *my_lm)
         if (my_lm->l_addr != info1.load_addr) {
             printf_log(LOG_DEBUG,
                        "error %d debug %s link_map = %p has no name\n",
-                       getpid(), "kzt_tb_callback", my_lm);
+                       getpid(), source, my_lm);
             return NULL;
         }
         object_name = my_context->fullpath;
@@ -2303,16 +2339,35 @@ static char *kzt_get_object_name(struct link_map_x64 *my_lm)
         if (!object_name || !object_name[0]) {
             printf_log(LOG_DEBUG,
                        "error %d debug %s main object has no filename\n",
-                       getpid(), "kzt_tb_callback");
+                       getpid(), source);
             return NULL;
         }
     }
     return object_name;
 }
 
+static int kzt_capture_loader_event_from_link_map(const char *source,
+                                                  struct link_map_x64 *link_map,
+                                                  KztLoaderEvent *event)
+{
+    if (!kzt_loader_link_map_is_valid(link_map, source))
+        return 0;
+
+    event->source = source;
+    event->link_map = link_map;
+    event->object_name = kzt_get_object_name(link_map, source);
+    if (!event->object_name)
+        return 0;
+
+    event->load_bias = link_map->l_addr;
+    event->dynamic_addr = (uintptr_t)link_map->l_ld;
+    return 1;
+}
+
 static void kzt_parse_guest_object_dynamic(KztGuestObject *object)
 {
-    KztParseDynamicView(&object->dynamic_view, object->link_map->l_ld,
+    KztParseDynamicView(&object->dynamic_view,
+                        (Elf64_Dyn *)object->dynamic_addr,
                         KZT_DYNAMIC_SCAN_MAX);
 
     if (object->dynamic_view.status != KZT_DYNAMIC_VIEW_READY)
@@ -2323,61 +2378,95 @@ static void kzt_parse_guest_object_dynamic(KztGuestObject *object)
                                     kzt_guest_dynamic_range_is_readable,
                                     NULL);
     KztResolveDynamicSymbolCount(&object->dynamic_info,
-                                 object->link_map->l_addr);
+                                 object->load_bias);
     object->has_dynamic_info = 1;
 }
 
-static int kzt_register_callback_guest_object(CPUX86State *env,
-                                              KztGuestObject *object)
+static uintptr_t kzt_guest_object_link_map_addr(KztGuestObject *object)
 {
-    object->link_map = kzt_get_callback_link_map(env);
-    if (!object->link_map)
-        return 0;
+    return (uintptr_t)object->link_map;
+}
 
-    object->object_name = kzt_get_object_name(object->link_map);
-    if (!object->object_name)
-        return 0;
+static guest_object_observation_t kzt_observe_guest_object(
+    KztGuestObject *object)
+{
+    return ObserveGuestObject(my_context->guest_objects,
+                              kzt_guest_object_link_map_addr(object),
+                              object->load_bias,
+                              object->dynamic_addr,
+                              object->object_name);
+}
 
-    printf_log(LOG_DEBUG, "%d debug %s link_map = %p{0x%lx, %s}\n",
-               getpid(), "kzt_tb_callback", object->link_map,
-               object->link_map->l_addr, object->object_name);
-
-    guest_object_observation_t observation = ObserveGuestObject(
-        my_context->guest_objects,
-        (uintptr_t)object->link_map,
-        object->link_map->l_addr,
-        (uintptr_t)object->link_map->l_ld,
-        object->object_name);
-
-    if (observation == GUEST_OBJECT_OBSERVE_NEW
-        || observation == GUEST_OBJECT_OBSERVE_CHANGED) {
-        printf_log(LOG_DEBUG,
-                   "%s guest object %s: map=%p bias=0x%lx dynamic=%p name=%s\n",
-                   "kzt_tb_callback",
-                   observation == GUEST_OBJECT_OBSERVE_NEW ? "discovered"
-                                                          : "changed",
-                   object->link_map, object->link_map->l_addr,
-                   object->link_map->l_ld, object->object_name);
+static void kzt_log_guest_object_observation(
+    KztGuestObject *object,
+    guest_object_observation_t observation)
+{
+    if (observation != GUEST_OBJECT_OBSERVE_NEW
+        && observation != GUEST_OBJECT_OBSERVE_CHANGED) {
+        return;
     }
+
+    printf_log(LOG_DEBUG,
+               "%s guest object %s: map=%p bias=0x%lx dynamic=%p name=%s\n",
+               object->event_source,
+               observation == GUEST_OBJECT_OBSERVE_NEW ? "discovered"
+                                                      : "changed",
+               object->link_map, object->load_bias,
+               (void *)object->dynamic_addr, object->object_name);
+}
+
+static int kzt_register_guest_object(KztGuestObject *object)
+{
+    printf_log(LOG_DEBUG, "%d debug %s link_map = %p{0x%lx, %s}\n",
+               getpid(), object->event_source, object->link_map,
+               object->load_bias, object->object_name);
+
+    guest_object_observation_t observation = kzt_observe_guest_object(object);
+    kzt_log_guest_object_observation(object, observation);
 
     kzt_parse_guest_object_dynamic(object);
     return 1;
 }
 
+static void kzt_guest_object_from_loader_event(const KztLoaderEvent *event,
+                                               KztGuestObject *object)
+{
+    object->event_source = event->source;
+    object->link_map = event->link_map;
+    object->load_bias = event->load_bias;
+    object->dynamic_addr = event->dynamic_addr;
+    object->object_name = event->object_name;
+}
+
 static int kzt_begin_legacy_guest_object_processing(KztGuestObject *object)
 {
     guest_object_process_result_t processing = BeginGuestObjectProcessing(
-        my_context->guest_objects, (uintptr_t)object->link_map);
+        my_context->guest_objects, kzt_guest_object_link_map_addr(object));
     if (processing == GUEST_OBJECT_PROCESS_IN_PROGRESS) {
         printf_log(LOG_DEBUG,
                    "%s skip guest object map=%p name=%s reason=processing\n",
-                   "kzt_tb_callback", object->link_map, object->object_name);
+                   object->event_source, object->link_map,
+                   object->object_name);
         return 0;
     }
     if (processing == GUEST_OBJECT_PROCESS_INVALID)
         printf_log(LOG_DEBUG, "%s guest object registry unavailable\n",
-                   "kzt_tb_callback");
+                   object->event_source);
     return 1;
+}
+
+static int kzt_set_guest_object_state(KztGuestObject *object,
+                                      guest_object_state_t state)
+{
+    return SetGuestObjectState(my_context->guest_objects,
+                               kzt_guest_object_link_map_addr(object), state);
+}
+
+static void kzt_mark_guest_elf_unavailable(KztGuestObject *object)
+{
+    kzt_set_guest_object_state(object,
+                               object->is_loader ? GUEST_OBJECT_EMULATED
+                                                 : GUEST_OBJECT_FAILED);
 }
 
 static void kzt_resolve_guest_object_path(KztGuestObject *object)
@@ -2397,23 +2486,17 @@ static elfheader_t *kzt_open_guest_elf(KztGuestObject *object)
     FILE *f = fopen(object->filename, "rb");
     if (!f) {
         printf_log(LOG_INFO, "%s Error: Cannot open \"%s\"\n",
-                   "kzt_tb_callback", object->filename);
-        SetGuestObjectState(my_context->guest_objects,
-                            (uintptr_t)object->link_map,
-                            object->is_loader ? GUEST_OBJECT_EMULATED
-                                              : GUEST_OBJECT_FAILED);
+                   object->event_source, object->filename);
+        kzt_mark_guest_elf_unavailable(object);
         return NULL;
     }
 
     elfheader_t *h = LoadAndCheckElfHeader(f, object->filename, 0);
     if (!h) {
         printf_log(LOG_INFO, "%s Error: Cannot parse ELF header for \"%s\"\n",
-                   "kzt_tb_callback", object->filename);
+                   object->event_source, object->filename);
         fclose(f);
-        SetGuestObjectState(my_context->guest_objects,
-                            (uintptr_t)object->link_map,
-                            object->is_loader ? GUEST_OBJECT_EMULATED
-                                              : GUEST_OBJECT_FAILED);
+        kzt_mark_guest_elf_unavailable(object);
         return NULL;
     }
     fclose(f);
@@ -3252,7 +3335,7 @@ static void kzt_compare_guest_dynamic(KztGuestObject *object, elfheader_t *h)
     KztDynamicView *new_view = &object->dynamic_view;
     KztDynamicInfo *new_info = &object->dynamic_info;
     KztDynamicSummary *new_dynamic = &new_view->summary;
-    uintptr_t load_bias = object->link_map->l_addr;
+    uintptr_t load_bias = object->load_bias;
     int mismatches = 0;
 
     KztParseDynamicView(&old_view, h->Dynamic, h->numDynamic);
@@ -3382,15 +3465,15 @@ static void kzt_record_guest_load_range(KztGuestObject *object,
                                         elfheader_t *h)
 {
     if (!GetElfLoadRange(h->PHEntries, h->numPHEntries,
-                         object->link_map->l_addr, TARGET_PAGE_SIZE,
+                         object->load_bias, TARGET_PAGE_SIZE,
                          &object->map_start, &object->map_end)) {
         SetGuestObjectMapRange(my_context->guest_objects,
-                               (uintptr_t)object->link_map,
+                               kzt_guest_object_link_map_addr(object),
                                object->map_start, object->map_end);
     } else {
         printf_log(LOG_INFO,
                    "%s Warning: Cannot determine load range for \"%s\"\n",
-                   "kzt_tb_callback", object->filename);
+                   object->event_source, object->filename);
     }
 }
 
@@ -3404,42 +3487,61 @@ static library_t *kzt_register_guest_library_policy(KztGuestObject *object)
     if (AddNeededLib(my_context->maplib, &my_context->neededlibs, NULL, 0,
                      1, libs, 1, my_context)) {
         printf_log(LOG_INFO, "%s Error: registering wrapper for \"%s\"\n",
-                   "kzt_tb_callback", object->basename);
+                   object->event_source, object->basename);
         return NULL;
     }
     return GetLibInternal(object->basename);
 }
 
-static void kzt_process_guest_object_legacy(KztGuestObject *object)
+static void kzt_add_guest_object_debug_info(KztGuestObject *object, int type)
 {
-    elfheader_t *h = NULL;
+    if (object->map_start < object->map_end)
+        AddDebugInfo(type, object->object_name, object->map_start,
+                     object->map_end);
+}
 
-    if (!kzt_begin_legacy_guest_object_processing(object))
-        return;
+static void kzt_finish_guest_loader_object(KztGuestObject *object,
+                                           elfheader_t **h)
+{
+    kzt_add_guest_object_debug_info(object, LIB_EMULATED);
+    FreeElfHeader(h);
+    kzt_set_guest_object_state(object, GUEST_OBJECT_EMULATED);
+}
 
-    kzt_resolve_guest_object_path(object);
-    library_t *lib = NULL;
-    h = kzt_open_guest_elf(object);
-    if (!h)
-        return;
-
-    kzt_compare_guest_dynamic(object, h);
-    kzt_record_guest_load_range(object, h);
-
-    if (object->is_loader) {
-        if (object->map_start < object->map_end)
-            AddDebugInfo(LIB_EMULATED, object->object_name, object->map_start,
-                         object->map_end);
-        FreeElfHeader(&h);
-        SetGuestObjectState(my_context->guest_objects,
-                            (uintptr_t)object->link_map,
-                            GUEST_OBJECT_EMULATED);
-        return;
+static void kzt_finish_guest_object_success(KztGuestObject *object,
+                                            library_t *lib)
+{
+    if (lib) {
+        kzt_add_guest_object_debug_info(object, LIB_WRAPPED);
+        kzt_set_guest_object_state(object, GUEST_OBJECT_WRAPPED);
+    } else {
+        kzt_add_guest_object_debug_info(object, LIB_EMULATED);
+        kzt_set_guest_object_state(object, GUEST_OBJECT_EMULATED);
     }
+}
 
-    lib = kzt_register_guest_library_policy(object);
+static int kzt_relocate_guest_object_legacy(KztGuestObject *object,
+                                            elfheader_t *h)
+{
+    if (RelocateElf(my_context->maplib, NULL, 0, h)) {
+        printf_log(LOG_INFO, "%s Error: relocating symbols for \"%s\"\n",
+                   object->event_source, object->filename);
+        kzt_set_guest_object_state(object, GUEST_OBJECT_FAILED);
+        return -1;
+    }
+    if (RelocateElfPlt(my_context->maplib, NULL, 0, h)) {
+        printf_log(LOG_INFO, "%s Error: relocating PLT symbols for \"%s\"\n",
+                   object->event_source, object->filename);
+        kzt_set_guest_object_state(object, GUEST_OBJECT_FAILED);
+        return -1;
+    }
+    return 0;
+}
 
-    ElfHeadReFix(h, object->link_map->l_addr);
+static void kzt_prepare_guest_object_legacy_elf(KztGuestObject *object,
+                                                elfheader_t *h)
+{
+    ElfHeadReFix(h, object->load_bias);
     collectX86free(h);
     if(!x86free &&!strcmp(object->basename, libcName)) {
         struct malloc_map * m = SearchMallocMap(my_context, (char *)libcName);
@@ -3451,48 +3553,83 @@ static void kzt_process_guest_object_legacy(KztGuestObject *object)
         findx86pthread_setcanceltype(h);
     }
     AddElfHeader(my_context, h);
-    kzt_skip_guest_needed_side_load("kzt_tb_callback", object->filename);
-    if (RelocateElf(my_context->maplib, NULL, 0, h)) {
-        printf_log(LOG_INFO, "%s Error: relocating symbols for \"%s\"\n",
-                   "kzt_tb_callback", object->filename);
-        SetGuestObjectState(my_context->guest_objects,
-                            (uintptr_t)object->link_map,
-                            GUEST_OBJECT_FAILED);
-        return;
-    }
-    if (RelocateElfPlt(my_context->maplib, NULL, 0, h)) {
-        printf_log(LOG_INFO, "%s Error: relocating PLT symbols for \"%s\"\n",
-                   "kzt_tb_callback", object->filename);
-        SetGuestObjectState(my_context->guest_objects,
-                            (uintptr_t)object->link_map,
-                            GUEST_OBJECT_FAILED);
-        return;
-    }
-    if (lib) {
-        if (object->map_start < object->map_end)
-            AddDebugInfo(LIB_WRAPPED, object->object_name, object->map_start,
-                         object->map_end);
-        SetGuestObjectState(my_context->guest_objects,
-                            (uintptr_t)object->link_map,
-                            GUEST_OBJECT_WRAPPED);
-    } else {
-        if (object->map_start < object->map_end)
-            AddDebugInfo(LIB_EMULATED, object->object_name, object->map_start,
-                         object->map_end);
-        SetGuestObjectState(my_context->guest_objects,
-                            (uintptr_t)object->link_map,
-                            GUEST_OBJECT_EMULATED);
-    }
+    kzt_skip_guest_needed_side_load(object->event_source, object->filename);
 }
 
-static void kzt_tb_callback(CPUX86State *env)
+static void kzt_process_regular_guest_object_legacy(KztGuestObject *object,
+                                                    elfheader_t *h)
+{
+    library_t *lib = kzt_register_guest_library_policy(object);
+
+    kzt_prepare_guest_object_legacy_elf(object, h);
+    if (kzt_relocate_guest_object_legacy(object, h))
+        return;
+
+    kzt_finish_guest_object_success(object, lib);
+}
+
+static elfheader_t *kzt_prepare_guest_object_discovery(KztGuestObject *object)
+{
+    kzt_resolve_guest_object_path(object);
+    elfheader_t *h = kzt_open_guest_elf(object);
+    if (!h)
+        return NULL;
+
+    kzt_compare_guest_dynamic(object, h);
+    kzt_record_guest_load_range(object, h);
+    return h;
+}
+
+static void kzt_finish_discovered_guest_object(KztGuestObject *object,
+                                               elfheader_t **h)
+{
+    if (object->is_loader) {
+        kzt_finish_guest_loader_object(object, h);
+        return;
+    }
+
+    kzt_process_regular_guest_object_legacy(object, *h);
+}
+
+static void kzt_dispatch_guest_object_compat(KztGuestObject *object)
+{
+    if (!kzt_begin_legacy_guest_object_processing(object))
+        return;
+
+    elfheader_t *h = kzt_prepare_guest_object_discovery(object);
+    if (!h)
+        return;
+
+    kzt_finish_discovered_guest_object(object, &h);
+}
+
+static void kzt_handle_loader_event(const KztLoaderEvent *event)
 {
     KztGuestObject object = {0};
 
-    if (!kzt_register_callback_guest_object(env, &object))
+    kzt_guest_object_from_loader_event(event, &object);
+
+    if (!kzt_register_guest_object(&object))
         return;
 
-    kzt_process_guest_object_legacy(&object);
+    kzt_dispatch_guest_object_compat(&object);
+}
+
+static void kzt_submit_loader_link_map_event(const char *source,
+                                             struct link_map_x64 *link_map)
+{
+    KztLoaderEvent event = {0};
+
+    if (!kzt_capture_loader_event_from_link_map(source, link_map, &event))
+        return;
+
+    kzt_handle_loader_event(&event);
+}
+
+static void kzt_glibc_loader_callback(CPUX86State *env)
+{
+    kzt_submit_loader_link_map_event(
+        kzt_glibc_loader_event_source.name, kzt_get_glibc_loader_link_map(env));
 }
 static TranslationBlock* test_tb;
 static void test_x86free(CPUX86State *env)
@@ -3879,23 +4016,55 @@ static struct x86_ld_info *find_ld_bridge(void* info)
     return NULL;
 }
 
+static void kzt_install_exec_entry_callback(CPUState *cpu,
+                                            struct image_info *execinfo,
+                                            uint32 *saved_inst)
+{
+    kzt_add_fucn_by_addr(saved_inst, cpu, execinfo->exec_entry,
+                         target_latx_ld_callback, kzt_exectb_callback);
+}
+
+static void kzt_install_glibc_loader_callback(CPUState *cpu,
+                                              uint32 *saved_inst)
+{
+    /*
+     * This is the Stage 8 fallback event source.  It still patches a private
+     * glibc location today, but the rest of KZT now consumes only loader
+     * events, so this function can later be replaced or version-gated.
+     */
+    kzt_add_fucn_by_addr(saved_inst, cpu,
+                         kzt_glibc_loader_event_source.hook->addr,
+                         target_latx_ld_callback,
+                         kzt_glibc_loader_callback);
+}
+
+static int kzt_prepare_glibc_loader_event_source(void *info)
+{
+    if (!kzt_glibc_loader_event_source.hook) {
+        kzt_glibc_loader_event_source.hook = find_ld_bridge(info);
+    }
+    if (kzt_glibc_loader_event_source.hook) {
+        return 1;
+    }
+
+    lsassertm(0, "can't find ld callback tb.");
+    option_kzt = 0;
+    return 0;
+}
+
 void init_tb_callback_bridge(CPUState *cpu, void* info)
 {
     struct image_info * execinfo = (struct image_info *)info;
     static uint32 jmpinst_exec [2] = {0};
     static uint32 jmpinst_ld [2] = {0};
-    if (!ld_info) {
-        ld_info = find_ld_bridge(info);
-    }
-    if (!ld_info) {
-        lsassertm(0,"can't find ld callback tb.");
-        option_kzt = 0;
+
+    if (!kzt_prepare_glibc_loader_event_source(info))
         return;
-    }
+
     CPUArchState *env = cpu->env_ptr;
     target_ulong eip = env->eip;
-    kzt_add_fucn_by_addr((uint32 *)&jmpinst_exec, cpu, execinfo->exec_entry, target_latx_ld_callback, kzt_exectb_callback);
-    kzt_add_fucn_by_addr((uint32 *)&jmpinst_ld, cpu, ld_info->addr, target_latx_ld_callback, kzt_tb_callback);
+    kzt_install_exec_entry_callback(cpu, execinfo, (uint32 *)&jmpinst_exec);
+    kzt_install_glibc_loader_callback(cpu, (uint32 *)&jmpinst_ld);
     env->eip = eip;
 }
 void kzt_bridge_init(void)
