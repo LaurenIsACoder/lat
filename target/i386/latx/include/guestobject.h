@@ -24,6 +24,7 @@ typedef enum guest_object_process_result_e {
     GUEST_OBJECT_PROCESS_INVALID = -1,
     GUEST_OBJECT_PROCESS_STARTED = 0,
     GUEST_OBJECT_PROCESS_IN_PROGRESS,
+    GUEST_OBJECT_PROCESS_DONE,
 } guest_object_process_result_t;
 
 typedef struct guest_object_lookup_s {

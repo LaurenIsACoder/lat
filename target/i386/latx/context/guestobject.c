@@ -254,13 +254,15 @@ guest_object_process_result_t BeginGuestObjectProcessing(
     switch (object->state) {
         case GUEST_OBJECT_DISCOVERED:
         case GUEST_OBJECT_FAILED:
-        case GUEST_OBJECT_WRAPPED:
-        case GUEST_OBJECT_EMULATED:
             object->state = GUEST_OBJECT_PROCESSING;
             result = GUEST_OBJECT_PROCESS_STARTED;
             break;
         case GUEST_OBJECT_PROCESSING:
             result = GUEST_OBJECT_PROCESS_IN_PROGRESS;
+            break;
+        case GUEST_OBJECT_WRAPPED:
+        case GUEST_OBJECT_EMULATED:
+            result = GUEST_OBJECT_PROCESS_DONE;
             break;
         default:
             result = GUEST_OBJECT_PROCESS_INVALID;
