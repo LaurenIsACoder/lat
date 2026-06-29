@@ -11,6 +11,9 @@
 #include "librarian.h"
 #include "library.h"
 #include "wrapper.h"
+#ifdef CONFIG_LATX_KZT
+#include "kzt_guest_registry.h"
+#endif
 #include <pthread.h>
 
 box64context_t *NewBox64Context(int argc)
@@ -34,6 +37,19 @@ box64context_t *NewBox64Context(int argc)
     return context;
 }
 
+#ifdef CONFIG_LATX_KZT
+kzt_guest_registry_t *KztGuestRegistryForContext(box64context_t *context)
+{
+    if (!context) {
+        return NULL;
+    }
+    if (!context->kzt_guest_registry) {
+        context->kzt_guest_registry = kzt_guest_registry_init();
+    }
+    return context->kzt_guest_registry;
+}
+#endif
+
 EXPORTDYN
 void FreeBox64Context(box64context_t** context)
 {
@@ -44,6 +60,10 @@ void FreeBox64Context(box64context_t** context)
         return;
 
     box64context_t* ctx = *context;   // local copy to do the cleanning
+
+#ifdef CONFIG_LATX_KZT
+    kzt_guest_registry_destroy(&ctx->kzt_guest_registry);
+#endif
 
     if(ctx->local_maplib)
         FreeLibrarian(&ctx->local_maplib);

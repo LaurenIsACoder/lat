@@ -10,6 +10,7 @@ typedef struct elfheader_s elfheader_t;
 typedef struct cleanup_s cleanup_t;
 typedef struct lib_s lib_t;
 typedef struct bridge_s bridge_t;
+typedef struct kzt_guest_registry kzt_guest_registry_t;
 typedef struct kh_symbolmap_s kh_symbolmap_t;
 typedef struct kh_symbol1map_s kh_symbol1map_t;
 typedef struct library_s library_t;
@@ -346,12 +347,18 @@ typedef struct box64context_s {
     int                 latx_kzt_debugcap;
     int                 latx_kzt_debugsize;        // number of latx_kzt_debug
 #endif
+#ifdef CONFIG_LATX_KZT
+    kzt_guest_registry_t *kzt_guest_registry;
+#endif
 } box64context_t;
 
 extern box64context_t *my_context; // global context
 
 box64context_t *NewBox64Context(int argc);
 void FreeBox64Context(box64context_t** context);
+#ifdef CONFIG_LATX_KZT
+kzt_guest_registry_t *KztGuestRegistryForContext(box64context_t *context);
+#endif
 
 // return the index of the added header
 int AddElfHeader(box64context_t* ctx, elfheader_t* head);

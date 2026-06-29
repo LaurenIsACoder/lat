@@ -68,6 +68,7 @@ my_file = files(
   'bridge.c',
   'wrapperdebug.c',
   'wrapper.c',
+  'kzt_guest_registry.c',
   'myalign.c',
   'obstack.c',
   'globalsymbols.c',
