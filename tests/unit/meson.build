@@ -19,3 +19,15 @@ kzt_guest_registry_test = executable(
 )
 
 test('kzt-guest-registry', kzt_guest_registry_test)
+
+kzt_guest_link_map_reader_test = executable(
+  'kzt-guest-link-map-reader',
+  files(
+    'kzt/test_guest_link_map_reader.c',
+    '../../target/i386/latx/context/kzt_guest_link_map_reader.c',
+  ),
+  c_args: ['-DKZT_GUEST_LINK_MAP_READER_TEST'],
+  include_directories: include_directories('../..', '../../target/i386/latx/include'),
+)
+
+test('kzt-guest-link-map-reader', kzt_guest_link_map_reader_test)

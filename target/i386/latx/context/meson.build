@@ -69,6 +69,7 @@ my_file = files(
   'wrapperdebug.c',
   'wrapper.c',
   'kzt_guest_registry.c',
+  'kzt_guest_link_map_reader.c',
   'myalign.c',
   'obstack.c',
   'globalsymbols.c',
