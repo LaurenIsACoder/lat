@@ -43,7 +43,7 @@ static int kzt_registry_debug_dump_line(const char *line, void *opaque)
 {
     (void)opaque;
 
-    printf_log(LOG_DEBUG, "%s\n", line);
+    printf_kzt_registry_diagnostics("%s\n", line);
     return 0;
 }
 
@@ -55,15 +55,15 @@ static void kzt_callback_diagnostic_log(
         return;
     }
 
-    printf_log(LOG_DEBUG,
-               "KZT registry callback result=%d link_map=0x%lx "
-               "registry_result=%d generation=%lu objects=%lu "
-               "observed=%lu suppressed=%lu\n",
-               diagnostic->result, (unsigned long)diagnostic->link_map_addr,
-               diagnostic->registry.result, diagnostic->registry.generation,
-               diagnostic->registry.object_count,
-               diagnostic->registry.result_observations,
-               diagnostic->registry.result_suppressed);
+    printf_kzt_registry_diagnostics(
+        "KZT registry callback result=%d link_map=0x%lx "
+        "registry_result=%d generation=%lu objects=%lu "
+        "observed=%lu suppressed=%lu\n",
+        diagnostic->result, (unsigned long)diagnostic->link_map_addr,
+        diagnostic->registry.result, diagnostic->registry.generation,
+        diagnostic->registry.object_count,
+        diagnostic->registry.result_observations,
+        diagnostic->registry.result_suppressed);
 
     if (opaque) {
         (void)kzt_guest_registry_dump_text(opaque, kzt_registry_debug_dump_line,
@@ -2355,8 +2355,7 @@ static void kzt_tb_callback(CPUX86State *env)
     };
     kzt_observation_adapter_request_t request = {
         .enabled = option_kzt || wine_option_kzt,
-        .diagnostics_enabled = kzt_registry_diagnostics ||
-                               LOG_DEBUG <= relocation_log,
+        .diagnostics_enabled = kzt_registry_diagnostics_enabled(),
         .link_map_addr = link_map_addr,
         .registry = registry,
         .reader_ops = &reader_ops,

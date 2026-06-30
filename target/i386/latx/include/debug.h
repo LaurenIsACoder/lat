@@ -51,6 +51,19 @@ extern char* libGL;
 #define printf_dlsym(L, ...)         ((void)0)
 #define printf_kzt_call(L, ...)         ((void)0)
 #endif
+#if defined(CONFIG_LATX_KZT)
+#define kzt_registry_diagnostics_enabled() \
+    (kzt_registry_diagnostics || (LOG_DEBUG <= relocation_log))
+#define printf_kzt_registry_diagnostics(...) \
+    do { \
+        if (kzt_registry_diagnostics_enabled()) { \
+            fprintf(stderr, __VA_ARGS__); \
+        } \
+    } while (0)
+#else
+#define kzt_registry_diagnostics_enabled() 0
+#define printf_kzt_registry_diagnostics(...) ((void)0)
+#endif
 #define EXPORT __attribute__((visibility("default")))
 #define EXPORTDYN 
 
