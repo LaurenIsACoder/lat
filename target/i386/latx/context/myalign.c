@@ -1,6 +1,7 @@
 #include "config-host.h"
 #include "lsenv.h"
 #include "myalign.h"
+#include "debug.h"
 #include "elfloader.h"
 #include "elfloader_private.h"
 #ifdef CONFIG_LATX_KZT
@@ -36,6 +37,41 @@ typedef union {
 } mmx87_regs_t;
 
 static int regs_abi[] = {R_EDI, R_ESI, R_EDX, R_ECX, R_R8, R_R9};
+
+#ifdef CONFIG_LATX_KZT
+static int kzt_registry_debug_dump_line(const char *line, void *opaque)
+{
+    (void)opaque;
+
+    printf_log(LOG_DEBUG, "%s\n", line);
+    return 0;
+}
+
+static void kzt_callback_diagnostic_log(
+    const kzt_observation_adapter_diagnostic_t *diagnostic,
+    void *opaque)
+{
+    if (!diagnostic) {
+        return;
+    }
+
+    printf_log(LOG_DEBUG,
+               "KZT registry callback result=%d link_map=0x%lx "
+               "registry_result=%d generation=%lu objects=%lu "
+               "observed=%lu suppressed=%lu\n",
+               diagnostic->result, (unsigned long)diagnostic->link_map_addr,
+               diagnostic->registry.result, diagnostic->registry.generation,
+               diagnostic->registry.object_count,
+               diagnostic->registry.result_observations,
+               diagnostic->registry.result_suppressed);
+
+    if (opaque) {
+        (void)kzt_guest_registry_dump_text(opaque, kzt_registry_debug_dump_line,
+                                           NULL);
+    }
+}
+#endif
+
 uintptr_t getVArgs(int pos, uintptr_t* b, int N)
 {
     CPUX86State *cpu = (CPUX86State *)lsenv->cpu_state;
@@ -2308,19 +2344,31 @@ static void kzt_tb_callback(CPUX86State *env)
 {
     uintptr_t link_map_addr = env->regs[R_EAX + ld_info->reg];
 #ifdef CONFIG_LATX_KZT
+    kzt_guest_registry_t *registry = KztGuestRegistryForContext(my_context);
+    kzt_guest_registry_diagnostic_config_t diagnostic_config = {
+        .enabled = option_kzt || wine_option_kzt,
+        .throttle_limit = 1,
+    };
     const kzt_guest_link_map_reader_ops_t reader_ops = {
         .read_memory = kzt_callback_read_memory,
         .opaque = NULL,
     };
     kzt_observation_adapter_request_t request = {
         .enabled = option_kzt || wine_option_kzt,
+        .diagnostics_enabled = LOG_DEBUG <= relocation_log,
         .link_map_addr = link_map_addr,
-        .registry = KztGuestRegistryForContext(my_context),
+        .registry = registry,
         .reader_ops = &reader_ops,
         .legacy_flow = kzt_tb_callback_legacy,
         .legacy_opaque = NULL,
+        .diagnostic = kzt_callback_diagnostic_log,
+        .diagnostic_opaque = registry,
     };
 
+    if (registry) {
+        (void)kzt_guest_registry_configure_diagnostics(registry,
+                                                       &diagnostic_config);
+    }
     (void)kzt_observe_guest_object_from_callback(&request, NULL);
 #else
     (void)kzt_tb_callback_legacy(link_map_addr, env);

@@ -30,18 +30,29 @@ static kzt_observation_adapter_result_t kzt_observe_guest_object(
     kzt_guest_registry_result_t registry_result;
 
     if (!request || !request->enabled) {
+        if (request) {
+            kzt_guest_registry_note_diagnostic(
+                request->registry, KZT_GUEST_REGISTRY_DISABLED,
+                request->link_map_addr, registry_diagnostic);
+        }
         return KZT_OBSERVATION_ADAPTER_DISABLED;
     }
 
     if (kzt_guest_link_map_read_observation(request->link_map_addr,
                                             request->reader_ops,
                                             &observation) != 0) {
+        kzt_guest_registry_note_diagnostic(
+            request->registry, KZT_GUEST_REGISTRY_ERROR,
+            request->link_map_addr, registry_diagnostic);
         return KZT_OBSERVATION_ADAPTER_READER_FAILED;
     }
 
     if (observation.link_map_addr == 0 ||
         observation.load_bias.status != KZT_GUEST_FIELD_OK) {
         kzt_guest_link_map_observation_clear(&observation);
+        kzt_guest_registry_note_diagnostic(
+            request->registry, KZT_GUEST_REGISTRY_ERROR,
+            request->link_map_addr, registry_diagnostic);
         return KZT_OBSERVATION_ADAPTER_READER_FAILED;
     }
 
@@ -66,12 +77,11 @@ static void kzt_observation_adapter_emit_diagnostic(
     diagnostic.enabled = 1;
     diagnostic.result = result;
     diagnostic.link_map_addr = request->link_map_addr;
-    diagnostic.emitted = 1;
+    diagnostic.emitted = 0;
     if (registry_diagnostic) {
         diagnostic.registry = *registry_diagnostic;
-        if (registry_diagnostic->enabled) {
-            diagnostic.emitted = registry_diagnostic->emitted;
-        }
+        diagnostic.emitted = registry_diagnostic->enabled &&
+                             registry_diagnostic->emitted;
     }
 
     if (!diagnostic.emitted) {

@@ -747,6 +747,23 @@ int kzt_guest_registry_get_diagnostic_report(
     return 0;
 }
 
+int kzt_guest_registry_note_diagnostic(
+    kzt_guest_registry_t *registry,
+    kzt_guest_registry_result_t result,
+    uintptr_t link_map_addr,
+    kzt_guest_registry_observation_diagnostic_t *diagnostic)
+{
+    if (!registry || result >= KZT_GUEST_REGISTRY_RESULT_COUNT) {
+        kzt_registry_init_empty_diagnostic(diagnostic, result, link_map_addr);
+        return -1;
+    }
+
+    pthread_mutex_lock(&registry->lock);
+    kzt_registry_note_result(registry, result, link_map_addr, 0, diagnostic);
+    pthread_mutex_unlock(&registry->lock);
+    return 0;
+}
+
 static int kzt_guest_registry_dump_emit(
     kzt_guest_registry_dump_sink_fn sink,
     void *opaque,

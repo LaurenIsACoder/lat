@@ -488,6 +488,110 @@ static void test_enabled_diagnostics_are_throttled_and_fail_open(void)
     kzt_guest_registry_destroy(&registry);
 }
 
+static void test_reader_failures_are_throttled(void)
+{
+    fake_callback_event_t event;
+    fake_read_failure_t failure;
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_observation_adapter_result_t result = KZT_OBSERVATION_ADAPTER_DISABLED;
+    kzt_guest_registry_diagnostic_config_t config = {
+        .enabled = 1,
+        .throttle_limit = 1,
+    };
+
+    check_true("registry.init", registry != NULL);
+    if (!registry) {
+        return;
+    }
+
+    init_fake_callback_event(&event, "/guest/libdiagnostic-fail.so",
+                             0x710000);
+    failure.addr = (uintptr_t)&event.link_map +
+                   offsetof(struct link_map_x64, l_addr);
+    failure.size = sizeof(event.link_map.l_addr);
+    event.memory.failures = &failure;
+    event.memory.failure_count = 1;
+    event.trace.legacy_return = 37;
+    check_int("reader-diagnostic.configure",
+              kzt_guest_registry_configure_diagnostics(registry, &config),
+              0);
+
+    check_int("reader-diagnostic.first-return",
+              run_adapter_with_diagnostics(&event, registry, 1, &result),
+              37);
+    check_int("reader-diagnostic.first-result", result,
+              KZT_OBSERVATION_ADAPTER_READER_FAILED);
+    check_int("reader-diagnostic.first-calls",
+              event.trace.diagnostic_calls, 1);
+    check_int("reader-diagnostic.first-emitted",
+              event.trace.diagnostic_emitted, 1);
+    check_int("reader-diagnostic.first-legacy",
+              event.trace.legacy_calls, 1);
+
+    check_int("reader-diagnostic.second-return",
+              run_adapter_with_diagnostics(&event, registry, 1, &result),
+              37);
+    check_int("reader-diagnostic.second-result", result,
+              KZT_OBSERVATION_ADAPTER_READER_FAILED);
+    check_int("reader-diagnostic.second-calls",
+              event.trace.diagnostic_calls, 1);
+    check_int("reader-diagnostic.second-legacy",
+              event.trace.legacy_calls, 2);
+
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_disabled_adapter_diagnostics_are_throttled(void)
+{
+    fake_callback_event_t event;
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_observation_adapter_result_t result = KZT_OBSERVATION_ADAPTER_ADDED;
+    kzt_guest_registry_diagnostic_config_t config = {
+        .enabled = 1,
+        .throttle_limit = 1,
+    };
+
+    check_true("registry.init", registry != NULL);
+    if (!registry) {
+        return;
+    }
+
+    init_fake_callback_event(&event, "/guest/libdiagnostic-disabled.so",
+                             0x720000);
+    event.trace.legacy_return = 39;
+    check_int("disabled-diagnostic.configure",
+              kzt_guest_registry_configure_diagnostics(registry, &config),
+              0);
+
+    check_int("disabled-diagnostic.first-return",
+              run_adapter_with_diagnostics(&event, registry, 0, &result),
+              39);
+    check_int("disabled-diagnostic.first-result", result,
+              KZT_OBSERVATION_ADAPTER_DISABLED);
+    check_int("disabled-diagnostic.first-calls",
+              event.trace.diagnostic_calls, 1);
+    check_int("disabled-diagnostic.first-emitted",
+              event.trace.diagnostic_emitted, 1);
+    check_int("disabled-diagnostic.first-legacy",
+              event.trace.legacy_calls, 1);
+    check_int("disabled-diagnostic.reader-calls",
+              event.trace.reader_calls, 0);
+
+    check_int("disabled-diagnostic.second-return",
+              run_adapter_with_diagnostics(&event, registry, 0, &result),
+              39);
+    check_int("disabled-diagnostic.second-result", result,
+              KZT_OBSERVATION_ADAPTER_DISABLED);
+    check_int("disabled-diagnostic.second-calls",
+              event.trace.diagnostic_calls, 1);
+    check_int("disabled-diagnostic.second-legacy",
+              event.trace.legacy_calls, 2);
+    check_int("disabled-diagnostic.second-reader-calls",
+              event.trace.reader_calls, 0);
+
+    kzt_guest_registry_destroy(&registry);
+}
+
 int main(void)
 {
     test_active_observation_adds_object_and_preserves_old_flow();
@@ -497,6 +601,8 @@ int main(void)
     test_conflict_result_does_not_change_old_flow();
     test_no_callback_event_does_not_create_registry_objects();
     test_enabled_diagnostics_are_throttled_and_fail_open();
+    test_reader_failures_are_throttled();
+    test_disabled_adapter_diagnostics_are_throttled();
 
     if (failures) {
         fprintf(stderr, "kzt-observation-adapter: %d failure(s)\n", failures);

@@ -155,6 +155,12 @@ int kzt_guest_registry_get_diagnostic_report(
     kzt_guest_registry_t *registry,
     kzt_guest_registry_diagnostic_report_t *report);
 
+int kzt_guest_registry_note_diagnostic(
+    kzt_guest_registry_t *registry,
+    kzt_guest_registry_result_t result,
+    uintptr_t link_map_addr,
+    kzt_guest_registry_observation_diagnostic_t *diagnostic);
+
 int kzt_guest_registry_dump_text(
     kzt_guest_registry_t *registry,
     kzt_guest_registry_dump_sink_fn sink,
