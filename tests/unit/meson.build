@@ -31,3 +31,19 @@ kzt_guest_link_map_reader_test = executable(
 )
 
 test('kzt-guest-link-map-reader', kzt_guest_link_map_reader_test)
+
+
+kzt_observation_adapter_test = executable(
+  'kzt-observation-adapter',
+  files(
+    'kzt/test_observation_adapter.c',
+    '../../target/i386/latx/context/kzt_guest_registry.c',
+    '../../target/i386/latx/context/kzt_guest_link_map_reader.c',
+    '../../target/i386/latx/context/kzt_observation_adapter.c',
+  ),
+  c_args: ['-DKZT_GUEST_REGISTRY_TEST', '-DKZT_GUEST_LINK_MAP_READER_TEST'],
+  include_directories: include_directories('../..', '../../target/i386/latx/include'),
+  dependencies: dependency('threads'),
+)
+
+test('kzt-observation-adapter', kzt_observation_adapter_test)
