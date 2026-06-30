@@ -20,6 +20,19 @@ kzt_guest_registry_test = executable(
 
 test('kzt-guest-registry', kzt_guest_registry_test)
 
+kzt_guest_registry_concurrency_test = executable(
+  'kzt-guest-registry-concurrency',
+  files(
+    'kzt/test_guest_registry_concurrency.c',
+    '../../target/i386/latx/context/kzt_guest_registry.c',
+  ),
+  c_args: ['-DKZT_GUEST_REGISTRY_TEST'],
+  include_directories: include_directories('../../target/i386/latx/include'),
+  dependencies: dependency('threads'),
+)
+
+test('kzt-guest-registry-concurrency', kzt_guest_registry_concurrency_test)
+
 kzt_guest_link_map_reader_test = executable(
   'kzt-guest-link-map-reader',
   files(
