@@ -2355,7 +2355,8 @@ static void kzt_tb_callback(CPUX86State *env)
     };
     kzt_observation_adapter_request_t request = {
         .enabled = option_kzt || wine_option_kzt,
-        .diagnostics_enabled = LOG_DEBUG <= relocation_log,
+        .diagnostics_enabled = kzt_registry_diagnostics ||
+                               LOG_DEBUG <= relocation_log,
         .link_map_addr = link_map_addr,
         .registry = registry,
         .reader_ops = &reader_ops,

@@ -125,7 +125,9 @@ extern unsigned long long counter_mips_tr;
 
 #if defined(CONFIG_LATX) && defined(CONFIG_LATX_KZT)
 #define ENVSUP_KZT \
-    ENVFUN(LATX_KZT, handle_arg_latx_kzt)
+    ENVFUN(LATX_KZT, handle_arg_latx_kzt) \
+    ENVFUN(LATX_KZT_REGISTRY_DIAGNOSTICS, \
+           handle_arg_latx_kzt_registry_diagnostics)
 #else
 #define ENVSUP_KZT
 #endif

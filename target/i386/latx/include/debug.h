@@ -13,6 +13,7 @@ extern int box64_pagesize;
 extern uintptr_t box64_load_addr;
 extern int dlsym_error;    // log dlsym error
 extern int kzt_call_log;
+extern int kzt_registry_diagnostics;
 extern int allow_missing_libs;
 extern int  box64_nogtk;
 extern int box64_prefer_wrapped;

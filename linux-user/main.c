@@ -80,6 +80,7 @@ int box64_pagesize;
 uintptr_t box64_load_addr = 0;
 int dlsym_error = 0;
 int kzt_call_log = 0;
+int kzt_registry_diagnostics = 0;
 int cycle_log = 0;
 int allow_missing_libs = 1;
 int box64_nogtk = 0;
@@ -635,6 +636,11 @@ static void handle_arg_latx_kzt(const char *arg)
 {
     option_kzt = strtol(arg, NULL, 0);
 }
+
+static void handle_arg_latx_kzt_registry_diagnostics(const char *arg)
+{
+    kzt_registry_diagnostics = strtol(arg, NULL, 0);
+}
 #endif
 
 static void handle_arg_latx_fputag(const char *arg)
@@ -818,6 +824,9 @@ static const struct qemu_argument arg_table[] = {
 #if defined(CONFIG_LATX_KZT)
     {"latx-kzt",    "LATX_KZT",     true,  handle_arg_latx_kzt,
     "",           "enable kuzhitong"},
+    {"latx-kzt-registry-diagnostics", "LATX_KZT_REGISTRY_DIAGNOSTICS",
+     true, handle_arg_latx_kzt_registry_diagnostics,
+    "",           "enable KZT guest registry diagnostics"},
 #endif
     {"latx-fputag",    "LATX_FPUTAG",     true,  handle_arg_latx_fputag,
     "",           "enable fputag"},
