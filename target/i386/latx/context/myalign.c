@@ -3,6 +3,9 @@
 #include "myalign.h"
 #include "elfloader.h"
 #include "elfloader_private.h"
+#ifdef CONFIG_LATX_KZT
+#include "kzt_observation_adapter.h"
+#endif
 #include <sys/epoll.h>
 #include <sys/sem.h>
 #include <sys/syscall.h>
@@ -2214,19 +2217,47 @@ static char* kzt_find_realsofilepath(char * filepath, char *filetmp)
     return filepath;
 }
 extern const char* libcName;
-static void kzt_tb_callback(CPUX86State *env)
+#ifdef CONFIG_LATX_KZT
+static int kzt_callback_read_memory(uintptr_t guest_addr,
+                                    void *dst,
+                                    size_t size,
+                                    void *opaque)
 {
-    struct link_map_x64 * my_lm = (struct link_map_x64 *)env->regs[R_EAX + ld_info->reg];
+    void *host_ptr;
+
+    (void)opaque;
+    if (!dst && size) {
+        return -1;
+    }
+    if (!size) {
+        return 0;
+    }
+
+    host_ptr = lock_user(VERIFY_READ, (abi_ulong)guest_addr, size, true);
+    if (!host_ptr) {
+        return -1;
+    }
+
+    memcpy(dst, host_ptr, size);
+    unlock_user(host_ptr, (abi_ulong)guest_addr, 0);
+    return 0;
+}
+#endif
+
+static int kzt_tb_callback_legacy(uintptr_t link_map_addr, void *opaque)
+{
+    (void)opaque;
+    struct link_map_x64 * my_lm = (struct link_map_x64 *)link_map_addr;
     elfheader_t *h = NULL;
     if ((!my_lm ||!my_lm->l_name ||!strlen(my_lm->l_name) || ! my_lm->l_addr)&& my_lm->l_addr != info1.load_addr) {
         printf_log(LOG_DEBUG, "error %d debug %s link_map = %p{0x%lx, %s}\n", getpid(), __func__, my_lm, my_lm->l_addr, my_lm->l_name);
-        return;
+        return 0;
     }
     printf_log(LOG_DEBUG, "%d debug %s link_map = %p{0x%lx, %s}\n", getpid(), __func__, my_lm, my_lm->l_addr, my_lm->l_name);
     char * rfilename = my_lm->l_name;
     if (strstr(basename(rfilename), "ld-linux-x86-64.so.2")) {
         AddDebugInfo(LIB_EMULATED, my_lm->l_name, my_lm->l_map_start, my_lm->l_map_end);
-        return;
+        return 0;
     }
     char filetmp[PATH_MAX] = {0};
     if (rfilename[0] == '/') {
@@ -2246,7 +2277,7 @@ static void kzt_tb_callback(CPUX86State *env)
     FILE *f = fopen(rfilename, "rb");
     if(!f) {
         printf_log(LOG_INFO, "%s Error: Cannot open \"%s\"\n", __func__, rfilename);
-        return;
+        return 0;
     }
     h = LoadAndCheckElfHeader(f, rfilename, 0);
     ElfHeadReFix(h, my_lm->l_addr);
@@ -2270,6 +2301,30 @@ static void kzt_tb_callback(CPUX86State *env)
     } else {
         AddDebugInfo(LIB_EMULATED, my_lm->l_name, my_lm->l_map_start, my_lm->l_map_end);
     }
+    return 0;
+}
+
+static void kzt_tb_callback(CPUX86State *env)
+{
+    uintptr_t link_map_addr = env->regs[R_EAX + ld_info->reg];
+#ifdef CONFIG_LATX_KZT
+    const kzt_guest_link_map_reader_ops_t reader_ops = {
+        .read_memory = kzt_callback_read_memory,
+        .opaque = NULL,
+    };
+    kzt_observation_adapter_request_t request = {
+        .enabled = option_kzt || wine_option_kzt,
+        .link_map_addr = link_map_addr,
+        .registry = KztGuestRegistryForContext(my_context),
+        .reader_ops = &reader_ops,
+        .legacy_flow = kzt_tb_callback_legacy,
+        .legacy_opaque = NULL,
+    };
+
+    (void)kzt_observe_guest_object_from_callback(&request, NULL);
+#else
+    (void)kzt_tb_callback_legacy(link_map_addr, env);
+#endif
 }
 static TranslationBlock* test_tb;
 static void test_x86free(CPUX86State *env)
