@@ -1,4 +1,6 @@
 #include <pthread.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
@@ -16,6 +18,9 @@ struct kzt_guest_registry {
     size_t capacity;
     unsigned long next_generation;
     kzt_guest_registry_diagnostics_t diagnostics;
+    kzt_guest_registry_diagnostic_config_t diagnostic_config;
+    kzt_guest_registry_event_summary_t diagnostic_events[
+        KZT_GUEST_REGISTRY_RESULT_COUNT];
 };
 
 #ifdef KZT_GUEST_REGISTRY_TEST
@@ -333,8 +338,49 @@ static int kzt_registry_ensure_capacity(kzt_guest_registry_t *registry)
     return 0;
 }
 
-static void kzt_registry_note_result(kzt_guest_registry_t *registry,
-                                     kzt_guest_registry_result_t result)
+static const char *kzt_registry_result_name(kzt_guest_registry_result_t result)
+{
+    switch (result) {
+    case KZT_GUEST_REGISTRY_ADDED:
+        return "added";
+    case KZT_GUEST_REGISTRY_UNCHANGED:
+        return "unchanged";
+    case KZT_GUEST_REGISTRY_UPDATED:
+        return "updated";
+    case KZT_GUEST_REGISTRY_CONFLICT:
+        return "conflict";
+    case KZT_GUEST_REGISTRY_DISABLED:
+        return "disabled";
+    case KZT_GUEST_REGISTRY_ERROR:
+        return "error";
+    case KZT_GUEST_REGISTRY_RESULT_COUNT:
+        break;
+    }
+
+    return "unknown";
+}
+
+static const char *kzt_guest_field_status_name(
+    kzt_guest_field_status_t status)
+{
+    switch (status) {
+    case KZT_GUEST_FIELD_OK:
+        return "ok";
+    case KZT_GUEST_FIELD_UNKNOWN:
+        return "unknown";
+    case KZT_GUEST_FIELD_READ_ERROR:
+        return "read_error";
+    case KZT_GUEST_FIELD_TRUNCATED:
+        return "truncated";
+    case KZT_GUEST_FIELD_NOT_PARSED:
+        return "not_parsed";
+    }
+
+    return "invalid";
+}
+
+static void kzt_registry_note_counter(kzt_guest_registry_t *registry,
+                                      kzt_guest_registry_result_t result)
 {
     switch (result) {
     case KZT_GUEST_REGISTRY_ADDED:
@@ -355,6 +401,67 @@ static void kzt_registry_note_result(kzt_guest_registry_t *registry,
     case KZT_GUEST_REGISTRY_ERROR:
         ++registry->diagnostics.errors;
         break;
+    case KZT_GUEST_REGISTRY_RESULT_COUNT:
+        break;
+    }
+}
+
+static void kzt_registry_init_empty_diagnostic(
+    kzt_guest_registry_observation_diagnostic_t *diagnostic,
+    kzt_guest_registry_result_t result,
+    uintptr_t link_map_addr)
+{
+    if (!diagnostic) {
+        return;
+    }
+
+    memset(diagnostic, 0, sizeof(*diagnostic));
+    diagnostic->result = result;
+    diagnostic->link_map_addr = link_map_addr;
+}
+
+static void kzt_registry_note_result(
+    kzt_guest_registry_t *registry,
+    kzt_guest_registry_result_t result,
+    uintptr_t link_map_addr,
+    unsigned long generation,
+    kzt_guest_registry_observation_diagnostic_t *diagnostic)
+{
+    kzt_guest_registry_event_summary_t *event = NULL;
+    int emitted = 0;
+
+    kzt_registry_note_counter(registry, result);
+
+    if (registry->diagnostic_config.enabled &&
+        result < KZT_GUEST_REGISTRY_RESULT_COUNT) {
+        event = &registry->diagnostic_events[result];
+        event->result = result;
+        ++event->observed;
+        event->last_link_map_addr = link_map_addr;
+        event->last_generation = generation;
+        if (event->emitted < registry->diagnostic_config.throttle_limit) {
+            ++event->emitted;
+            emitted = 1;
+        } else {
+            ++event->suppressed;
+        }
+    }
+
+    if (!diagnostic) {
+        return;
+    }
+
+    memset(diagnostic, 0, sizeof(*diagnostic));
+    diagnostic->enabled = registry->diagnostic_config.enabled;
+    diagnostic->emitted = emitted;
+    diagnostic->result = result;
+    diagnostic->link_map_addr = link_map_addr;
+    diagnostic->generation = generation;
+    diagnostic->object_count = registry->count;
+    diagnostic->counters = registry->diagnostics;
+    if (event) {
+        diagnostic->result_observations = event->observed;
+        diagnostic->result_suppressed = event->suppressed;
     }
 }
 
@@ -420,11 +527,25 @@ kzt_guest_registry_result_t kzt_guest_registry_observe(
     kzt_guest_registry_t *registry,
     const kzt_guest_object_observation_t *observation)
 {
+    return kzt_guest_registry_observe_with_diagnostic(registry, observation,
+                                                      NULL);
+}
+
+kzt_guest_registry_result_t kzt_guest_registry_observe_with_diagnostic(
+    kzt_guest_registry_t *registry,
+    const kzt_guest_object_observation_t *observation,
+    kzt_guest_registry_observation_diagnostic_t *diagnostic)
+{
     kzt_guest_registry_result_t result;
     ssize_t index;
     int updated = 0;
+    uintptr_t link_map_addr = observation ? observation->link_map_addr : 0;
+    unsigned long generation = 0;
 
     if (!registry) {
+        kzt_registry_init_empty_diagnostic(diagnostic,
+                                           KZT_GUEST_REGISTRY_DISABLED,
+                                           link_map_addr);
         return KZT_GUEST_REGISTRY_DISABLED;
     }
 
@@ -443,8 +564,6 @@ kzt_guest_registry_result_t kzt_guest_registry_observe(
 
     index = kzt_find_object_index(registry, observation->link_map_addr);
     if (index < 0) {
-        unsigned long generation;
-
         if (kzt_registry_ensure_capacity(registry) != 0) {
             result = KZT_GUEST_REGISTRY_ERROR;
             goto out;
@@ -462,6 +581,7 @@ kzt_guest_registry_result_t kzt_guest_registry_observe(
         goto out;
     }
 
+    generation = registry->objects[index].generation;
     if (kzt_observation_conflicts(&registry->objects[index], observation)) {
         result = KZT_GUEST_REGISTRY_CONFLICT;
         goto out;
@@ -478,7 +598,8 @@ kzt_guest_registry_result_t kzt_guest_registry_observe(
                        KZT_GUEST_REGISTRY_UNCHANGED;
 
 out:
-    kzt_registry_note_result(registry, result);
+    kzt_registry_note_result(registry, result, link_map_addr, generation,
+                             diagnostic);
     pthread_mutex_unlock(&registry->lock);
     return result;
 }
@@ -589,6 +710,168 @@ int kzt_guest_registry_get_diagnostics(
     *diagnostics = registry->diagnostics;
     pthread_mutex_unlock(&registry->lock);
     return 0;
+}
+
+int kzt_guest_registry_configure_diagnostics(
+    kzt_guest_registry_t *registry,
+    const kzt_guest_registry_diagnostic_config_t *config)
+{
+    if (!registry || !config) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&registry->lock);
+    registry->diagnostic_config.enabled = !!config->enabled;
+    registry->diagnostic_config.throttle_limit =
+        config->throttle_limit ? config->throttle_limit : 1;
+    pthread_mutex_unlock(&registry->lock);
+    return 0;
+}
+
+int kzt_guest_registry_get_diagnostic_report(
+    kzt_guest_registry_t *registry,
+    kzt_guest_registry_diagnostic_report_t *report)
+{
+    if (!registry || !report) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&registry->lock);
+    memset(report, 0, sizeof(*report));
+    report->config = registry->diagnostic_config;
+    report->counters = registry->diagnostics;
+    memcpy(report->events, registry->diagnostic_events,
+           sizeof(report->events));
+    report->event_count = KZT_GUEST_REGISTRY_RESULT_COUNT;
+    pthread_mutex_unlock(&registry->lock);
+    return 0;
+}
+
+static int kzt_guest_registry_dump_emit(
+    kzt_guest_registry_dump_sink_fn sink,
+    void *opaque,
+    const char *fmt,
+    ...)
+{
+    char line[1024];
+    va_list ap;
+    int len;
+
+    va_start(ap, fmt);
+    len = vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (len < 0) {
+        return -1;
+    }
+
+    line[sizeof(line) - 1] = '\0';
+    return sink(line, opaque);
+}
+
+static int kzt_guest_registry_dump_emit_scalar(
+    kzt_guest_registry_dump_sink_fn sink,
+    void *opaque,
+    const char *name,
+    kzt_guest_scalar_field_t field)
+{
+    return kzt_guest_registry_dump_emit(
+        sink, opaque, "%s=0x%lx(%s)", name, (unsigned long)field.value,
+        kzt_guest_field_status_name(field.status));
+}
+
+int kzt_guest_registry_dump_text(
+    kzt_guest_registry_t *registry,
+    kzt_guest_registry_dump_sink_fn sink,
+    void *opaque)
+{
+    kzt_guest_registry_diagnostic_report_t report;
+    kzt_guest_registry_dump_t dump = { 0 };
+    size_t i;
+    int ret = -1;
+
+    if (!registry || !sink) {
+        return -1;
+    }
+
+    if (kzt_guest_registry_get_diagnostic_report(registry, &report) != 0) {
+        return -1;
+    }
+    if (kzt_guest_registry_dump_snapshot(registry, &dump) != 0) {
+        return -1;
+    }
+
+    if (kzt_guest_registry_dump_emit(
+            sink, opaque,
+            "kzt_guest_registry diagnostics enabled=%d throttle_limit=%lu "
+            "observations=%lu added=%lu unchanged=%lu updated=%lu "
+            "conflicts=%lu disabled=%lu errors=%lu init_failures=%lu "
+            "allocation_failures=%lu objects=%lu",
+            report.config.enabled, report.config.throttle_limit,
+            report.counters.observations, report.counters.added,
+            report.counters.unchanged, report.counters.updated,
+            report.counters.conflicts, report.counters.disabled,
+            report.counters.errors, report.counters.init_failures,
+            report.counters.allocation_failures,
+            (unsigned long)dump.count) != 0) {
+        goto out;
+    }
+
+    for (i = 0; i < report.event_count; ++i) {
+        const kzt_guest_registry_event_summary_t *event = &report.events[i];
+
+        if (event->observed == 0) {
+            continue;
+        }
+        if (kzt_guest_registry_dump_emit(
+                sink, opaque,
+                "kzt_guest_registry event result=%s observed=%lu "
+                "emitted=%lu suppressed=%lu last_link_map=0x%lx "
+                "last_generation=%lu",
+                kzt_registry_result_name(event->result), event->observed,
+                event->emitted, event->suppressed,
+                (unsigned long)event->last_link_map_addr,
+                event->last_generation) != 0) {
+            goto out;
+        }
+    }
+
+    for (i = 0; i < dump.count; ++i) {
+        const kzt_guest_object_snapshot_t *object = &dump.objects[i];
+
+        if (kzt_guest_registry_dump_emit(
+                sink, opaque,
+                "kzt_guest_registry object link_map=0x%lx generation=%lu "
+                "state=%d ",
+                (unsigned long)object->link_map_addr, object->generation,
+                object->state) != 0 ||
+            kzt_guest_registry_dump_emit_scalar(sink, opaque, "load_bias",
+                                                object->load_bias) != 0 ||
+            kzt_guest_registry_dump_emit_scalar(sink, opaque, " dynamic_addr",
+                                                object->dynamic_addr) != 0 ||
+            kzt_guest_registry_dump_emit_scalar(sink, opaque, " map_start",
+                                                object->map_start) != 0 ||
+            kzt_guest_registry_dump_emit_scalar(sink, opaque, " map_end",
+                                                object->map_end) != 0 ||
+            kzt_guest_registry_dump_emit(
+                sink, opaque,
+                " namespace_id=0x%lx(%s) dynamic_view=%s path_status=%s "
+                "path=\"%s\" soname_status=%s soname=\"%s\"",
+                (unsigned long)object->namespace_id.value,
+                kzt_guest_field_status_name(object->namespace_id.status),
+                kzt_guest_field_status_name(object->dynamic_view_status),
+                kzt_guest_field_status_name(object->path.status),
+                object->path.value ? object->path.value : "",
+                kzt_guest_field_status_name(object->soname.status),
+                object->soname.value ? object->soname.value : "") != 0) {
+            goto out;
+        }
+    }
+
+    ret = 0;
+
+out:
+    kzt_guest_registry_dump_free(&dump);
+    return ret;
 }
 
 void kzt_guest_object_snapshot_free(kzt_guest_object_snapshot_t *snapshot)

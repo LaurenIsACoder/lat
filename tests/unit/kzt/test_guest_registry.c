@@ -69,6 +69,18 @@ static void check_string(const char *name, const char *got,
     ++failures;
 }
 
+static void check_contains(const char *name, const char *haystack,
+                           const char *needle)
+{
+    if (haystack && needle && strstr(haystack, needle)) {
+        return;
+    }
+
+    fprintf(stderr, "%s: missing \"%s\" in \"%s\"\n", name,
+            needle ? needle : "(null)", haystack ? haystack : "(null)");
+    ++failures;
+}
+
 static kzt_guest_object_observation_t make_observation(uintptr_t link_map_addr)
 {
     return (kzt_guest_object_observation_t) {
@@ -395,6 +407,147 @@ static void test_query_and_dump_snapshots_are_caller_owned(void)
     check_true("registry.destroy", registry == NULL);
 }
 
+typedef struct dump_text_sink {
+    char text[8192];
+    size_t used;
+    unsigned long calls;
+    kzt_guest_registry_t *registry;
+} dump_text_sink_t;
+
+static int collect_dump_text_line(const char *line, void *opaque)
+{
+    dump_text_sink_t *sink = opaque;
+    kzt_guest_registry_diagnostics_t diagnostics = { 0 };
+    size_t len;
+    size_t remaining;
+
+    if (sink->registry) {
+        check_int("dump.sink-can-query-registry",
+                  kzt_guest_registry_get_diagnostics(sink->registry,
+                                                     &diagnostics),
+                  0);
+    }
+
+    ++sink->calls;
+    len = strlen(line);
+    remaining = sizeof(sink->text) - sink->used;
+    if (remaining <= 2) {
+        return 0;
+    }
+    if (len >= remaining - 1) {
+        len = remaining - 2;
+    }
+    memcpy(sink->text + sink->used, line, len);
+    sink->used += len;
+    sink->text[sink->used++] = '\n';
+    sink->text[sink->used] = '\0';
+    return 0;
+}
+
+static void test_diagnostics_are_opt_in_and_throttled(void)
+{
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_guest_object_observation_t observation = make_observation(0x8000);
+    kzt_guest_registry_observation_diagnostic_t diagnostic = { 0 };
+    kzt_guest_registry_diagnostic_report_t report;
+    kzt_guest_registry_diagnostic_config_t config = {
+        .enabled = 1,
+        .throttle_limit = 2,
+    };
+    dump_text_sink_t sink = { 0 };
+
+    check_true("registry.init", registry != NULL);
+    if (!registry) {
+        return;
+    }
+
+    check_int("observe.diagnostic-disabled",
+              kzt_guest_registry_observe_with_diagnostic(registry,
+                                                         &observation,
+                                                         &diagnostic),
+              KZT_GUEST_REGISTRY_ADDED);
+    check_int("diagnostic.default-enabled", diagnostic.enabled, 0);
+    check_int("diagnostic.default-emitted", diagnostic.emitted, 0);
+    check_int("diagnostic.default-result", diagnostic.result,
+              KZT_GUEST_REGISTRY_ADDED);
+
+    check_int("diagnostic.report.disabled",
+              kzt_guest_registry_get_diagnostic_report(registry, &report),
+              0);
+    check_int("report.default-enabled", report.config.enabled, 0);
+    check_ulong("report.default-added-events",
+                report.events[KZT_GUEST_REGISTRY_ADDED].observed, 0);
+    check_ulong("report.default-added-counter", report.counters.added, 1);
+
+    check_int("diagnostic.configure",
+              kzt_guest_registry_configure_diagnostics(registry, &config),
+              0);
+
+    check_int("observe.unchanged.first",
+              kzt_guest_registry_observe_with_diagnostic(registry,
+                                                         &observation,
+                                                         &diagnostic),
+              KZT_GUEST_REGISTRY_UNCHANGED);
+    check_int("diagnostic.first-enabled", diagnostic.enabled, 1);
+    check_int("diagnostic.first-emitted", diagnostic.emitted, 1);
+    check_ulong("diagnostic.first-observations",
+                diagnostic.result_observations, 1);
+    check_ulong("diagnostic.first-suppressed", diagnostic.result_suppressed,
+                0);
+
+    check_int("observe.unchanged.second",
+              kzt_guest_registry_observe_with_diagnostic(registry,
+                                                         &observation,
+                                                         &diagnostic),
+              KZT_GUEST_REGISTRY_UNCHANGED);
+    check_int("diagnostic.second-emitted", diagnostic.emitted, 1);
+    check_ulong("diagnostic.second-observations",
+                diagnostic.result_observations, 2);
+
+    check_int("observe.unchanged.third",
+              kzt_guest_registry_observe_with_diagnostic(registry,
+                                                         &observation,
+                                                         &diagnostic),
+              KZT_GUEST_REGISTRY_UNCHANGED);
+    check_int("diagnostic.third-emitted", diagnostic.emitted, 0);
+    check_ulong("diagnostic.third-observations",
+                diagnostic.result_observations, 3);
+    check_ulong("diagnostic.third-suppressed", diagnostic.result_suppressed,
+                1);
+
+    check_int("diagnostic.report.enabled",
+              kzt_guest_registry_get_diagnostic_report(registry, &report),
+              0);
+    check_int("report.enabled", report.config.enabled, 1);
+    check_ulong("report.throttle-limit", report.config.throttle_limit, 2);
+    check_ulong("report.unchanged-observed",
+                report.events[KZT_GUEST_REGISTRY_UNCHANGED].observed, 3);
+    check_ulong("report.unchanged-emitted",
+                report.events[KZT_GUEST_REGISTRY_UNCHANGED].emitted, 2);
+    check_ulong("report.unchanged-suppressed",
+                report.events[KZT_GUEST_REGISTRY_UNCHANGED].suppressed, 1);
+    check_uintptr("report.unchanged-last-link-map",
+                  report.events[KZT_GUEST_REGISTRY_UNCHANGED]
+                      .last_link_map_addr,
+                  0x8000);
+
+    sink.registry = registry;
+    check_int("dump.text",
+              kzt_guest_registry_dump_text(registry, collect_dump_text_line,
+                                           &sink),
+              0);
+    check_true("dump.text-called", sink.calls > 0);
+    check_contains("dump.text-summary", sink.text,
+                   "enabled=1 throttle_limit=2");
+    check_contains("dump.text-event", sink.text,
+                   "result=unchanged observed=3 emitted=2 suppressed=1");
+    check_contains("dump.text-object", sink.text,
+                   "object link_map=0x8000 generation=1 state=0");
+
+    kzt_guest_registry_destroy(&registry);
+    check_true("registry.destroy", registry == NULL);
+}
+
 static void test_init_failure_creates_disabled_registry_diagnostics(void)
 {
     kzt_guest_registry_t *registry;
@@ -450,6 +603,7 @@ int main(void)
     test_identity_conflict_preserves_original_record();
     test_partial_observation_and_invalid_identity();
     test_query_and_dump_snapshots_are_caller_owned();
+    test_diagnostics_are_opt_in_and_throttled();
     test_init_failure_creates_disabled_registry_diagnostics();
     test_destroyed_registry_rejects_new_observation();
 

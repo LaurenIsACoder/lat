@@ -7,6 +7,7 @@
 
 #define EVENT_READER_READ 1
 #define EVENT_LEGACY_FLOW 2
+#define EVENT_DIAGNOSTIC 3
 
 #define TEST_ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 
@@ -27,8 +28,12 @@ typedef struct observation_trace {
     size_t event_count;
     int reader_calls;
     int legacy_calls;
+    int diagnostic_calls;
     int legacy_return;
     uintptr_t legacy_link_map_addr;
+    kzt_observation_adapter_result_t diagnostic_result;
+    int diagnostic_emitted;
+    unsigned long diagnostic_result_observations;
 } observation_trace_t;
 
 typedef struct fake_callback_event {
@@ -126,6 +131,20 @@ static int fake_legacy_flow(uintptr_t link_map_addr, void *opaque)
     return trace->legacy_return;
 }
 
+static void fake_diagnostic(
+    const kzt_observation_adapter_diagnostic_t *diagnostic,
+    void *opaque)
+{
+    observation_trace_t *trace = opaque;
+
+    ++trace->diagnostic_calls;
+    trace->diagnostic_result = diagnostic->result;
+    trace->diagnostic_emitted = diagnostic->emitted;
+    trace->diagnostic_result_observations =
+        diagnostic->registry.result_observations;
+    record_event(trace, EVENT_DIAGNOSTIC);
+}
+
 static void init_fake_callback_event(fake_callback_event_t *event,
                                      const char *path,
                                      uintptr_t load_bias)
@@ -208,6 +227,27 @@ static int run_adapter(fake_callback_event_t *event,
         .reader_ops = &event->ops,
         .legacy_flow = fake_legacy_flow,
         .legacy_opaque = &event->trace,
+    };
+
+    return kzt_observe_guest_object_from_callback(&request, result);
+}
+
+static int run_adapter_with_diagnostics(
+    fake_callback_event_t *event,
+    kzt_guest_registry_t *registry,
+    int enabled,
+    kzt_observation_adapter_result_t *result)
+{
+    kzt_observation_adapter_request_t request = {
+        .enabled = enabled,
+        .diagnostics_enabled = 1,
+        .link_map_addr = (uintptr_t)&event->link_map,
+        .registry = registry,
+        .reader_ops = &event->ops,
+        .legacy_flow = fake_legacy_flow,
+        .legacy_opaque = &event->trace,
+        .diagnostic = fake_diagnostic,
+        .diagnostic_opaque = &event->trace,
     };
 
     return kzt_observe_guest_object_from_callback(&request, result);
@@ -390,6 +430,64 @@ static void test_no_callback_event_does_not_create_registry_objects(void)
     kzt_guest_registry_destroy(&registry);
 }
 
+static void test_enabled_diagnostics_are_throttled_and_fail_open(void)
+{
+    fake_callback_event_t event;
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_observation_adapter_result_t result = KZT_OBSERVATION_ADAPTER_DISABLED;
+    kzt_guest_registry_diagnostic_config_t config = {
+        .enabled = 1,
+        .throttle_limit = 1,
+    };
+
+    check_true("registry.init", registry != NULL);
+    if (!registry) {
+        return;
+    }
+
+    init_fake_callback_event(&event, "/guest/libdiagnostic.so", 0x700000);
+    event.trace.legacy_return = 31;
+    check_int("diagnostic.configure",
+              kzt_guest_registry_configure_diagnostics(registry, &config),
+              0);
+
+    check_int("diagnostic.added.return",
+              run_adapter_with_diagnostics(&event, registry, 1, &result),
+              31);
+    check_int("diagnostic.added.result", result,
+              KZT_OBSERVATION_ADAPTER_ADDED);
+    check_int("diagnostic.added.calls", event.trace.diagnostic_calls, 1);
+    check_int("diagnostic.added.callback-result",
+              event.trace.diagnostic_result, KZT_OBSERVATION_ADAPTER_ADDED);
+    check_int("diagnostic.added.emitted", event.trace.diagnostic_emitted, 1);
+    check_int("diagnostic.added.legacy-calls", event.trace.legacy_calls, 1);
+
+    check_int("diagnostic.unchanged.return",
+              run_adapter_with_diagnostics(&event, registry, 1, &result),
+              31);
+    check_int("diagnostic.unchanged.result", result,
+              KZT_OBSERVATION_ADAPTER_UNCHANGED);
+    check_int("diagnostic.unchanged.calls", event.trace.diagnostic_calls, 2);
+    check_int("diagnostic.unchanged.callback-result",
+              event.trace.diagnostic_result,
+              KZT_OBSERVATION_ADAPTER_UNCHANGED);
+    check_ulong("diagnostic.unchanged.observations",
+                event.trace.diagnostic_result_observations, 1);
+    check_int("diagnostic.unchanged.legacy-calls",
+              event.trace.legacy_calls, 2);
+
+    check_int("diagnostic.suppressed.return",
+              run_adapter_with_diagnostics(&event, registry, 1, &result),
+              31);
+    check_int("diagnostic.suppressed.result", result,
+              KZT_OBSERVATION_ADAPTER_UNCHANGED);
+    check_int("diagnostic.suppressed.calls", event.trace.diagnostic_calls, 2);
+    check_int("diagnostic.suppressed.legacy-calls",
+              event.trace.legacy_calls, 3);
+
+    kzt_guest_registry_destroy(&registry);
+}
+
 int main(void)
 {
     test_active_observation_adds_object_and_preserves_old_flow();
@@ -398,6 +496,7 @@ int main(void)
     test_registry_failure_is_fail_open_for_old_flow();
     test_conflict_result_does_not_change_old_flow();
     test_no_callback_event_does_not_create_registry_objects();
+    test_enabled_diagnostics_are_throttled_and_fail_open();
 
     if (failures) {
         fprintf(stderr, "kzt-observation-adapter: %d failure(s)\n", failures);

@@ -30,6 +30,7 @@ typedef enum kzt_guest_registry_result {
     KZT_GUEST_REGISTRY_CONFLICT,
     KZT_GUEST_REGISTRY_DISABLED,
     KZT_GUEST_REGISTRY_ERROR,
+    KZT_GUEST_REGISTRY_RESULT_COUNT,
 } kzt_guest_registry_result_t;
 
 typedef struct kzt_guest_scalar_field {
@@ -85,12 +86,53 @@ typedef struct kzt_guest_registry_diagnostics {
     unsigned long allocation_failures;
 } kzt_guest_registry_diagnostics_t;
 
+typedef struct kzt_guest_registry_diagnostic_config {
+    int enabled;
+    unsigned long throttle_limit;
+} kzt_guest_registry_diagnostic_config_t;
+
+typedef struct kzt_guest_registry_observation_diagnostic {
+    int enabled;
+    int emitted;
+    kzt_guest_registry_result_t result;
+    uintptr_t link_map_addr;
+    unsigned long generation;
+    unsigned long object_count;
+    unsigned long result_observations;
+    unsigned long result_suppressed;
+    kzt_guest_registry_diagnostics_t counters;
+} kzt_guest_registry_observation_diagnostic_t;
+
+typedef struct kzt_guest_registry_event_summary {
+    kzt_guest_registry_result_t result;
+    unsigned long observed;
+    unsigned long emitted;
+    unsigned long suppressed;
+    uintptr_t last_link_map_addr;
+    unsigned long last_generation;
+} kzt_guest_registry_event_summary_t;
+
+typedef struct kzt_guest_registry_diagnostic_report {
+    kzt_guest_registry_diagnostic_config_t config;
+    kzt_guest_registry_diagnostics_t counters;
+    kzt_guest_registry_event_summary_t events[KZT_GUEST_REGISTRY_RESULT_COUNT];
+    size_t event_count;
+} kzt_guest_registry_diagnostic_report_t;
+
+typedef int (*kzt_guest_registry_dump_sink_fn)(const char *line,
+                                               void *opaque);
+
 kzt_guest_registry_t *kzt_guest_registry_init(void);
 void kzt_guest_registry_destroy(kzt_guest_registry_t **registry);
 
 kzt_guest_registry_result_t kzt_guest_registry_observe(
     kzt_guest_registry_t *registry,
     const kzt_guest_object_observation_t *observation);
+
+kzt_guest_registry_result_t kzt_guest_registry_observe_with_diagnostic(
+    kzt_guest_registry_t *registry,
+    const kzt_guest_object_observation_t *observation,
+    kzt_guest_registry_observation_diagnostic_t *diagnostic);
 
 int kzt_guest_registry_find_by_link_map(
     kzt_guest_registry_t *registry,
@@ -104,6 +146,19 @@ int kzt_guest_registry_dump_snapshot(
 int kzt_guest_registry_get_diagnostics(
     kzt_guest_registry_t *registry,
     kzt_guest_registry_diagnostics_t *diagnostics);
+
+int kzt_guest_registry_configure_diagnostics(
+    kzt_guest_registry_t *registry,
+    const kzt_guest_registry_diagnostic_config_t *config);
+
+int kzt_guest_registry_get_diagnostic_report(
+    kzt_guest_registry_t *registry,
+    kzt_guest_registry_diagnostic_report_t *report);
+
+int kzt_guest_registry_dump_text(
+    kzt_guest_registry_t *registry,
+    kzt_guest_registry_dump_sink_fn sink,
+    void *opaque);
 
 void kzt_guest_object_snapshot_free(kzt_guest_object_snapshot_t *snapshot);
 void kzt_guest_registry_dump_free(kzt_guest_registry_dump_t *dump);
