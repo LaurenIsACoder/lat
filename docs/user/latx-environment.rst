@@ -198,6 +198,12 @@ AOT（预翻译）会保存恢复预翻译信息，某些配置与 AOT 冲突，
      - 库直通
      - 
      - 
+   * - LATX\_KZT\_REGISTRY\_DIAGNOSTICS
+     - ``-latx-kzt-registry-diagnostics``
+     - kzt\_registry\_diagnostics
+     - KZT registry 诊断输出
+     -
+     - 仅控制 KZT registry 诊断输出，不单独启用 KZT；通常需配合 ``LATX_KZT=2`` 或 ``-latx-kzt 2``
    * - LATX\_FPUTAG
      - ``-latx-fputag``
      - option\_fputag
