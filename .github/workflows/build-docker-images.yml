@@ -39,15 +39,16 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Pull existing image
-        run: docker pull ghcr.io/${{ github.repository_owner }}/${{ matrix.IMAGE.TAG_NAME }} || true
-        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
-
       - name: Get image name
         id: image-name
         run: |
           ATTEST_IMAGE=$(echo "${{ matrix.IMAGE.TAG_NAME }}" | cut -d ':' -f 1)
           echo "ATTEST_IMAGE=${ATTEST_IMAGE}" | tee -a "$GITHUB_OUTPUT"
+          echo "GHCR_OWNER=${GITHUB_REPOSITORY_OWNER,,}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Pull existing image
+        run: docker pull "ghcr.io/${{ steps.image-name.outputs.GHCR_OWNER }}/${{ matrix.IMAGE.TAG_NAME }}" || true
+        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
 
       - name: Setup QEMU
         uses: docker/setup-qemu-action@v4
@@ -70,15 +71,15 @@ jobs:
         id: docker-build
         with:
           context: ${{ matrix.IMAGE.DOCKERFILE_PATH }}
-          cache-from: ghcr.io/${{ github.repository_owner }}/${{ matrix.IMAGE.TAG_NAME }}
-          tags: ghcr.io/${{ github.repository_owner }}/${{ matrix.IMAGE.TAG_NAME }}
+          cache-from: ghcr.io/${{ steps.image-name.outputs.GHCR_OWNER }}/${{ matrix.IMAGE.TAG_NAME }}
+          tags: ghcr.io/${{ steps.image-name.outputs.GHCR_OWNER }}/${{ matrix.IMAGE.TAG_NAME }}
           platforms: ${{ matrix.IMAGE.DOCKER_PLATFORM }}
           pull: true
           push: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master' }}
 
       - uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32  # v4.1.0
         with:
-          subject-name: "ghcr.io/${{ github.repository_owner }}/${{ steps.image-name.outputs.ATTEST_IMAGE }}"
+          subject-name: "ghcr.io/${{ steps.image-name.outputs.GHCR_OWNER }}/${{ steps.image-name.outputs.ATTEST_IMAGE }}"
           subject-digest: ${{ steps.docker-build.outputs.digest }}
           push-to-registry: true
         if: (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/master'

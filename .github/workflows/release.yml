@@ -55,7 +55,8 @@ jobs:
 
       - name: "Build LATX"
         run: |
-          DOCKER_IMAGE="ghcr.io/${{ github.repository_owner }}/${{ matrix.container }}:loong64"
+          GHCR_OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          DOCKER_IMAGE="ghcr.io/${GHCR_OWNER}/${{ matrix.container }}:loong64"
           DOCKER_CMD="./latxbuild/${{ matrix.type }}.sh -c"
           docker run --rm \
             --platform linux/loong64 \
