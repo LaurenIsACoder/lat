@@ -60,3 +60,22 @@ kzt_observation_adapter_test = executable(
 )
 
 test('kzt-observation-adapter', kzt_observation_adapter_test)
+
+kzt_registry_diagnostics_gate_test = executable(
+  'kzt-registry-diagnostics-gate',
+  files(
+    'kzt/test_registry_diagnostics_gate.c',
+    '../../target/i386/latx/context/kzt_guest_registry.c',
+    '../../target/i386/latx/context/kzt_guest_link_map_reader.c',
+    '../../target/i386/latx/context/kzt_observation_adapter.c',
+  ),
+  c_args: [
+    '-DCONFIG_LATX_KZT',
+    '-DKZT_GUEST_REGISTRY_TEST',
+    '-DKZT_GUEST_LINK_MAP_READER_TEST',
+  ],
+  include_directories: include_directories('../..', '../../target/i386/latx/include'),
+  dependencies: dependency('threads'),
+)
+
+test('kzt-registry-diagnostics-gate', kzt_registry_diagnostics_gate_test)
