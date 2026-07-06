@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kzt_guest_dynamic_view.h"
+
 typedef struct kzt_guest_registry kzt_guest_registry_t;
 
 typedef enum kzt_guest_object_state {
@@ -65,6 +67,7 @@ typedef struct kzt_guest_object_snapshot {
     kzt_guest_string_field_t path;
     kzt_guest_string_field_t soname;
     kzt_guest_field_status_t dynamic_view_status;
+    kzt_guest_dynamic_view_t dynamic_view;
     kzt_guest_object_state_t state;
     unsigned long generation;
 } kzt_guest_object_snapshot_t;
@@ -138,6 +141,18 @@ int kzt_guest_registry_find_by_link_map(
     kzt_guest_registry_t *registry,
     uintptr_t link_map_addr,
     kzt_guest_object_snapshot_t **snapshot);
+
+kzt_guest_registry_result_t kzt_guest_registry_commit_dynamic_view(
+    kzt_guest_registry_t *registry,
+    uintptr_t link_map_addr,
+    const kzt_guest_dynamic_view_t *view);
+
+int kzt_guest_registry_find_dynamic_view(
+    kzt_guest_registry_t *registry,
+    uintptr_t link_map_addr,
+    kzt_guest_dynamic_view_t *view,
+    kzt_guest_field_status_t *status,
+    unsigned long *generation);
 
 int kzt_guest_registry_dump_snapshot(
     kzt_guest_registry_t *registry,

@@ -104,6 +104,93 @@ static int kzt_copy_string_field(kzt_guest_string_field_t *dst,
     return dst->value ? 0 : -1;
 }
 
+static int kzt_dynamic_field_equal(
+    const kzt_guest_dynamic_field_t *left,
+    const kzt_guest_dynamic_field_t *right)
+{
+    return left->present == right->present &&
+           left->value == right->value &&
+           left->address_semantics == right->address_semantics;
+}
+
+static int kzt_dynamic_needed_equal(
+    const kzt_guest_dynamic_view_t *left,
+    const kzt_guest_dynamic_view_t *right)
+{
+    size_t i;
+
+    if (left->needed_count != right->needed_count) {
+        return 0;
+    }
+
+    if (left->needed_count > 0 &&
+        left->needed_address_semantics != right->needed_address_semantics) {
+        return 0;
+    }
+
+    for (i = 0; i < left->needed_count; ++i) {
+        if (left->needed_offsets[i] != right->needed_offsets[i]) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static int kzt_dynamic_view_equal(
+    const kzt_guest_dynamic_view_t *left,
+    const kzt_guest_dynamic_view_t *right)
+{
+    return left->dynamic_addr == right->dynamic_addr &&
+           left->load_bias == right->load_bias &&
+           left->status == right->status &&
+           left->entry_count == right->entry_count &&
+           left->has_null == right->has_null &&
+           left->scan_limit == right->scan_limit &&
+           left->unknown_tag_count == right->unknown_tag_count &&
+           left->first_unknown_tag == right->first_unknown_tag &&
+           left->first_unknown_tag_index == right->first_unknown_tag_index &&
+           kzt_dynamic_field_equal(&left->symtab, &right->symtab) &&
+           kzt_dynamic_field_equal(&left->strtab, &right->strtab) &&
+           kzt_dynamic_field_equal(&left->syment, &right->syment) &&
+           kzt_dynamic_field_equal(&left->strsz, &right->strsz) &&
+           kzt_dynamic_field_equal(&left->hash, &right->hash) &&
+           kzt_dynamic_field_equal(&left->gnu_hash, &right->gnu_hash) &&
+           kzt_dynamic_field_equal(&left->versym, &right->versym) &&
+           kzt_dynamic_field_equal(&left->verneed, &right->verneed) &&
+           kzt_dynamic_field_equal(&left->verneednum, &right->verneednum) &&
+           kzt_dynamic_field_equal(&left->verdef, &right->verdef) &&
+           kzt_dynamic_field_equal(&left->verdefnum, &right->verdefnum) &&
+           kzt_dynamic_field_equal(&left->rela, &right->rela) &&
+           kzt_dynamic_field_equal(&left->relasz, &right->relasz) &&
+           kzt_dynamic_field_equal(&left->relaent, &right->relaent) &&
+           kzt_dynamic_field_equal(&left->rel, &right->rel) &&
+           kzt_dynamic_field_equal(&left->relsz, &right->relsz) &&
+           kzt_dynamic_field_equal(&left->relent, &right->relent) &&
+           kzt_dynamic_field_equal(&left->jmprel, &right->jmprel) &&
+           kzt_dynamic_field_equal(&left->pltrelsz, &right->pltrelsz) &&
+           kzt_dynamic_field_equal(&left->pltrel, &right->pltrel) &&
+           kzt_dynamic_field_equal(&left->pltgot, &right->pltgot) &&
+           kzt_dynamic_needed_equal(left, right);
+}
+
+static kzt_guest_field_status_t kzt_dynamic_view_field_status(
+    const kzt_guest_dynamic_view_t *view)
+{
+    switch (view->status) {
+    case KZT_GUEST_DYNAMIC_COMPLETE:
+        return KZT_GUEST_FIELD_OK;
+    case KZT_GUEST_DYNAMIC_TRUNCATED_NO_NULL:
+        return KZT_GUEST_FIELD_TRUNCATED;
+    case KZT_GUEST_DYNAMIC_READ_ERROR:
+        return KZT_GUEST_FIELD_READ_ERROR;
+    case KZT_GUEST_DYNAMIC_ERROR:
+        return KZT_GUEST_FIELD_READ_ERROR;
+    }
+
+    return KZT_GUEST_FIELD_UNKNOWN;
+}
+
 static void kzt_free_snapshot_strings(kzt_guest_object_snapshot_t *snapshot)
 {
     if (!snapshot) {
@@ -112,6 +199,7 @@ static void kzt_free_snapshot_strings(kzt_guest_object_snapshot_t *snapshot)
 
     kzt_free_string_field(&snapshot->path);
     kzt_free_string_field(&snapshot->soname);
+    memset(&snapshot->dynamic_view, 0, sizeof(snapshot->dynamic_view));
 }
 
 static void kzt_free_snapshot_array(kzt_guest_object_snapshot_t *objects,
@@ -643,6 +731,104 @@ int kzt_guest_registry_find_by_link_map(
         *snapshot = NULL;
         pthread_mutex_unlock(&registry->lock);
         return -1;
+    }
+
+    pthread_mutex_unlock(&registry->lock);
+    return 0;
+}
+
+kzt_guest_registry_result_t kzt_guest_registry_commit_dynamic_view(
+    kzt_guest_registry_t *registry,
+    uintptr_t link_map_addr,
+    const kzt_guest_dynamic_view_t *view)
+{
+    kzt_guest_object_snapshot_t *object;
+    kzt_guest_field_status_t status;
+    kzt_guest_registry_result_t result;
+    ssize_t index;
+
+    if (!registry) {
+        return KZT_GUEST_REGISTRY_DISABLED;
+    }
+
+    if (!view || link_map_addr == 0) {
+        return KZT_GUEST_REGISTRY_ERROR;
+    }
+
+    pthread_mutex_lock(&registry->lock);
+    if (registry->disabled) {
+        result = KZT_GUEST_REGISTRY_DISABLED;
+        goto out;
+    }
+
+    index = kzt_find_object_index(registry, link_map_addr);
+    if (index < 0) {
+        result = KZT_GUEST_REGISTRY_ERROR;
+        goto out;
+    }
+
+    object = &registry->objects[index];
+    status = kzt_dynamic_view_field_status(view);
+    if (object->dynamic_view_status == status &&
+        kzt_dynamic_view_equal(&object->dynamic_view, view)) {
+        result = KZT_GUEST_REGISTRY_UNCHANGED;
+        goto out;
+    }
+
+    object->dynamic_view = *view;
+    object->dynamic_view_status = status;
+    if (status == KZT_GUEST_FIELD_OK) {
+        object->state = KZT_GUEST_OBJECT_PARSED;
+    } else if (object->state == KZT_GUEST_OBJECT_PARSED) {
+        object->state = KZT_GUEST_OBJECT_DISCOVERED;
+    }
+    result = KZT_GUEST_REGISTRY_UPDATED;
+
+out:
+    pthread_mutex_unlock(&registry->lock);
+    return result;
+}
+
+int kzt_guest_registry_find_dynamic_view(
+    kzt_guest_registry_t *registry,
+    uintptr_t link_map_addr,
+    kzt_guest_dynamic_view_t *view,
+    kzt_guest_field_status_t *status,
+    unsigned long *generation)
+{
+    ssize_t index;
+
+    if (view) {
+        memset(view, 0, sizeof(*view));
+    }
+    if (status) {
+        *status = KZT_GUEST_FIELD_NOT_PARSED;
+    }
+    if (generation) {
+        *generation = 0;
+    }
+    if (!registry || !view || link_map_addr == 0) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&registry->lock);
+    if (registry->disabled) {
+        pthread_mutex_unlock(&registry->lock);
+        return -1;
+    }
+
+    index = kzt_find_object_index(registry, link_map_addr);
+    if (index < 0) {
+        pthread_mutex_unlock(&registry->lock);
+        return -1;
+    }
+
+    *view = registry->objects[index].dynamic_view;
+    if (status) {
+        *status = registry->objects[index].dynamic_view_status;
+    }
+    if (generation) {
+        *generation = registry->objects[index].generation;
     }
 
     pthread_mutex_unlock(&registry->lock);
