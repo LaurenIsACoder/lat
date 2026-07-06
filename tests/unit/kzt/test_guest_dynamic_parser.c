@@ -4,6 +4,7 @@
 #include "target/i386/latx/include/kzt_guest_dynamic.h"
 
 #define TEST_ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#define KZT_TEST_UNKNOWN_DYNAMIC_TAG 0x6000000d
 
 typedef struct fake_dynamic_memory {
     uintptr_t base;
@@ -52,6 +53,17 @@ static void check_u64(const char *name, uint64_t got, uint64_t expected)
 
     fprintf(stderr, "%s: got 0x%llx expected 0x%llx\n", name,
             (unsigned long long)got, (unsigned long long)expected);
+    ++failures;
+}
+
+static void check_i64(const char *name, int64_t got, int64_t expected)
+{
+    if (got == expected) {
+        return;
+    }
+
+    fprintf(stderr, "%s: got %lld expected %lld\n", name,
+            (long long)got, (long long)expected);
     ++failures;
 }
 
@@ -238,6 +250,159 @@ static void test_dynamic_address_semantics(void)
     kzt_guest_dynamic_parse_result_clear(&result);
 }
 
+static void test_read_failure_reports_parser_state(void)
+{
+    Elf64_Dyn dynamic[] = {
+        { .d_tag = DT_SYMTAB, .d_un.d_ptr = 0x5000010000 },
+    };
+    fake_dynamic_memory_t memory = {
+        .base = (uintptr_t)dynamic,
+        .size = sizeof(dynamic),
+    };
+    kzt_guest_link_map_reader_ops_t ops = fake_ops(&memory);
+    kzt_guest_dynamic_parse_result_t result = { 0 };
+    uintptr_t expected_error_addr = (uintptr_t)&dynamic[1];
+
+    check_int("read-failure.parse",
+              kzt_guest_dynamic_parse((uintptr_t)dynamic, 0x100000,
+                                      &ops, &result),
+              0);
+    check_int("read-failure.status", result.status,
+              KZT_GUEST_DYNAMIC_READ_ERROR);
+    check_int("read-failure.view-status", result.view.status,
+              KZT_GUEST_DYNAMIC_READ_ERROR);
+    check_int("read-failure.error", result.error,
+              KZT_GUEST_DYNAMIC_ERROR_READ_FAILURE);
+    check_size("read-failure.entry-count", result.entry_count, 1);
+    check_size("read-failure.view-entry-count", result.view.entry_count, 1);
+    check_u64("read-failure.addr", result.read_error_addr,
+              expected_error_addr);
+    check_size("read-failure.scan-limit", result.scan_limit,
+               KZT_GUEST_DYNAMIC_SCAN_LIMIT);
+    check_size("read-failure.view-scan-limit", result.view.scan_limit,
+               KZT_GUEST_DYNAMIC_SCAN_LIMIT);
+    check_int("read-failure.reader-calls", memory.read_calls, 2);
+    check_true("read-failure.no-null", !result.view.has_null);
+
+    kzt_guest_dynamic_parse_result_clear(&result);
+}
+
+static void test_missing_null_stops_at_scan_limit(void)
+{
+    Elf64_Dyn dynamic[KZT_GUEST_DYNAMIC_SCAN_LIMIT];
+    fake_dynamic_memory_t memory = {
+        .base = (uintptr_t)dynamic,
+        .size = sizeof(dynamic),
+    };
+    kzt_guest_link_map_reader_ops_t ops = fake_ops(&memory);
+    kzt_guest_dynamic_parse_result_t result = { 0 };
+    size_t i;
+
+    for (i = 0; i < TEST_ARRAY_SIZE(dynamic); ++i) {
+        dynamic[i].d_tag = DT_SYMENT;
+        dynamic[i].d_un.d_val = sizeof(Elf64_Sym);
+    }
+
+    check_int("scan-limit.parse",
+              kzt_guest_dynamic_parse((uintptr_t)dynamic, 0x100000,
+                                      &ops, &result),
+              0);
+    check_int("scan-limit.status", result.status,
+              KZT_GUEST_DYNAMIC_TRUNCATED_NO_NULL);
+    check_int("scan-limit.view-status", result.view.status,
+              KZT_GUEST_DYNAMIC_TRUNCATED_NO_NULL);
+    check_int("scan-limit.error", result.error,
+              KZT_GUEST_DYNAMIC_ERROR_SCAN_LIMIT_EXCEEDED);
+    check_size("scan-limit.entry-count", result.entry_count,
+               KZT_GUEST_DYNAMIC_SCAN_LIMIT);
+    check_size("scan-limit.view-entry-count", result.view.entry_count,
+               KZT_GUEST_DYNAMIC_SCAN_LIMIT);
+    check_size("scan-limit.scan-limit", result.scan_limit,
+               KZT_GUEST_DYNAMIC_SCAN_LIMIT);
+    check_int("scan-limit.reader-calls", memory.read_calls,
+              KZT_GUEST_DYNAMIC_SCAN_LIMIT);
+    check_true("scan-limit.no-null", !result.view.has_null);
+
+    kzt_guest_dynamic_parse_result_clear(&result);
+}
+
+static void test_unknown_tag_is_diagnostic_only(void)
+{
+    Elf64_Dyn dynamic[] = {
+        { .d_tag = KZT_TEST_UNKNOWN_DYNAMIC_TAG, .d_un.d_val = 0x44 },
+        { .d_tag = DT_STRTAB, .d_un.d_ptr = 0x5000020000 },
+        { .d_tag = DT_NULL, .d_un.d_val = 0 },
+    };
+    fake_dynamic_memory_t memory = {
+        .base = (uintptr_t)dynamic,
+        .size = sizeof(dynamic),
+    };
+    kzt_guest_link_map_reader_ops_t ops = fake_ops(&memory);
+    kzt_guest_dynamic_parse_result_t result = { 0 };
+
+    check_int("unknown-tag.parse",
+              kzt_guest_dynamic_parse((uintptr_t)dynamic, 0x100000,
+                                      &ops, &result),
+              0);
+    check_int("unknown-tag.status", result.status,
+              KZT_GUEST_DYNAMIC_COMPLETE);
+    check_int("unknown-tag.error", result.error,
+              KZT_GUEST_DYNAMIC_ERROR_NONE);
+    check_size("unknown-tag.count", result.unknown_tag_count, 1);
+    check_size("unknown-tag.view-count", result.view.unknown_tag_count, 1);
+    check_i64("unknown-tag.first", result.first_unknown_tag,
+              KZT_TEST_UNKNOWN_DYNAMIC_TAG);
+    check_i64("unknown-tag.view-first", result.view.first_unknown_tag,
+              KZT_TEST_UNKNOWN_DYNAMIC_TAG);
+    check_size("unknown-tag.index", result.first_unknown_tag_index, 0);
+    check_size("unknown-tag.view-index", result.view.first_unknown_tag_index,
+               0);
+    check_field("unknown-tag.strtab", &result.view.strtab, 0x5000020000,
+                KZT_GUEST_DYNAMIC_RUNTIME_ADDRESS);
+    check_true("unknown-tag.has-null", result.view.has_null);
+
+    kzt_guest_dynamic_parse_result_clear(&result);
+}
+
+static void test_too_many_needed_reports_resource_limit(void)
+{
+    Elf64_Dyn dynamic[KZT_GUEST_DYNAMIC_NEEDED_LIMIT + 2];
+    fake_dynamic_memory_t memory = {
+        .base = (uintptr_t)dynamic,
+        .size = sizeof(dynamic),
+    };
+    kzt_guest_link_map_reader_ops_t ops = fake_ops(&memory);
+    kzt_guest_dynamic_parse_result_t result = { 0 };
+    size_t i;
+
+    for (i = 0; i < KZT_GUEST_DYNAMIC_NEEDED_LIMIT + 1; ++i) {
+        dynamic[i].d_tag = DT_NEEDED;
+        dynamic[i].d_un.d_val = i * 0x10;
+    }
+    dynamic[KZT_GUEST_DYNAMIC_NEEDED_LIMIT + 1].d_tag = DT_NULL;
+    dynamic[KZT_GUEST_DYNAMIC_NEEDED_LIMIT + 1].d_un.d_val = 0;
+
+    check_int("needed-limit.parse",
+              kzt_guest_dynamic_parse((uintptr_t)dynamic, 0x100000,
+                                      &ops, &result),
+              0);
+    check_int("needed-limit.status", result.status,
+              KZT_GUEST_DYNAMIC_ERROR);
+    check_int("needed-limit.view-status", result.view.status,
+              KZT_GUEST_DYNAMIC_ERROR);
+    check_int("needed-limit.error", result.error,
+              KZT_GUEST_DYNAMIC_ERROR_TOO_MANY_NEEDED);
+    check_size("needed-limit.entry-count", result.entry_count,
+               KZT_GUEST_DYNAMIC_NEEDED_LIMIT);
+    check_size("needed-limit.view-entry-count", result.view.entry_count,
+               KZT_GUEST_DYNAMIC_NEEDED_LIMIT);
+    check_size("needed-limit.needed-count", result.view.needed_count,
+               KZT_GUEST_DYNAMIC_NEEDED_LIMIT);
+    check_true("needed-limit.no-null", !result.view.has_null);
+
+    kzt_guest_dynamic_parse_result_clear(&result);
+}
+
 static int test_matches_filter(const char *name, int argc, char **argv)
 {
     int i;
@@ -258,6 +423,20 @@ int main(int argc, char **argv)
     }
     if (test_matches_filter("dynamic_address_semantics", argc, argv)) {
         test_dynamic_address_semantics();
+    }
+    if (test_matches_filter("read_failure_reports_parser_state",
+                            argc, argv)) {
+        test_read_failure_reports_parser_state();
+    }
+    if (test_matches_filter("missing_null_stops_at_scan_limit", argc, argv)) {
+        test_missing_null_stops_at_scan_limit();
+    }
+    if (test_matches_filter("unknown_tag_is_diagnostic_only", argc, argv)) {
+        test_unknown_tag_is_diagnostic_only();
+    }
+    if (test_matches_filter("too_many_needed_reports_resource_limit",
+                            argc, argv)) {
+        test_too_many_needed_reports_resource_limit();
     }
 
     if (failures) {

@@ -25,6 +25,9 @@ typedef enum kzt_guest_dynamic_error {
     KZT_GUEST_DYNAMIC_ERROR_NONE = 0,
     KZT_GUEST_DYNAMIC_ERROR_INVALID_ARGUMENT,
     KZT_GUEST_DYNAMIC_ERROR_ALLOCATION_FAILURE,
+    KZT_GUEST_DYNAMIC_ERROR_READ_FAILURE,
+    KZT_GUEST_DYNAMIC_ERROR_SCAN_LIMIT_EXCEEDED,
+    KZT_GUEST_DYNAMIC_ERROR_TOO_MANY_NEEDED,
 } kzt_guest_dynamic_error_t;
 
 typedef enum kzt_guest_dynamic_address_semantics {
@@ -46,6 +49,10 @@ typedef struct kzt_guest_dynamic_view {
     kzt_guest_dynamic_status_t status;
     size_t entry_count;
     int has_null;
+    size_t scan_limit;
+    size_t unknown_tag_count;
+    int64_t first_unknown_tag;
+    size_t first_unknown_tag_index;
 
     kzt_guest_dynamic_field_t symtab;
     kzt_guest_dynamic_field_t strtab;
@@ -79,6 +86,10 @@ typedef struct kzt_guest_dynamic_parse_result {
     kzt_guest_dynamic_error_t error;
     size_t entry_count;
     uintptr_t read_error_addr;
+    size_t scan_limit;
+    size_t unknown_tag_count;
+    int64_t first_unknown_tag;
+    size_t first_unknown_tag_index;
     kzt_guest_dynamic_view_t view;
 } kzt_guest_dynamic_parse_result_t;
 

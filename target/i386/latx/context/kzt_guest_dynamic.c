@@ -51,8 +51,21 @@ static int kzt_guest_dynamic_add_needed(kzt_guest_dynamic_view_t *view,
     return 0;
 }
 
+static void kzt_guest_dynamic_record_unknown_tag(
+    kzt_guest_dynamic_view_t *view,
+    int64_t tag,
+    size_t index)
+{
+    if (view->unknown_tag_count == 0) {
+        view->first_unknown_tag = tag;
+        view->first_unknown_tag_index = index;
+    }
+    ++view->unknown_tag_count;
+}
+
 static int kzt_guest_dynamic_record_entry(kzt_guest_dynamic_view_t *view,
-                                          const Elf64_Dyn *entry)
+                                          const Elf64_Dyn *entry,
+                                          size_t index)
 {
     uint64_t value = entry->d_un.d_val;
     uint64_t ptr = entry->d_un.d_ptr;
@@ -144,9 +157,25 @@ static int kzt_guest_dynamic_record_entry(kzt_guest_dynamic_view_t *view,
         kzt_guest_dynamic_field_set(&view->pltgot, ptr,
                                     KZT_GUEST_DYNAMIC_RUNTIME_ADDRESS);
         break;
+    default:
+        kzt_guest_dynamic_record_unknown_tag(view, entry->d_tag, index);
+        break;
     }
 
     return 0;
+}
+
+static void kzt_guest_dynamic_publish_view(
+    kzt_guest_dynamic_parse_result_t *result,
+    const kzt_guest_dynamic_view_t *view)
+{
+    result->status = view->status;
+    result->entry_count = view->entry_count;
+    result->scan_limit = view->scan_limit;
+    result->unknown_tag_count = view->unknown_tag_count;
+    result->first_unknown_tag = view->first_unknown_tag;
+    result->first_unknown_tag_index = view->first_unknown_tag_index;
+    result->view = *view;
 }
 
 int kzt_guest_dynamic_parse(
@@ -173,6 +202,7 @@ int kzt_guest_dynamic_parse(
     memset(&view, 0, sizeof(view));
     view.dynamic_addr = dynamic_addr;
     view.load_bias = load_bias;
+    view.scan_limit = KZT_GUEST_DYNAMIC_SCAN_LIMIT;
 
     for (i = 0; i < KZT_GUEST_DYNAMIC_SCAN_LIMIT; ++i) {
         Elf64_Dyn entry;
@@ -180,13 +210,11 @@ int kzt_guest_dynamic_parse(
 
         if (kzt_guest_dynamic_read_entry(dynamic_addr, i, reader_ops,
                                          &entry, &entry_addr) != 0) {
-            view.status = KZT_GUEST_DYNAMIC_ERROR;
+            view.status = KZT_GUEST_DYNAMIC_READ_ERROR;
             view.entry_count = i;
-            result->status = view.status;
-            result->entry_count = view.entry_count;
             result->read_error_addr = entry_addr;
-            result->error = KZT_GUEST_DYNAMIC_ERROR_INVALID_ARGUMENT;
-            result->view = view;
+            result->error = KZT_GUEST_DYNAMIC_ERROR_READ_FAILURE;
+            kzt_guest_dynamic_publish_view(result, &view);
             return 0;
         }
 
@@ -194,27 +222,25 @@ int kzt_guest_dynamic_parse(
             view.status = KZT_GUEST_DYNAMIC_COMPLETE;
             view.entry_count = i;
             view.has_null = 1;
-            result->status = view.status;
-            result->entry_count = view.entry_count;
             result->error = KZT_GUEST_DYNAMIC_ERROR_NONE;
-            result->view = view;
+            kzt_guest_dynamic_publish_view(result, &view);
             return 0;
         }
 
-        if (kzt_guest_dynamic_record_entry(&view, &entry) != 0) {
-            kzt_guest_dynamic_view_destroy(&view);
+        if (kzt_guest_dynamic_record_entry(&view, &entry, i) != 0) {
+            view.status = KZT_GUEST_DYNAMIC_ERROR;
+            view.entry_count = i;
             result->status = KZT_GUEST_DYNAMIC_ERROR;
-            result->error = KZT_GUEST_DYNAMIC_ERROR_INVALID_ARGUMENT;
+            result->error = KZT_GUEST_DYNAMIC_ERROR_TOO_MANY_NEEDED;
+            kzt_guest_dynamic_publish_view(result, &view);
             return 0;
         }
     }
 
-    view.status = KZT_GUEST_DYNAMIC_ERROR;
+    view.status = KZT_GUEST_DYNAMIC_TRUNCATED_NO_NULL;
     view.entry_count = KZT_GUEST_DYNAMIC_SCAN_LIMIT;
-    result->status = view.status;
-    result->entry_count = view.entry_count;
-    result->error = KZT_GUEST_DYNAMIC_ERROR_INVALID_ARGUMENT;
-    result->view = view;
+    result->error = KZT_GUEST_DYNAMIC_ERROR_SCAN_LIMIT_EXCEEDED;
+    kzt_guest_dynamic_publish_view(result, &view);
     return 0;
 }
 
