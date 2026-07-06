@@ -45,6 +45,17 @@ kzt_guest_link_map_reader_test = executable(
 
 test('kzt-guest-link-map-reader', kzt_guest_link_map_reader_test)
 
+kzt_guest_dynamic_parser_test = executable(
+  'kzt-guest-dynamic-parser',
+  files(
+    'kzt/test_guest_dynamic_parser.c',
+    '../../target/i386/latx/context/kzt_guest_dynamic.c',
+  ),
+  include_directories: include_directories('../..', '../../target/i386/latx/include'),
+)
+
+test('kzt-guest-dynamic-parser', kzt_guest_dynamic_parser_test)
+
 
 kzt_observation_adapter_test = executable(
   'kzt-observation-adapter',
