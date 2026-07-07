@@ -39,6 +39,17 @@ static void check_size(const char *name, size_t got, size_t expected)
     ++failures;
 }
 
+static void check_ulong(const char *name, unsigned long got,
+                        unsigned long expected)
+{
+    if (got == expected) {
+        return;
+    }
+
+    fprintf(stderr, "%s: got %lu expected %lu\n", name, got, expected);
+    ++failures;
+}
+
 static void check_u64(const char *name, uint64_t got, uint64_t expected)
 {
     if (got == expected) {
@@ -58,6 +69,18 @@ static void check_uintptr(const char *name, uintptr_t got, uintptr_t expected)
 
     fprintf(stderr, "%s: got 0x%lx expected 0x%lx\n", name,
             (unsigned long)got, (unsigned long)expected);
+    ++failures;
+}
+
+static void check_str_contains(const char *name, const char *value,
+                               const char *expected)
+{
+    if (value && expected && strstr(value, expected)) {
+        return;
+    }
+
+    fprintf(stderr, "%s: '%s' does not contain '%s'\n", name,
+            value ? value : "(null)", expected ? expected : "(null)");
     ++failures;
 }
 
@@ -267,6 +290,8 @@ static void test_unknown_tag_difference_is_diagnostic_only(void)
     kzt_guest_dynamic_parse_result_t old_result = make_complete_result();
     kzt_guest_dynamic_parse_result_t new_result = make_complete_result();
     kzt_guest_dynamic_diagnostic_report_t report;
+    kzt_guest_dynamic_diagnostic_summary_t summary;
+    char line[512];
 
     new_result.unknown_tag_count = 1;
     new_result.first_unknown_tag = KZT_TEST_UNKNOWN_DYNAMIC_TAG;
@@ -286,6 +311,21 @@ static void test_unknown_tag_difference_is_diagnostic_only(void)
     check_size("unknown.field-mismatch", report.mismatch_count, 0);
     check_size("unknown.difference", report.difference_count, 1);
     check_size("unknown.blocking", report.blocking_count, 0);
+
+    check_int("unknown.summary",
+              kzt_guest_dynamic_diagnostics_summarize(&report, 0xabc000, 9,
+                                                      &summary),
+              0);
+    check_int("unknown.summary-kind", summary.first_difference_kind,
+              KZT_GUEST_DYNAMIC_DIAGNOSTIC_DIFFERENCE_UNKNOWN_TAGS);
+    check_true("unknown.summary-new-present", summary.first_new_present);
+    check_true("unknown.summary-new-tag",
+               summary.first_new_tag == KZT_TEST_UNKNOWN_DYNAMIC_TAG);
+    check_size("unknown.summary-new-index", summary.first_new_tag_index, 3);
+    check_int("unknown.format",
+              kzt_guest_dynamic_diagnostics_format_summary(&summary, line,
+                                                           sizeof(line)), 0);
+    check_str_contains("unknown.format-first", line, "first=unknown_tags");
 }
 
 static void test_needed_offsets_difference_is_reported(void)
@@ -315,6 +355,92 @@ static void test_needed_offsets_difference_is_reported(void)
     check_size("needed.mismatch", report.mismatch_count, 1);
     check_size("needed.difference", report.difference_count, 1);
     check_size("needed.blocking", report.blocking_count, 0);
+}
+
+static void test_error_status_is_blocking(void)
+{
+    kzt_guest_dynamic_parse_result_t old_result = make_complete_result();
+    kzt_guest_dynamic_parse_result_t new_result = make_complete_result();
+    kzt_guest_dynamic_diagnostic_report_t report;
+    kzt_guest_dynamic_diagnostic_summary_t summary;
+    char line[512];
+
+    old_result.status = KZT_GUEST_DYNAMIC_ERROR;
+    old_result.error = KZT_GUEST_DYNAMIC_ERROR_INVALID_ARGUMENT;
+    old_result.view.status = KZT_GUEST_DYNAMIC_ERROR;
+    new_result.status = KZT_GUEST_DYNAMIC_ERROR;
+    new_result.error = KZT_GUEST_DYNAMIC_ERROR_INVALID_ARGUMENT;
+    new_result.view.status = KZT_GUEST_DYNAMIC_ERROR;
+
+    check_int("error.compare",
+              kzt_guest_dynamic_diagnostics_compare(&old_result, &new_result,
+                                                    &report),
+              0);
+    check_int("error.status-match", report.status_match,
+              KZT_GUEST_DYNAMIC_DIAGNOSTIC_MATCHED);
+    check_size("error.difference", report.difference_count, 0);
+    check_size("error.blocking", report.blocking_count, 2);
+
+    check_int("error.summary",
+              kzt_guest_dynamic_diagnostics_summarize(&report, 0xabc100, 10,
+                                                      &summary),
+              0);
+    check_true("error.summary-blocking", summary.blocking);
+    check_int("error.summary-kind", summary.first_difference_kind,
+              KZT_GUEST_DYNAMIC_DIAGNOSTIC_DIFFERENCE_STATUS);
+    check_int("error.summary-match", summary.first_difference_match,
+              KZT_GUEST_DYNAMIC_DIAGNOSTIC_MATCHED);
+    check_int("error.format",
+              kzt_guest_dynamic_diagnostics_format_summary(&summary, line,
+                                                           sizeof(line)), 0);
+    check_str_contains("error.format-blocking", line, "blocking=1");
+    check_str_contains("error.format-first", line, "first=status");
+}
+
+static void test_summary_includes_identity_and_first_field(void)
+{
+    kzt_guest_dynamic_parse_result_t old_result = make_complete_result();
+    kzt_guest_dynamic_parse_result_t new_result = make_complete_result();
+    kzt_guest_dynamic_diagnostic_report_t report;
+    kzt_guest_dynamic_diagnostic_summary_t summary;
+    char line[512];
+
+    new_result.view.pltgot.value = 0x70000c0000;
+    check_int("summary.compare",
+              kzt_guest_dynamic_diagnostics_compare(&old_result, &new_result,
+                                                    &report),
+              0);
+    check_int("summary.create",
+              kzt_guest_dynamic_diagnostics_summarize(&report, 0xabcdef00,
+                                                      17, &summary),
+              0);
+
+    check_uintptr("summary.link-map", summary.link_map_addr, 0xabcdef00);
+    check_ulong("summary.generation", summary.generation, 17);
+    check_true("summary.not-matched", !summary.matched);
+    check_true("summary.not-blocking", !summary.blocking);
+    check_size("summary.difference", summary.difference_count, 1);
+    check_int("summary.kind", summary.first_difference_kind,
+              KZT_GUEST_DYNAMIC_DIAGNOSTIC_DIFFERENCE_FIELD);
+    check_true("summary.name", !strcmp(summary.first_difference_name,
+                                       "pltgot"));
+    check_int("summary.match", summary.first_difference_match,
+              KZT_GUEST_DYNAMIC_DIAGNOSTIC_MISMATCH);
+    check_true("summary.old-present", summary.first_old_present);
+    check_true("summary.new-present", summary.first_new_present);
+    check_u64("summary.old-value", summary.first_old_value, 0x70000b0000);
+    check_u64("summary.new-value", summary.first_new_value, 0x70000c0000);
+
+    check_int("summary.format",
+              kzt_guest_dynamic_diagnostics_format_summary(&summary, line,
+                                                           sizeof(line)), 0);
+    check_str_contains("summary.format-object", line,
+                       "link_map=0xabcdef00");
+    check_str_contains("summary.format-generation", line,
+                       "generation=17");
+    check_str_contains("summary.format-first", line, "first=pltgot");
+    check_str_contains("summary.format-differences", line,
+                       "differences=1");
 }
 
 static int test_matches_filter(const char *name, int argc, char **argv)
@@ -350,6 +476,13 @@ int main(int argc, char **argv)
     if (test_matches_filter("needed_offsets_difference_is_reported",
                             argc, argv)) {
         test_needed_offsets_difference_is_reported();
+    }
+    if (test_matches_filter("error_status_is_blocking", argc, argv)) {
+        test_error_status_is_blocking();
+    }
+    if (test_matches_filter("summary_includes_identity_and_first_field",
+                            argc, argv)) {
+        test_summary_includes_identity_and_first_field();
     }
 
     if (failures) {

@@ -15,6 +15,14 @@ typedef enum kzt_guest_dynamic_diagnostic_match {
     KZT_GUEST_DYNAMIC_DIAGNOSTIC_MISMATCH,
 } kzt_guest_dynamic_diagnostic_match_t;
 
+typedef enum kzt_guest_dynamic_diagnostic_difference_kind {
+    KZT_GUEST_DYNAMIC_DIAGNOSTIC_DIFFERENCE_NONE = 0,
+    KZT_GUEST_DYNAMIC_DIAGNOSTIC_DIFFERENCE_STATUS,
+    KZT_GUEST_DYNAMIC_DIAGNOSTIC_DIFFERENCE_ENTRY_COUNT,
+    KZT_GUEST_DYNAMIC_DIAGNOSTIC_DIFFERENCE_UNKNOWN_TAGS,
+    KZT_GUEST_DYNAMIC_DIAGNOSTIC_DIFFERENCE_FIELD,
+} kzt_guest_dynamic_diagnostic_difference_kind_t;
+
 typedef struct kzt_guest_dynamic_diagnostic_field {
     const char *name;
     kzt_guest_dynamic_diagnostic_match_t match;
@@ -64,6 +72,46 @@ typedef struct kzt_guest_dynamic_diagnostic_report {
         fields[KZT_GUEST_DYNAMIC_DIAGNOSTIC_FIELD_LIMIT];
 } kzt_guest_dynamic_diagnostic_report_t;
 
+typedef struct kzt_guest_dynamic_diagnostic_summary {
+    uintptr_t link_map_addr;
+    unsigned long generation;
+    int matched;
+    int blocking;
+    size_t difference_count;
+    size_t blocking_count;
+
+    kzt_guest_dynamic_status_t old_status;
+    kzt_guest_dynamic_status_t new_status;
+    size_t old_entry_count;
+    size_t new_entry_count;
+    size_t old_unknown_tag_count;
+    size_t new_unknown_tag_count;
+    int64_t old_first_unknown_tag;
+    int64_t new_first_unknown_tag;
+    size_t old_first_unknown_tag_index;
+    size_t new_first_unknown_tag_index;
+
+    kzt_guest_dynamic_diagnostic_difference_kind_t first_difference_kind;
+    const char *first_difference_name;
+    kzt_guest_dynamic_diagnostic_match_t first_difference_match;
+    int first_old_present;
+    int first_new_present;
+    uint64_t first_old_value;
+    uint64_t first_new_value;
+    size_t first_old_count;
+    size_t first_new_count;
+    int64_t first_old_tag;
+    int64_t first_new_tag;
+    size_t first_old_tag_index;
+    size_t first_new_tag_index;
+} kzt_guest_dynamic_diagnostic_summary_t;
+
+int kzt_guest_dynamic_diagnostics_summarize(
+    const kzt_guest_dynamic_diagnostic_report_t *report,
+    uintptr_t link_map_addr,
+    unsigned long generation,
+    kzt_guest_dynamic_diagnostic_summary_t *summary);
+
 int kzt_guest_dynamic_diagnostics_compare(
     const kzt_guest_dynamic_parse_result_t *old_result,
     const kzt_guest_dynamic_parse_result_t *new_result,
@@ -73,5 +121,10 @@ const kzt_guest_dynamic_diagnostic_field_t *
 kzt_guest_dynamic_diagnostic_find_field(
     const kzt_guest_dynamic_diagnostic_report_t *report,
     const char *name);
+
+int kzt_guest_dynamic_diagnostics_format_summary(
+    const kzt_guest_dynamic_diagnostic_summary_t *summary,
+    char *buffer,
+    size_t buffer_size);
 
 #endif

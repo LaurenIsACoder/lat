@@ -643,6 +643,10 @@ static void test_conflict_result_does_not_change_old_flow(void)
     kzt_guest_registry_t *registry = kzt_guest_registry_init();
     kzt_guest_object_observation_t original;
     kzt_observation_adapter_result_t result = KZT_OBSERVATION_ADAPTER_ADDED;
+    kzt_guest_registry_diagnostic_config_t config = {
+        .enabled = 1,
+        .throttle_limit = 4,
+    };
     int ret;
 
     check_true("registry.init", registry != NULL);
@@ -655,11 +659,14 @@ static void test_conflict_result_does_not_change_old_flow(void)
     original = make_observation((uintptr_t)&event.link_map,
                                 0x510000,
                                 "/guest/libconflict-old.so");
+    check_int("conflict.configure",
+              kzt_guest_registry_configure_diagnostics(registry, &config),
+              0);
     check_int("conflict.prepopulate",
               kzt_guest_registry_observe(registry, &original),
               KZT_GUEST_REGISTRY_ADDED);
 
-    ret = run_adapter(&event, registry, 1, &result);
+    ret = run_adapter_with_diagnostics(&event, registry, 1, &result);
 
     check_int("conflict.return", ret, 27);
     check_int("conflict.result", result, KZT_OBSERVATION_ADAPTER_CONFLICT);
@@ -667,6 +674,14 @@ static void test_conflict_result_does_not_change_old_flow(void)
     assert_reader_before_old_flow(&event);
     check_ulong("conflict.registry-count",
                 registry_object_count(registry), 1);
+    assert_dynamic_view_not_parsed("conflict.view", registry, &event);
+    check_int("conflict.diagnostic-calls", event.trace.diagnostic_calls, 1);
+    check_int("conflict.dynamic-not-attempted",
+              event.trace.dynamic_attempted, 0);
+    check_int("conflict.dynamic-no-commit",
+              event.trace.dynamic_commit_attempted, 0);
+    check_int("conflict.dynamic-commit-result",
+              event.trace.dynamic_commit_result, KZT_GUEST_REGISTRY_RESULT_COUNT);
 
     kzt_guest_registry_destroy(&registry);
 }

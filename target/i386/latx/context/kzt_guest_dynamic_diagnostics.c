@@ -1,6 +1,7 @@
 #include "kzt_guest_dynamic_diagnostics.h"
 
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 typedef struct kzt_guest_dynamic_field_spec {
@@ -208,6 +209,184 @@ static size_t kzt_guest_dynamic_count_summary_differences(
     }
 
     return count;
+}
+
+static void kzt_guest_dynamic_summary_set_field(
+    kzt_guest_dynamic_diagnostic_summary_t *summary,
+    const kzt_guest_dynamic_diagnostic_field_t *field)
+{
+    summary->first_difference_kind =
+        KZT_GUEST_DYNAMIC_DIAGNOSTIC_DIFFERENCE_FIELD;
+    summary->first_difference_name = field->name;
+    summary->first_difference_match = field->match;
+    summary->first_old_present = field->old_present;
+    summary->first_new_present = field->new_present;
+    summary->first_old_value = field->old_value;
+    summary->first_new_value = field->new_value;
+    summary->first_old_count = field->old_count;
+    summary->first_new_count = field->new_count;
+}
+
+static void kzt_guest_dynamic_summary_set_status(
+    kzt_guest_dynamic_diagnostic_summary_t *summary,
+    const kzt_guest_dynamic_diagnostic_report_t *report)
+{
+    summary->first_difference_kind =
+        KZT_GUEST_DYNAMIC_DIAGNOSTIC_DIFFERENCE_STATUS;
+    summary->first_difference_name = "status";
+    summary->first_difference_match = report->status_match;
+    summary->first_old_present = 1;
+    summary->first_new_present = 1;
+    summary->first_old_value = report->old_status;
+    summary->first_new_value = report->new_status;
+}
+
+static void kzt_guest_dynamic_summary_set_entry_count(
+    kzt_guest_dynamic_diagnostic_summary_t *summary,
+    const kzt_guest_dynamic_diagnostic_report_t *report)
+{
+    summary->first_difference_kind =
+        KZT_GUEST_DYNAMIC_DIAGNOSTIC_DIFFERENCE_ENTRY_COUNT;
+    summary->first_difference_name = "entry_count";
+    summary->first_difference_match = report->entry_count_match;
+    summary->first_old_present = 1;
+    summary->first_new_present = 1;
+    summary->first_old_count = report->old_entry_count;
+    summary->first_new_count = report->new_entry_count;
+}
+
+static void kzt_guest_dynamic_summary_set_unknown_tags(
+    kzt_guest_dynamic_diagnostic_summary_t *summary,
+    const kzt_guest_dynamic_diagnostic_report_t *report)
+{
+    summary->first_difference_kind =
+        KZT_GUEST_DYNAMIC_DIAGNOSTIC_DIFFERENCE_UNKNOWN_TAGS;
+    summary->first_difference_name = "unknown_tags";
+    summary->first_difference_match = report->unknown_tags_match;
+    summary->first_old_present = report->old_unknown_tag_count > 0;
+    summary->first_new_present = report->new_unknown_tag_count > 0;
+    summary->first_old_count = report->old_unknown_tag_count;
+    summary->first_new_count = report->new_unknown_tag_count;
+    summary->first_old_tag = report->old_first_unknown_tag;
+    summary->first_new_tag = report->new_first_unknown_tag;
+    summary->first_old_tag_index = report->old_first_unknown_tag_index;
+    summary->first_new_tag_index = report->new_first_unknown_tag_index;
+}
+
+int kzt_guest_dynamic_diagnostics_summarize(
+    const kzt_guest_dynamic_diagnostic_report_t *report,
+    uintptr_t link_map_addr,
+    unsigned long generation,
+    kzt_guest_dynamic_diagnostic_summary_t *summary)
+{
+    size_t i;
+
+    if (!report || !summary) {
+        return -1;
+    }
+
+    memset(summary, 0, sizeof(*summary));
+    summary->link_map_addr = link_map_addr;
+    summary->generation = generation;
+    summary->matched = report->difference_count == 0;
+    summary->blocking = report->blocking_count > 0;
+    summary->difference_count = report->difference_count;
+    summary->blocking_count = report->blocking_count;
+    summary->old_status = report->old_status;
+    summary->new_status = report->new_status;
+    summary->old_entry_count = report->old_entry_count;
+    summary->new_entry_count = report->new_entry_count;
+    summary->old_unknown_tag_count = report->old_unknown_tag_count;
+    summary->new_unknown_tag_count = report->new_unknown_tag_count;
+    summary->old_first_unknown_tag = report->old_first_unknown_tag;
+    summary->new_first_unknown_tag = report->new_first_unknown_tag;
+    summary->old_first_unknown_tag_index =
+        report->old_first_unknown_tag_index;
+    summary->new_first_unknown_tag_index =
+        report->new_first_unknown_tag_index;
+    summary->first_difference_kind =
+        KZT_GUEST_DYNAMIC_DIAGNOSTIC_DIFFERENCE_NONE;
+    summary->first_difference_name = "none";
+    summary->first_difference_match =
+        KZT_GUEST_DYNAMIC_DIAGNOSTIC_MATCHED;
+
+    if (report->status_match != KZT_GUEST_DYNAMIC_DIAGNOSTIC_MATCHED ||
+        report->blocking_count > 0) {
+        kzt_guest_dynamic_summary_set_status(summary, report);
+        return 0;
+    }
+
+    if (report->entry_count_match != KZT_GUEST_DYNAMIC_DIAGNOSTIC_MATCHED) {
+        kzt_guest_dynamic_summary_set_entry_count(summary, report);
+        return 0;
+    }
+
+    if (report->unknown_tags_match !=
+        KZT_GUEST_DYNAMIC_DIAGNOSTIC_MATCHED) {
+        kzt_guest_dynamic_summary_set_unknown_tags(summary, report);
+        return 0;
+    }
+
+    for (i = 0; i < report->field_count; ++i) {
+        if (report->fields[i].match !=
+            KZT_GUEST_DYNAMIC_DIAGNOSTIC_MATCHED) {
+            kzt_guest_dynamic_summary_set_field(summary,
+                                               &report->fields[i]);
+            return 0;
+        }
+    }
+
+    return 0;
+}
+
+int kzt_guest_dynamic_diagnostics_format_summary(
+    const kzt_guest_dynamic_diagnostic_summary_t *summary,
+    char *buffer,
+    size_t buffer_size)
+{
+    int written;
+    const char *first_name;
+
+    if (!summary || !buffer || buffer_size == 0) {
+        return -1;
+    }
+
+    first_name = summary->first_difference_name ?
+        summary->first_difference_name : "none";
+    written = snprintf(
+        buffer, buffer_size,
+        "kzt_guest_dynamic_compare link_map=0x%lx generation=%lu "
+        "matched=%d blocking=%d differences=%lu blocking_count=%lu "
+        "first=%s kind=%d match=%d old_present=%d new_present=%d "
+        "old_value=0x%llx new_value=0x%llx old_count=%lu new_count=%lu "
+        "old_tag=%lld new_tag=%lld old_tag_index=%lu new_tag_index=%lu "
+        "old_status=%d new_status=%d old_entries=%lu new_entries=%lu "
+        "old_unknown_tags=%lu new_unknown_tags=%lu",
+        (unsigned long)summary->link_map_addr, summary->generation,
+        summary->matched, summary->blocking,
+        (unsigned long)summary->difference_count,
+        (unsigned long)summary->blocking_count, first_name,
+        summary->first_difference_kind, summary->first_difference_match,
+        summary->first_old_present, summary->first_new_present,
+        (unsigned long long)summary->first_old_value,
+        (unsigned long long)summary->first_new_value,
+        (unsigned long)summary->first_old_count,
+        (unsigned long)summary->first_new_count,
+        (long long)summary->first_old_tag,
+        (long long)summary->first_new_tag,
+        (unsigned long)summary->first_old_tag_index,
+        (unsigned long)summary->first_new_tag_index,
+        summary->old_status, summary->new_status,
+        (unsigned long)summary->old_entry_count,
+        (unsigned long)summary->new_entry_count,
+        (unsigned long)summary->old_unknown_tag_count,
+        (unsigned long)summary->new_unknown_tag_count);
+
+    if (written < 0 || (size_t)written >= buffer_size) {
+        return -1;
+    }
+
+    return 0;
 }
 
 int kzt_guest_dynamic_diagnostics_compare(
