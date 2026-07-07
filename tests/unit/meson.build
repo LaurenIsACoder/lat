@@ -126,3 +126,14 @@ kzt_patch_planner_test = executable(
 )
 
 test('kzt-patch-planner', kzt_patch_planner_test)
+
+kzt_runtime_got_plt_candidate_test = executable(
+  'kzt-runtime-got-plt-candidate',
+  files(
+    'kzt/test_runtime_got_plt_candidate.c',
+    '../../target/i386/latx/context/kzt_runtime_got_plt_candidate.c',
+  ),
+  include_directories: include_directories('../..', '../../target/i386/latx/include'),
+)
+
+test('kzt-runtime-got-plt-candidate', kzt_runtime_got_plt_candidate_test)

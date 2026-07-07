@@ -73,6 +73,7 @@ my_file = files(
   'kzt_guest_dynamic.c',
   'kzt_observation_adapter.c',
   'kzt_patch_planner.c',
+  'kzt_runtime_got_plt_candidate.c',
   'myalign.c',
   'obstack.c',
   'globalsymbols.c',
