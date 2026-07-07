@@ -69,6 +69,16 @@ kzt_guest_dynamic_snapshot_test = executable(
 
 test('kzt-guest-dynamic-snapshot', kzt_guest_dynamic_snapshot_test)
 
+kzt_guest_dynamic_diagnostics_test = executable(
+  'kzt-guest-dynamic-diagnostics',
+  files(
+    'kzt/test_guest_dynamic_diagnostics.c',
+    '../../target/i386/latx/context/kzt_guest_dynamic_diagnostics.c',
+  ),
+  include_directories: include_directories('../..', '../../target/i386/latx/include'),
+)
+
+test('kzt-guest-dynamic-diagnostics', kzt_guest_dynamic_diagnostics_test)
 
 kzt_observation_adapter_test = executable(
   'kzt-observation-adapter',
