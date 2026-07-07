@@ -115,3 +115,14 @@ kzt_registry_diagnostics_gate_test = executable(
 )
 
 test('kzt-registry-diagnostics-gate', kzt_registry_diagnostics_gate_test)
+
+kzt_patch_planner_test = executable(
+  'kzt-patch-planner',
+  files(
+    'kzt/test_patch_planner.c',
+    '../../target/i386/latx/context/kzt_patch_planner.c',
+  ),
+  include_directories: include_directories('../..', '../../target/i386/latx/include'),
+)
+
+test('kzt-patch-planner', kzt_patch_planner_test)

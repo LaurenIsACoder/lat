@@ -72,6 +72,7 @@ my_file = files(
   'kzt_guest_link_map_reader.c',
   'kzt_guest_dynamic.c',
   'kzt_observation_adapter.c',
+  'kzt_patch_planner.c',
   'myalign.c',
   'obstack.c',
   'globalsymbols.c',
