@@ -1,9 +1,11 @@
 #ifndef KZT_OBSERVATION_ADAPTER_H
 #define KZT_OBSERVATION_ADAPTER_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "kzt_guest_link_map_reader.h"
+#include "kzt_guest_dynamic.h"
 #include "kzt_guest_registry.h"
 
 typedef enum kzt_observation_adapter_result {
@@ -19,12 +21,26 @@ typedef enum kzt_observation_adapter_result {
 typedef int (*kzt_observation_legacy_flow_fn)(uintptr_t link_map_addr,
                                              void *opaque);
 
+typedef struct kzt_observation_adapter_dynamic_diagnostic {
+    int attempted;
+    int parse_return;
+    uintptr_t dynamic_addr;
+    kzt_guest_dynamic_status_t status;
+    kzt_guest_dynamic_error_t error;
+    size_t entry_count;
+    uintptr_t read_error_addr;
+    int commit_attempted;
+    kzt_guest_registry_result_t commit_result;
+    kzt_guest_registry_observation_diagnostic_t registry;
+} kzt_observation_adapter_dynamic_diagnostic_t;
+
 typedef struct kzt_observation_adapter_diagnostic {
     int enabled;
     int emitted;
     kzt_observation_adapter_result_t result;
     uintptr_t link_map_addr;
     kzt_guest_registry_observation_diagnostic_t registry;
+    kzt_observation_adapter_dynamic_diagnostic_t dynamic;
 } kzt_observation_adapter_diagnostic_t;
 
 typedef void (*kzt_observation_adapter_diagnostic_fn)(

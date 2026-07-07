@@ -186,6 +186,7 @@ void kzt_guest_registry_dump_free(kzt_guest_registry_dump_t *dump);
 
 #ifdef KZT_GUEST_REGISTRY_TEST
 void kzt_guest_registry_test_set_alloc_failure_after(long allocations);
+void kzt_guest_registry_test_set_dynamic_commit_failure_after(long commits);
 #endif
 
 #endif

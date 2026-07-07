@@ -25,10 +25,27 @@ struct kzt_guest_registry {
 
 #ifdef KZT_GUEST_REGISTRY_TEST
 static long test_alloc_failure_after = -1;
+static long test_dynamic_commit_failure_after = -1;
 
 void kzt_guest_registry_test_set_alloc_failure_after(long allocations)
 {
     test_alloc_failure_after = allocations;
+}
+
+void kzt_guest_registry_test_set_dynamic_commit_failure_after(long commits)
+{
+    test_dynamic_commit_failure_after = commits;
+}
+
+static int kzt_registry_test_should_fail_dynamic_commit(void)
+{
+    if (test_dynamic_commit_failure_after == 0) {
+        return 1;
+    }
+    if (test_dynamic_commit_failure_after > 0) {
+        --test_dynamic_commit_failure_after;
+    }
+    return 0;
 }
 #endif
 
@@ -754,6 +771,12 @@ kzt_guest_registry_result_t kzt_guest_registry_commit_dynamic_view(
     if (!view || link_map_addr == 0) {
         return KZT_GUEST_REGISTRY_ERROR;
     }
+
+#ifdef KZT_GUEST_REGISTRY_TEST
+    if (kzt_registry_test_should_fail_dynamic_commit()) {
+        return KZT_GUEST_REGISTRY_ERROR;
+    }
+#endif
 
     pthread_mutex_lock(&registry->lock);
     if (registry->disabled) {

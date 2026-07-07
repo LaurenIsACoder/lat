@@ -34,11 +34,22 @@ typedef struct observation_trace {
     kzt_observation_adapter_result_t diagnostic_result;
     int diagnostic_emitted;
     unsigned long diagnostic_result_observations;
+    int dynamic_attempted;
+    int dynamic_parse_return;
+    uintptr_t dynamic_addr;
+    kzt_guest_dynamic_status_t dynamic_status;
+    kzt_guest_dynamic_error_t dynamic_error;
+    size_t dynamic_entry_count;
+    uintptr_t dynamic_read_error_addr;
+    int dynamic_commit_attempted;
+    kzt_guest_registry_result_t dynamic_commit_result;
+    int dynamic_registry_emitted;
 } observation_trace_t;
 
 typedef struct fake_callback_event {
     struct link_map_x64 link_map;
     char guest_name[64];
+    Elf64_Dyn dynamic[4];
     fake_reader_memory_t memory;
     kzt_guest_link_map_reader_ops_t ops;
     observation_trace_t trace;
@@ -74,6 +85,18 @@ static void check_ulong(const char *name, unsigned long got,
     }
 
     fprintf(stderr, "%s: got %lu expected %lu\n", name, got, expected);
+    ++failures;
+}
+
+static void check_uintptr(const char *name, uintptr_t got,
+                          uintptr_t expected)
+{
+    if (got == expected) {
+        return;
+    }
+
+    fprintf(stderr, "%s: got 0x%lx expected 0x%lx\n", name,
+            (unsigned long)got, (unsigned long)expected);
     ++failures;
 }
 
@@ -142,6 +165,16 @@ static void fake_diagnostic(
     trace->diagnostic_emitted = diagnostic->emitted;
     trace->diagnostic_result_observations =
         diagnostic->registry.result_observations;
+    trace->dynamic_attempted = diagnostic->dynamic.attempted;
+    trace->dynamic_parse_return = diagnostic->dynamic.parse_return;
+    trace->dynamic_addr = diagnostic->dynamic.dynamic_addr;
+    trace->dynamic_status = diagnostic->dynamic.status;
+    trace->dynamic_error = diagnostic->dynamic.error;
+    trace->dynamic_entry_count = diagnostic->dynamic.entry_count;
+    trace->dynamic_read_error_addr = diagnostic->dynamic.read_error_addr;
+    trace->dynamic_commit_attempted = diagnostic->dynamic.commit_attempted;
+    trace->dynamic_commit_result = diagnostic->dynamic.commit_result;
+    trace->dynamic_registry_emitted = diagnostic->dynamic.registry.emitted;
     record_event(trace, EVENT_DIAGNOSTIC);
 }
 
@@ -151,9 +184,17 @@ static void init_fake_callback_event(fake_callback_event_t *event,
 {
     memset(event, 0, sizeof(*event));
     strcpy(event->guest_name, path);
+    event->dynamic[0].d_tag = DT_SYMTAB;
+    event->dynamic[0].d_un.d_ptr = load_bias + 0x3000;
+    event->dynamic[1].d_tag = DT_STRTAB;
+    event->dynamic[1].d_un.d_ptr = load_bias + 0x4000;
+    event->dynamic[2].d_tag = DT_STRSZ;
+    event->dynamic[2].d_un.d_val = 0x180;
+    event->dynamic[3].d_tag = DT_NULL;
+    event->dynamic[3].d_un.d_val = 0;
     event->link_map.l_addr = load_bias;
     event->link_map.l_name = event->guest_name;
-    event->link_map.l_ld = (Elf64_Dyn *)(load_bias + 0x1000);
+    event->link_map.l_ld = event->dynamic;
     event->link_map.l_ns = 7;
     event->link_map.l_map_start = load_bias;
     event->link_map.l_map_end = load_bias + 0x20000;
@@ -265,6 +306,83 @@ static unsigned long registry_object_count(kzt_guest_registry_t *registry)
     return count;
 }
 
+static void assert_dynamic_view_complete(const char *name,
+                                         kzt_guest_registry_t *registry,
+                                         const fake_callback_event_t *event,
+                                         unsigned long expected_generation)
+{
+    kzt_guest_dynamic_view_t view = { 0 };
+    kzt_guest_field_status_t status = KZT_GUEST_FIELD_UNKNOWN;
+    unsigned long generation = 0;
+
+    check_int(name, kzt_guest_registry_find_dynamic_view(
+                  registry, (uintptr_t)&event->link_map, &view, &status,
+                  &generation), 0);
+    check_int("dynamic.status", status, KZT_GUEST_FIELD_OK);
+    check_ulong("dynamic.generation", generation, expected_generation);
+    check_uintptr("dynamic.addr", view.dynamic_addr,
+                  (uintptr_t)event->dynamic);
+    check_uintptr("dynamic.load-bias", view.load_bias,
+                  event->link_map.l_addr);
+    check_int("dynamic.view-status", view.status,
+              KZT_GUEST_DYNAMIC_COMPLETE);
+    check_ulong("dynamic.entry-count", view.entry_count, 3);
+    check_int("dynamic.has-null", view.has_null, 1);
+    check_true("dynamic.symtab.present", view.symtab.present);
+    check_uintptr("dynamic.symtab", view.symtab.value,
+                  event->link_map.l_addr + 0x3000);
+    check_int("dynamic.symtab.semantics", view.symtab.address_semantics,
+              KZT_GUEST_DYNAMIC_RUNTIME_ADDRESS);
+    check_true("dynamic.strtab.present", view.strtab.present);
+    check_uintptr("dynamic.strtab", view.strtab.value,
+                  event->link_map.l_addr + 0x4000);
+    check_int("dynamic.strtab.semantics", view.strtab.address_semantics,
+              KZT_GUEST_DYNAMIC_RUNTIME_ADDRESS);
+    check_true("dynamic.strsz.present", view.strsz.present);
+    check_ulong("dynamic.strsz", view.strsz.value, 0x180);
+    check_int("dynamic.strsz.semantics", view.strsz.address_semantics,
+              KZT_GUEST_DYNAMIC_SCALAR);
+}
+
+static void assert_dynamic_view_read_error(const char *name,
+                                           kzt_guest_registry_t *registry,
+                                           const fake_callback_event_t *event)
+{
+    kzt_guest_dynamic_view_t view = { 0 };
+    kzt_guest_field_status_t status = KZT_GUEST_FIELD_UNKNOWN;
+    unsigned long generation = 0;
+
+    check_int(name, kzt_guest_registry_find_dynamic_view(
+                  registry, (uintptr_t)&event->link_map, &view, &status,
+                  &generation), 0);
+    check_int("dynamic.read-error.status", status,
+              KZT_GUEST_FIELD_READ_ERROR);
+    check_ulong("dynamic.read-error.generation", generation, 1);
+    check_uintptr("dynamic.read-error.addr", view.dynamic_addr,
+                  (uintptr_t)event->dynamic);
+    check_int("dynamic.read-error.view-status", view.status,
+              KZT_GUEST_DYNAMIC_READ_ERROR);
+    check_ulong("dynamic.read-error.entry-count", view.entry_count, 1);
+    check_int("dynamic.read-error.no-null", view.has_null, 0);
+}
+
+static void assert_dynamic_view_not_parsed(const char *name,
+                                           kzt_guest_registry_t *registry,
+                                           const fake_callback_event_t *event)
+{
+    kzt_guest_dynamic_view_t view = { 0 };
+    kzt_guest_field_status_t status = KZT_GUEST_FIELD_UNKNOWN;
+    unsigned long generation = 0;
+
+    check_int(name, kzt_guest_registry_find_dynamic_view(
+                  registry, (uintptr_t)&event->link_map, &view, &status,
+                  &generation), 0);
+    check_int("dynamic.not-parsed.status", status,
+              KZT_GUEST_FIELD_NOT_PARSED);
+    check_ulong("dynamic.not-parsed.generation", generation, 1);
+    check_uintptr("dynamic.not-parsed.addr", view.dynamic_addr, 0);
+}
+
 static void test_active_observation_adds_object_and_preserves_old_flow(void)
 {
     fake_callback_event_t event;
@@ -287,6 +405,144 @@ static void test_active_observation_adds_object_and_preserves_old_flow(void)
     assert_old_flow_exactly_once("active.old-flow", &event, 23);
     assert_reader_before_old_flow(&event);
     check_ulong("active.registry-count", registry_object_count(registry), 1);
+
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_dynamic_parser_success_commits_snapshot(void)
+{
+    fake_callback_event_t event;
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_observation_adapter_result_t result = KZT_OBSERVATION_ADAPTER_DISABLED;
+    kzt_guest_registry_diagnostic_config_t config = {
+        .enabled = 1,
+        .throttle_limit = 4,
+    };
+    int ret;
+
+    check_true("registry.init", registry != NULL);
+    if (!registry) {
+        return;
+    }
+
+    init_fake_callback_event(&event, "/guest/libdynamic.so", 0x180000);
+    event.trace.legacy_return = 41;
+    check_int("dynamic-success.configure",
+              kzt_guest_registry_configure_diagnostics(registry, &config),
+              0);
+
+    ret = run_adapter_with_diagnostics(&event, registry, 1, &result);
+
+    check_int("dynamic-success.return", ret, 41);
+    check_int("dynamic-success.result", result,
+              KZT_OBSERVATION_ADAPTER_ADDED);
+    assert_old_flow_exactly_once("dynamic-success.old-flow", &event, 41);
+    assert_dynamic_view_complete("dynamic-success.view", registry, &event, 1);
+    check_int("dynamic-success.diagnostic-attempted",
+              event.trace.dynamic_attempted, 1);
+    check_int("dynamic-success.diagnostic-parse-return",
+              event.trace.dynamic_parse_return, 0);
+    check_int("dynamic-success.diagnostic-status",
+              event.trace.dynamic_status, KZT_GUEST_DYNAMIC_COMPLETE);
+    check_int("dynamic-success.diagnostic-commit",
+              event.trace.dynamic_commit_attempted, 1);
+    check_int("dynamic-success.diagnostic-commit-result",
+              event.trace.dynamic_commit_result, KZT_GUEST_REGISTRY_UPDATED);
+
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_dynamic_parser_read_failure_is_fail_open(void)
+{
+    fake_callback_event_t event;
+    fake_read_failure_t failure;
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_observation_adapter_result_t result = KZT_OBSERVATION_ADAPTER_DISABLED;
+    kzt_guest_registry_diagnostic_config_t config = {
+        .enabled = 1,
+        .throttle_limit = 4,
+    };
+    int ret;
+
+    check_true("registry.init", registry != NULL);
+    if (!registry) {
+        return;
+    }
+
+    init_fake_callback_event(&event, "/guest/libdynamic-readfail.so",
+                             0x190000);
+    event.trace.legacy_return = 42;
+    failure.addr = (uintptr_t)&event.dynamic[1];
+    failure.size = sizeof(event.dynamic[1]);
+    event.memory.failures = &failure;
+    event.memory.failure_count = 1;
+    check_int("dynamic-readfail.configure",
+              kzt_guest_registry_configure_diagnostics(registry, &config),
+              0);
+
+    ret = run_adapter_with_diagnostics(&event, registry, 1, &result);
+
+    check_int("dynamic-readfail.return", ret, 42);
+    check_int("dynamic-readfail.result", result,
+              KZT_OBSERVATION_ADAPTER_ADDED);
+    assert_old_flow_exactly_once("dynamic-readfail.old-flow", &event, 42);
+    assert_dynamic_view_read_error("dynamic-readfail.view", registry, &event);
+    check_int("dynamic-readfail.diagnostic-attempted",
+              event.trace.dynamic_attempted, 1);
+    check_int("dynamic-readfail.diagnostic-status",
+              event.trace.dynamic_status, KZT_GUEST_DYNAMIC_READ_ERROR);
+    check_uintptr("dynamic-readfail.diagnostic-read-addr",
+                  event.trace.dynamic_read_error_addr,
+                  (uintptr_t)&event.dynamic[1]);
+    check_int("dynamic-readfail.diagnostic-commit-result",
+              event.trace.dynamic_commit_result, KZT_GUEST_REGISTRY_UPDATED);
+
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_dynamic_commit_failure_is_fail_open(void)
+{
+    fake_callback_event_t event;
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_observation_adapter_result_t result = KZT_OBSERVATION_ADAPTER_DISABLED;
+    kzt_guest_registry_diagnostic_config_t config = {
+        .enabled = 1,
+        .throttle_limit = 4,
+    };
+    kzt_guest_registry_diagnostics_t diagnostics = { 0 };
+    int ret;
+
+    check_true("registry.init", registry != NULL);
+    if (!registry) {
+        return;
+    }
+
+    init_fake_callback_event(&event, "/guest/libdynamic-commitfail.so",
+                             0x1a0000);
+    event.trace.legacy_return = 43;
+    check_int("dynamic-commitfail.configure",
+              kzt_guest_registry_configure_diagnostics(registry, &config),
+              0);
+
+    kzt_guest_registry_test_set_dynamic_commit_failure_after(0);
+    ret = run_adapter_with_diagnostics(&event, registry, 1, &result);
+    kzt_guest_registry_test_set_dynamic_commit_failure_after(-1);
+
+    check_int("dynamic-commitfail.return", ret, 43);
+    check_int("dynamic-commitfail.result", result,
+              KZT_OBSERVATION_ADAPTER_ADDED);
+    assert_old_flow_exactly_once("dynamic-commitfail.old-flow", &event, 43);
+    assert_dynamic_view_not_parsed("dynamic-commitfail.view", registry,
+                                   &event);
+    check_int("dynamic-commitfail.diagnostic-attempted",
+              event.trace.dynamic_attempted, 1);
+    check_int("dynamic-commitfail.diagnostic-status",
+              event.trace.dynamic_status, KZT_GUEST_DYNAMIC_COMPLETE);
+    check_int("dynamic-commitfail.diagnostic-commit-result",
+              event.trace.dynamic_commit_result, KZT_GUEST_REGISTRY_ERROR);
+    check_int("dynamic-commitfail.diagnostics",
+              kzt_guest_registry_get_diagnostics(registry, &diagnostics), 0);
+    check_ulong("dynamic-commitfail.error-count", diagnostics.errors, 1);
 
     kzt_guest_registry_destroy(&registry);
 }
@@ -595,6 +851,9 @@ static void test_disabled_adapter_diagnostics_are_throttled(void)
 int main(void)
 {
     test_active_observation_adds_object_and_preserves_old_flow();
+    test_dynamic_parser_success_commits_snapshot();
+    test_dynamic_parser_read_failure_is_fail_open();
+    test_dynamic_commit_failure_is_fail_open();
     test_disabled_adapter_skips_observation_but_preserves_old_flow();
     test_reader_failure_is_fail_open_for_old_flow();
     test_registry_failure_is_fail_open_for_old_flow();
