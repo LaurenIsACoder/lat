@@ -16,6 +16,12 @@ extern int option_flag_reduction;
 extern int option_tu_link;
 #endif
 
+#if defined(CONFIG_LATX_KZT)
+extern int option_kzt_patch_spike;
+extern int option_kzt_patch_spike_write;
+extern unsigned long option_kzt_patch_spike_budget;
+#endif
+
 #ifdef CONFIG_LATX_AVX_OPT
 extern int option_avx_cpuid;
 #endif /* CONFIG_LATX_AVX_OPT */
@@ -127,7 +133,10 @@ extern unsigned long long counter_mips_tr;
 #define ENVSUP_KZT \
     ENVFUN(LATX_KZT, handle_arg_latx_kzt) \
     ENVFUN(LATX_KZT_REGISTRY_DIAGNOSTICS, \
-           handle_arg_latx_kzt_registry_diagnostics)
+           handle_arg_latx_kzt_registry_diagnostics) \
+    ENVFUN(LATX_KZT_PATCH_SPIKE, handle_arg_latx_kzt_patch_spike) \
+    ENVFUN(LATX_KZT_PATCH_SPIKE_WRITE, handle_arg_latx_kzt_patch_spike_write) \
+    ENVFUN(LATX_KZT_PATCH_SPIKE_BUDGET, handle_arg_latx_kzt_patch_spike_budget)
 #else
 #define ENVSUP_KZT
 #endif

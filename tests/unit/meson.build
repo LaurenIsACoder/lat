@@ -137,3 +137,15 @@ kzt_runtime_got_plt_candidate_test = executable(
 )
 
 test('kzt-runtime-got-plt-candidate', kzt_runtime_got_plt_candidate_test)
+
+kzt_patch_spike_guard_test = executable(
+  'kzt-patch-spike-guard',
+  files(
+    'kzt/test_patch_spike_guard.c',
+    '../../target/i386/latx/context/kzt_patch_spike_guard.c',
+  ),
+  c_args: ['-DCONFIG_LATX_KZT'],
+  include_directories: include_directories('../..', '../../target/i386/latx/include'),
+)
+
+test('kzt-patch-spike-guard', kzt_patch_spike_guard_test)

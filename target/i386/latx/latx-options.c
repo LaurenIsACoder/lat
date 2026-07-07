@@ -7,6 +7,9 @@
 
 #if defined(CONFIG_LATX_KZT)
 int option_kzt = 0;
+int option_kzt_patch_spike = 0;
+int option_kzt_patch_spike_write = 0;
+unsigned long option_kzt_patch_spike_budget = 0;
 #endif
 
 #ifdef CONFIG_LATX_AVX_OPT
@@ -268,6 +271,12 @@ void options_init(void)
         option_fast_atomic = 1;
     else
         option_fast_atomic = 0;
+
+#if defined(CONFIG_LATX_KZT)
+    option_kzt_patch_spike = 0;
+    option_kzt_patch_spike_write = 0;
+    option_kzt_patch_spike_budget = 0;
+#endif
 }
 
 #define OPTIONS_IMM_REG 0

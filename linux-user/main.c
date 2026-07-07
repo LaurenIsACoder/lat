@@ -641,6 +641,23 @@ static void handle_arg_latx_kzt_registry_diagnostics(const char *arg)
 {
     kzt_registry_diagnostics = strtol(arg, NULL, 0);
 }
+
+static void handle_arg_latx_kzt_patch_spike(const char *arg)
+{
+    option_kzt_patch_spike = strtol(arg, NULL, 0) > 0;
+}
+
+static void handle_arg_latx_kzt_patch_spike_write(const char *arg)
+{
+    option_kzt_patch_spike_write = strtol(arg, NULL, 0) > 0;
+}
+
+static void handle_arg_latx_kzt_patch_spike_budget(const char *arg)
+{
+    long value = strtol(arg, NULL, 0);
+
+    option_kzt_patch_spike_budget = value > 0 ? (unsigned long)value : 0;
+}
 #endif
 
 static void handle_arg_latx_fputag(const char *arg)
@@ -827,6 +844,15 @@ static const struct qemu_argument arg_table[] = {
     {"latx-kzt-registry-diagnostics", "LATX_KZT_REGISTRY_DIAGNOSTICS",
      true, handle_arg_latx_kzt_registry_diagnostics,
     "",           "enable KZT guest registry diagnostics"},
+    {"latx-kzt-patch-spike", "LATX_KZT_PATCH_SPIKE",
+     true, handle_arg_latx_kzt_patch_spike,
+    "",           "enable KZT controlled patch spike planning"},
+    {"latx-kzt-patch-spike-write", "LATX_KZT_PATCH_SPIKE_WRITE",
+     true, handle_arg_latx_kzt_patch_spike_write,
+    "",           "authorize KZT controlled patch spike writes"},
+    {"latx-kzt-patch-spike-budget", "LATX_KZT_PATCH_SPIKE_BUDGET",
+     true, handle_arg_latx_kzt_patch_spike_budget,
+    "",           "set KZT controlled patch spike write budget"},
 #endif
     {"latx-fputag",    "LATX_FPUTAG",     true,  handle_arg_latx_fputag,
     "",           "enable fputag"},
