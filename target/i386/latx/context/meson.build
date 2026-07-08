@@ -74,6 +74,7 @@ my_file = files(
   'kzt_observation_adapter.c',
   'kzt_patch_planner.c',
   'kzt_runtime_got_plt_candidate.c',
+  'kzt_rela_immediate_candidate.c',
   'kzt_patch_spike_guard.c',
   'kzt_patch_spike_writer.c',
   'myalign.c',

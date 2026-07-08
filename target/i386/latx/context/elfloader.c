@@ -23,10 +23,50 @@
 #include "dictionnary.h"
 #include "symbols.h"
 #include "lsenv.h"
+#include "kzt_rela_immediate_candidate.h"
 
 void* my__IO_2_1_stderr_ = NULL;
 void* my__IO_2_1_stdin_  = NULL;
 void* my__IO_2_1_stdout_ = NULL;
+
+static void RelocateElfRELAPlanImmediateJumpSlot(elfheader_t *head,
+    int need_resolv_present, int entry_index, Elf64_Rela *rela,
+    uint64_t *slot, uintptr_t slot_current_value,
+    unsigned long symbol_index, const char *symbol_name, const char *version)
+{
+    kzt_rela_immediate_candidate_request_t request;
+    kzt_rela_immediate_candidate_result_t result;
+
+    if (!head || !rela || !slot) {
+        return;
+    }
+
+    memset(&request, 0, sizeof(request));
+    request.relocation_type = ELF64_R_TYPE(rela->r_info);
+    request.table_kind = need_resolv_present ? KZT_PATCH_TABLE_PLT_RELA :
+                                             KZT_PATCH_TABLE_RELA;
+    request.entry_index = entry_index;
+    request.entry_addr = (uintptr_t)rela;
+    request.source.known = 1;
+    request.source.map_start = (uintptr_t)head->memory;
+    request.source.map_end = (uintptr_t)head->memory + head->memsz;
+    request.source.soname = head->name;
+    request.source.path = head->path;
+    request.dynamic_addr = (uintptr_t)head->Dynamic;
+    request.load_bias = head->delta;
+    request.dynamic_view_available = 1;
+    request.slot_addr = (uintptr_t)slot;
+    request.slot_current_value_present = 1;
+    request.slot_current_value = slot_current_value;
+    request.symbol_index = symbol_index;
+    request.symbol_name = symbol_name;
+    request.version = version;
+    request.owner_match = KZT_PATCH_OWNER_UNKNOWN;
+    request.wrapper_match = KZT_PATCH_WRAPPER_NO_MANIFEST;
+
+    (void)kzt_rela_immediate_jump_slot_plan(&request, &result);
+}
+
 void ResetSpecialCaseMainElf(elfheader_t* h)
 {
     Elf64_Sym *sym = NULL;
@@ -689,6 +729,10 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
                     if (offs){
                         if(p) {
                             printf_log(LOG_INFO, "RelocateElfRELA : Apply %s R_X86_64_JUMP_SLOT @%p with sym=%s (%p -> %p)\n", (bind==STB_LOCAL)?"Local":"Global", p, symname, *(void**)p, (void*)(offs+rela[i].r_addend));
+                            RelocateElfRELAPlanImmediateJumpSlot(
+                                head, need_resolv != NULL, i, &rela[i], p,
+                                (uintptr_t)(*p), ELF64_R_SYM(rela[i].r_info),
+                                symname, vername);
                             *p =(uint64_t) (offs + rela[i].r_addend);
                         } else {
                             printf_log(LOG_INFO, "Warning, Symbol %s found, but Jump Slot Offset is NULL \n", symname);

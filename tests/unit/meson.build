@@ -138,6 +138,18 @@ kzt_runtime_got_plt_candidate_test = executable(
 
 test('kzt-runtime-got-plt-candidate', kzt_runtime_got_plt_candidate_test)
 
+kzt_rela_immediate_candidate_test = executable(
+  'kzt-rela-immediate-candidate',
+  files(
+    'kzt/test_rela_immediate_candidate.c',
+    '../../target/i386/latx/context/kzt_rela_immediate_candidate.c',
+    '../../target/i386/latx/context/kzt_patch_planner.c',
+  ),
+  include_directories: include_directories('../..', '../../target/i386/latx/include'),
+)
+
+test('kzt-rela-immediate-candidate', kzt_rela_immediate_candidate_test)
+
 kzt_patch_spike_guard_test = executable(
   'kzt-patch-spike-guard',
   files(
