@@ -149,3 +149,17 @@ kzt_patch_spike_guard_test = executable(
 )
 
 test('kzt-patch-spike-guard', kzt_patch_spike_guard_test)
+
+kzt_patch_spike_writer_test = executable(
+  'kzt-patch-spike-writer',
+  files(
+    'kzt/test_patch_spike_writer.c',
+    '../../target/i386/latx/context/kzt_patch_planner.c',
+    '../../target/i386/latx/context/kzt_patch_spike_guard.c',
+    '../../target/i386/latx/context/kzt_patch_spike_writer.c',
+  ),
+  c_args: ['-DCONFIG_LATX_KZT'],
+  include_directories: include_directories('../..', '../../target/i386/latx/include'),
+)
+
+test('kzt-patch-spike-writer', kzt_patch_spike_writer_test)

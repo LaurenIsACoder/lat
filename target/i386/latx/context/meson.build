@@ -75,6 +75,7 @@ my_file = files(
   'kzt_patch_planner.c',
   'kzt_runtime_got_plt_candidate.c',
   'kzt_patch_spike_guard.c',
+  'kzt_patch_spike_writer.c',
   'myalign.c',
   'obstack.c',
   'globalsymbols.c',
