@@ -50,6 +50,26 @@ kzt_guest_registry_t *KztGuestRegistryForContext(box64context_t *context)
 }
 #endif
 
+kzt_patch_spike_guard_t *KztPatchSpikeGuardForContext(box64context_t *context)
+{
+#ifdef CONFIG_LATX_KZT
+    if (!context) {
+        return NULL;
+    }
+    if (!context->kzt_patch_spike_guard_initialized) {
+        kzt_patch_spike_config_t config;
+
+        kzt_patch_spike_config_from_options(&config);
+        kzt_patch_spike_guard_init(&context->kzt_patch_spike_guard, &config);
+        context->kzt_patch_spike_guard_initialized = 1;
+    }
+    return &context->kzt_patch_spike_guard;
+#else
+    (void)context;
+    return NULL;
+#endif
+}
+
 EXPORTDYN
 void FreeBox64Context(box64context_t** context)
 {

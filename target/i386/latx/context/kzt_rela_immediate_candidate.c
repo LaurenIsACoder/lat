@@ -125,3 +125,46 @@ int kzt_rela_immediate_jump_slot_plan(
         KZT_RELA_IMMEDIATE_CANDIDATE_REASON_NONE);
     return 0;
 }
+
+static int kzt_rela_immediate_decision_allows_writer(
+    const kzt_rela_immediate_candidate_result_t *plan)
+{
+    return plan && plan->status == KZT_RELA_IMMEDIATE_CANDIDATE_PLANNED &&
+           plan->decision_present &&
+           plan->decision.kind == KZT_PATCH_DECISION_APPROVED &&
+           plan->decision.allow_native_bridge;
+}
+
+int kzt_rela_immediate_jump_slot_try_write(
+    const kzt_rela_immediate_candidate_request_t *request,
+    kzt_patch_spike_guard_t *guard,
+    const kzt_patch_spike_slot_ops_t *slot_ops,
+    kzt_rela_immediate_writer_result_t *result)
+{
+    kzt_rela_immediate_writer_result_t local_result;
+
+    if (!result) {
+        result = &local_result;
+    }
+
+    memset(result, 0, sizeof(*result));
+    result->planner_called = 1;
+    if (kzt_rela_immediate_jump_slot_plan(request, &result->plan) != 0) {
+        return 0;
+    }
+
+    if (!kzt_rela_immediate_decision_allows_writer(&result->plan)) {
+        return 0;
+    }
+
+    if (kzt_patch_spike_writer_try_apply_with_slot_ops(
+            guard, &result->plan.decision, slot_ops, &result->record) != 0) {
+        return 0;
+    }
+
+    result->writer_called = result->record.writer_called;
+    result->skip_legacy_write =
+        result->record.result == KZT_PATCH_SPIKE_RESULT_APPLIED &&
+        result->record.skip_legacy_write;
+    return 0;
+}

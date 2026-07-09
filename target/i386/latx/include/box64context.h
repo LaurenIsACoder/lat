@@ -5,6 +5,7 @@
 #include "dictionnary.h"
 #include <link.h>
 #include "debug.h"
+#include "kzt_patch_spike_guard.h"
 
 typedef struct elfheader_s elfheader_t;
 typedef struct cleanup_s cleanup_t;
@@ -349,6 +350,8 @@ typedef struct box64context_s {
 #endif
 #ifdef CONFIG_LATX_KZT
     kzt_guest_registry_t *kzt_guest_registry;
+    kzt_patch_spike_guard_t kzt_patch_spike_guard;
+    int kzt_patch_spike_guard_initialized;
 #endif
 } box64context_t;
 
@@ -359,6 +362,7 @@ void FreeBox64Context(box64context_t** context);
 #ifdef CONFIG_LATX_KZT
 kzt_guest_registry_t *KztGuestRegistryForContext(box64context_t *context);
 #endif
+kzt_patch_spike_guard_t *KztPatchSpikeGuardForContext(box64context_t *context);
 
 // return the index of the added header
 int AddElfHeader(box64context_t* ctx, elfheader_t* head);

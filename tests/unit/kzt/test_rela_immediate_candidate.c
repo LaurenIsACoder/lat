@@ -22,6 +22,7 @@ typedef struct wi231_fake_slot {
 typedef struct wi231_writer_route {
     int planner_called;
     int writer_called;
+    int skip_legacy_write;
     kzt_rela_immediate_candidate_result_t plan;
     kzt_patch_spike_record_t record;
 } wi231_writer_route_t;
@@ -129,58 +130,28 @@ static void wi231_legacy_write(wi231_fake_slot_t *slot,
     slot->value = legacy_target;
 }
 
-static int wi231_plan_approved_for_writer(
-    const kzt_rela_immediate_candidate_result_t *plan)
-{
-    return plan && plan->status == KZT_RELA_IMMEDIATE_CANDIDATE_PLANNED &&
-           plan->decision_present &&
-           plan->decision.kind == KZT_PATCH_DECISION_APPROVED &&
-           plan->decision.allow_native_bridge;
-}
-
-static void wi231_apply_step4_writer_contract(
-    const kzt_rela_immediate_candidate_result_t *plan,
-    wi231_fake_slot_t *slot, uintptr_t legacy_target,
-    wi231_writer_route_t *route)
-{
-    kzt_patch_spike_guard_t guard = wi231_enabled_guard();
-    kzt_patch_spike_slot_ops_t ops;
-
-    memset(route, 0, sizeof(*route));
-    if (plan) {
-        route->plan = *plan;
-    }
-
-    if (!wi231_plan_approved_for_writer(plan)) {
-        wi231_legacy_write(slot, legacy_target);
-        return;
-    }
-
-    ops = wi231_slot_ops(slot);
-    check_int("wi231.writer.apply",
-              kzt_patch_spike_writer_try_apply_with_slot_ops(
-                  &guard, &plan->decision, &ops, &route->record),
-              0);
-    route->writer_called = route->record.writer_called;
-    if (!route->record.skip_legacy_write) {
-        wi231_legacy_write(slot, legacy_target);
-    }
-}
-
 static void wi231_apply_step4_request_contract(
     const kzt_rela_immediate_candidate_request_t *request,
     wi231_fake_slot_t *slot, uintptr_t legacy_target,
     wi231_writer_route_t *route)
 {
-    kzt_rela_immediate_candidate_result_t plan;
+    kzt_patch_spike_guard_t guard = wi231_enabled_guard();
+    kzt_patch_spike_slot_ops_t ops = wi231_slot_ops(slot);
+    kzt_rela_immediate_writer_result_t writer_result;
 
-    memset(&plan, 0, sizeof(plan));
     memset(route, 0, sizeof(*route));
-    route->planner_called = 1;
-    check_int("wi231.plan.call",
-              kzt_rela_immediate_jump_slot_plan(request, &plan), 0);
-    wi231_apply_step4_writer_contract(&plan, slot, legacy_target, route);
-    route->planner_called = 1;
+    check_int("wi231.real.apply",
+              kzt_rela_immediate_jump_slot_try_write(
+                  request, &guard, &ops, &writer_result),
+              0);
+    route->planner_called = writer_result.planner_called;
+    route->writer_called = writer_result.writer_called;
+    route->skip_legacy_write = writer_result.skip_legacy_write;
+    route->plan = writer_result.plan;
+    route->record = writer_result.record;
+    if (!writer_result.skip_legacy_write) {
+        wi231_legacy_write(slot, legacy_target);
+    }
 }
 
 static void wi231_trace(const char *tc, const wi231_fake_slot_t *slot,
@@ -253,37 +224,6 @@ static wi231_fake_slot_t wi231_slot_from_request(
         .value = request->slot_current_value,
         .replacement_value = request->bridge_target,
     };
-}
-
-static kzt_rela_immediate_candidate_result_t wi231_planned_decision(
-    kzt_patch_decision_kind_t kind, kzt_patch_reason_t reason)
-{
-    kzt_rela_immediate_candidate_request_t request = base_request();
-    kzt_rela_immediate_candidate_result_t result;
-
-    check_int("wi231.template.plan",
-              kzt_rela_immediate_jump_slot_plan(&request, &result), 0);
-    result.status = KZT_RELA_IMMEDIATE_CANDIDATE_PLANNED;
-    result.reason = KZT_RELA_IMMEDIATE_CANDIDATE_REASON_NONE;
-    result.candidate_present = 1;
-    result.decision_present = 1;
-    result.decision.kind = kind;
-    result.decision.reason = reason;
-    result.decision.allow_native_bridge =
-        kind == KZT_PATCH_DECISION_APPROVED;
-    return result;
-}
-
-static kzt_rela_immediate_candidate_result_t wi231_error_plan(void)
-{
-    kzt_rela_immediate_candidate_result_t result =
-        wi231_planned_decision(KZT_PATCH_DECISION_ERROR,
-                               KZT_PATCH_REASON_ERROR_INVALID_ARGUMENT);
-
-    result.status = KZT_RELA_IMMEDIATE_CANDIDATE_FAIL_OPEN;
-    result.reason = KZT_RELA_IMMEDIATE_CANDIDATE_REASON_PLANNER_ERROR;
-    result.candidate_present = 0;
-    return result;
 }
 
 static void test_immediate_jump_slot_builds_candidate_fields(void)
@@ -441,7 +381,6 @@ static void test_wi231_planner_non_approved_results_keep_legacy(void)
     uintptr_t legacy_target = 0x7300003333;
     wi231_fake_slot_t slot;
     wi231_writer_route_t route;
-    kzt_rela_immediate_candidate_result_t plan;
 
     memset(&request.current_owner, 0, sizeof(request.current_owner));
     request.owner_match = KZT_PATCH_OWNER_UNKNOWN;
@@ -470,39 +409,38 @@ static void test_wi231_planner_non_approved_results_keep_legacy(void)
     check_ulong("wi231.rejected.final", slot.value, legacy_target);
     wi231_trace("planner-rejected-keeps-legacy", &slot, &route);
 
-    plan = wi231_planned_decision(KZT_PATCH_DECISION_DEFERRED,
-                                  KZT_PATCH_REASON_DEFERRED_LAZY_BINDING);
+    request = base_request();
+    request.lazy_binding_deferred = 1;
     slot = wi231_slot_from_request(&request);
-    wi231_apply_step4_writer_contract(&plan, &slot, legacy_target, &route);
+    wi231_apply_step4_request_contract(&request, &slot, legacy_target,
+                                       &route);
     check_int("wi231.deferred.writer", route.writer_called, 0);
     check_int("wi231.deferred.legacy", slot.legacy_write_calls, 1);
     check_ulong("wi231.deferred.final", slot.value, legacy_target);
-    wi231_trace("planner-deferred-keeps-legacy", &slot, &route);
+    wi231_trace("lazy-deferred-keeps-legacy", &slot, &route);
 
-    plan = wi231_error_plan();
+    request = base_request();
+    request.symbol_name = NULL;
     slot = wi231_slot_from_request(&request);
-    wi231_apply_step4_writer_contract(&plan, &slot, legacy_target, &route);
+    wi231_apply_step4_request_contract(&request, &slot, legacy_target,
+                                       &route);
     check_int("wi231.error.writer", route.writer_called, 0);
     check_int("wi231.error.legacy", slot.legacy_write_calls, 1);
     check_ulong("wi231.error.final", slot.value, legacy_target);
-    wi231_trace("planner-error-keeps-legacy", &slot, &route);
+    wi231_trace("planner-fail-open-keeps-legacy", &slot, &route);
 }
 
 static void test_wi231_writer_failures_fail_open_to_legacy(void)
 {
-    kzt_rela_immediate_candidate_result_t plan =
-        wi231_planned_decision(KZT_PATCH_DECISION_APPROVED,
-                               KZT_PATCH_REASON_APPROVED_NATIVE_BRIDGE);
+    kzt_rela_immediate_candidate_request_t request = base_request();
     uintptr_t legacy_target = 0x7300004444;
     wi231_fake_slot_t slot;
     wi231_writer_route_t route;
 
-    slot = wi231_slot_from_request(&(kzt_rela_immediate_candidate_request_t) {
-        .slot_addr = plan.decision.slot_addr,
-        .slot_current_value = plan.decision.slot_current_value + 4,
-        .bridge_target = plan.decision.bridge_target,
-    });
-    wi231_apply_step4_writer_contract(&plan, &slot, legacy_target, &route);
+    slot = wi231_slot_from_request(&request);
+    slot.value = request.slot_current_value + 4;
+    wi231_apply_step4_request_contract(&request, &slot, legacy_target,
+                                       &route);
     check_int("wi231.mismatch.writer", route.writer_called, 1);
     check_int("wi231.mismatch.failure", route.record.failure,
               KZT_PATCH_SPIKE_FAILURE_EXPECTED_MISMATCH);
@@ -510,26 +448,20 @@ static void test_wi231_writer_failures_fail_open_to_legacy(void)
     check_ulong("wi231.mismatch.final", slot.value, legacy_target);
     wi231_trace("writer-expected-mismatch-fail-open", &slot, &route);
 
-    slot = wi231_slot_from_request(&(kzt_rela_immediate_candidate_request_t) {
-        .slot_addr = plan.decision.slot_addr,
-        .slot_current_value = plan.decision.slot_current_value,
-        .bridge_target = plan.decision.bridge_target,
-    });
+    slot = wi231_slot_from_request(&request);
     slot.fail_replacement_write = 1;
-    wi231_apply_step4_writer_contract(&plan, &slot, legacy_target, &route);
+    wi231_apply_step4_request_contract(&request, &slot, legacy_target,
+                                       &route);
     check_int("wi231.write_fail.failure", route.record.failure,
               KZT_PATCH_SPIKE_FAILURE_WRITE_FAILED);
     check_int("wi231.write_fail.legacy", slot.legacy_write_calls, 1);
     check_ulong("wi231.write_fail.final", slot.value, legacy_target);
     wi231_trace("writer-write-fail-fail-open", &slot, &route);
 
-    slot = wi231_slot_from_request(&(kzt_rela_immediate_candidate_request_t) {
-        .slot_addr = plan.decision.slot_addr,
-        .slot_current_value = plan.decision.slot_current_value,
-        .bridge_target = plan.decision.bridge_target,
-    });
+    slot = wi231_slot_from_request(&request);
     slot.force_verify_mismatch = 1;
-    wi231_apply_step4_writer_contract(&plan, &slot, legacy_target, &route);
+    wi231_apply_step4_request_contract(&request, &slot, legacy_target,
+                                       &route);
     check_int("wi231.verify_fail.failure", route.record.failure,
               KZT_PATCH_SPIKE_FAILURE_VERIFY_FAILED);
     check_int("wi231.verify_fail.rollback",
@@ -538,14 +470,11 @@ static void test_wi231_writer_failures_fail_open_to_legacy(void)
     check_ulong("wi231.verify_fail.final", slot.value, legacy_target);
     wi231_trace("writer-verify-fail-fail-open", &slot, &route);
 
-    slot = wi231_slot_from_request(&(kzt_rela_immediate_candidate_request_t) {
-        .slot_addr = plan.decision.slot_addr,
-        .slot_current_value = plan.decision.slot_current_value,
-        .bridge_target = plan.decision.bridge_target,
-    });
+    slot = wi231_slot_from_request(&request);
     slot.force_verify_mismatch = 1;
     slot.fail_rollback_write = 1;
-    wi231_apply_step4_writer_contract(&plan, &slot, legacy_target, &route);
+    wi231_apply_step4_request_contract(&request, &slot, legacy_target,
+                                       &route);
     check_int("wi231.rollback_fail.failure", route.record.failure,
               KZT_PATCH_SPIKE_FAILURE_ROLLBACK_FAILED);
     check_int("wi231.rollback_fail.rollback",

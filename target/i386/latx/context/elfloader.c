@@ -24,27 +24,10 @@
 #include "symbols.h"
 #include "lsenv.h"
 #include "kzt_rela_immediate_candidate.h"
-#include "kzt_patch_spike_writer.h"
 
 void* my__IO_2_1_stderr_ = NULL;
 void* my__IO_2_1_stdin_  = NULL;
 void* my__IO_2_1_stdout_ = NULL;
-
-static kzt_patch_spike_guard_t *RelocateElfRELAImmediateJumpSlotGuard(void)
-{
-    static kzt_patch_spike_guard_t guard;
-    static int guard_initialized;
-
-    if (!guard_initialized) {
-        kzt_patch_spike_config_t config;
-
-        kzt_patch_spike_config_from_options(&config);
-        kzt_patch_spike_guard_init(&guard, &config);
-        guard_initialized = 1;
-    }
-
-    return &guard;
-}
 
 static int RelocateElfRELATryImmediateJumpSlotWriter(elfheader_t *head,
     int need_resolv_present, int entry_index, Elf64_Rela *rela,
@@ -53,8 +36,7 @@ static int RelocateElfRELATryImmediateJumpSlotWriter(elfheader_t *head,
     uintptr_t bridge_target)
 {
     kzt_rela_immediate_candidate_request_t request;
-    kzt_rela_immediate_candidate_result_t result;
-    kzt_patch_spike_record_t record;
+    kzt_rela_immediate_writer_result_t result;
 
     if (!head || !rela || !slot) {
         return 0;
@@ -84,30 +66,25 @@ static int RelocateElfRELATryImmediateJumpSlotWriter(elfheader_t *head,
     request.wrapper_match = KZT_PATCH_WRAPPER_NO_MANIFEST;
     request.bridge_target = bridge_target;
 
-    if (kzt_rela_immediate_jump_slot_plan(&request, &result) != 0 ||
-        result.status != KZT_RELA_IMMEDIATE_CANDIDATE_PLANNED ||
-        !result.decision_present ||
-        result.decision.kind != KZT_PATCH_DECISION_APPROVED ||
-        !result.decision.allow_native_bridge) {
+    if (kzt_rela_immediate_jump_slot_try_write(
+            &request, KztPatchSpikeGuardForContext(my_context), NULL,
+            &result) != 0) {
         return 0;
     }
 
-    memset(&record, 0, sizeof(record));
-    if (kzt_patch_spike_writer_try_apply(
-            RelocateElfRELAImmediateJumpSlotGuard(), &result.decision,
-            &record) != 0) {
+    if (!result.writer_called) {
         return 0;
     }
 
     printf_log(LOG_DEBUG,
                "KZT: RelocateElfRELA immediate JUMP_SLOT writer %s/%s "
                "slot=%p bridge=%p sym=%s\n",
-               kzt_patch_spike_result_name(record.result),
-               kzt_patch_spike_failure_name(record.failure), (void *)slot,
-               (void *)bridge_target, symbol_name ? symbol_name : "(none)");
+               kzt_patch_spike_result_name(result.record.result),
+               kzt_patch_spike_failure_name(result.record.failure),
+               (void *)slot, (void *)bridge_target,
+               symbol_name ? symbol_name : "(none)");
 
-    return record.result == KZT_PATCH_SPIKE_RESULT_APPLIED &&
-           record.skip_legacy_write;
+    return result.skip_legacy_write;
 }
 
 void ResetSpecialCaseMainElf(elfheader_t* h)

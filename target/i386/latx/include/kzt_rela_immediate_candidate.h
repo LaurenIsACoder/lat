@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "kzt_patch_planner.h"
+#include "kzt_patch_spike_writer.h"
 
 typedef enum kzt_rela_immediate_candidate_status {
     KZT_RELA_IMMEDIATE_CANDIDATE_SKIPPED = 0,
@@ -62,8 +63,22 @@ typedef struct kzt_rela_immediate_candidate_result {
     kzt_patch_decision_t decision;
 } kzt_rela_immediate_candidate_result_t;
 
+typedef struct kzt_rela_immediate_writer_result {
+    int planner_called;
+    int writer_called;
+    int skip_legacy_write;
+    kzt_rela_immediate_candidate_result_t plan;
+    kzt_patch_spike_record_t record;
+} kzt_rela_immediate_writer_result_t;
+
 int kzt_rela_immediate_jump_slot_plan(
     const kzt_rela_immediate_candidate_request_t *request,
     kzt_rela_immediate_candidate_result_t *result);
+
+int kzt_rela_immediate_jump_slot_try_write(
+    const kzt_rela_immediate_candidate_request_t *request,
+    kzt_patch_spike_guard_t *guard,
+    const kzt_patch_spike_slot_ops_t *slot_ops,
+    kzt_rela_immediate_writer_result_t *result);
 
 #endif
