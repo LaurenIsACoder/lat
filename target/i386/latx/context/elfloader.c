@@ -24,21 +24,40 @@
 #include "symbols.h"
 #include "lsenv.h"
 #include "kzt_rela_immediate_candidate.h"
+#include "kzt_patch_spike_writer.h"
 
 void* my__IO_2_1_stderr_ = NULL;
 void* my__IO_2_1_stdin_  = NULL;
 void* my__IO_2_1_stdout_ = NULL;
 
-static void RelocateElfRELAPlanImmediateJumpSlot(elfheader_t *head,
+static kzt_patch_spike_guard_t *RelocateElfRELAImmediateJumpSlotGuard(void)
+{
+    static kzt_patch_spike_guard_t guard;
+    static int guard_initialized;
+
+    if (!guard_initialized) {
+        kzt_patch_spike_config_t config;
+
+        kzt_patch_spike_config_from_options(&config);
+        kzt_patch_spike_guard_init(&guard, &config);
+        guard_initialized = 1;
+    }
+
+    return &guard;
+}
+
+static int RelocateElfRELATryImmediateJumpSlotWriter(elfheader_t *head,
     int need_resolv_present, int entry_index, Elf64_Rela *rela,
     uint64_t *slot, uintptr_t slot_current_value,
-    unsigned long symbol_index, const char *symbol_name, const char *version)
+    unsigned long symbol_index, const char *symbol_name, const char *version,
+    uintptr_t bridge_target)
 {
     kzt_rela_immediate_candidate_request_t request;
     kzt_rela_immediate_candidate_result_t result;
+    kzt_patch_spike_record_t record;
 
     if (!head || !rela || !slot) {
-        return;
+        return 0;
     }
 
     memset(&request, 0, sizeof(request));
@@ -63,8 +82,32 @@ static void RelocateElfRELAPlanImmediateJumpSlot(elfheader_t *head,
     request.version = version;
     request.owner_match = KZT_PATCH_OWNER_UNKNOWN;
     request.wrapper_match = KZT_PATCH_WRAPPER_NO_MANIFEST;
+    request.bridge_target = bridge_target;
 
-    (void)kzt_rela_immediate_jump_slot_plan(&request, &result);
+    if (kzt_rela_immediate_jump_slot_plan(&request, &result) != 0 ||
+        result.status != KZT_RELA_IMMEDIATE_CANDIDATE_PLANNED ||
+        !result.decision_present ||
+        result.decision.kind != KZT_PATCH_DECISION_APPROVED ||
+        !result.decision.allow_native_bridge) {
+        return 0;
+    }
+
+    memset(&record, 0, sizeof(record));
+    if (kzt_patch_spike_writer_try_apply(
+            RelocateElfRELAImmediateJumpSlotGuard(), &result.decision,
+            &record) != 0) {
+        return 0;
+    }
+
+    printf_log(LOG_DEBUG,
+               "KZT: RelocateElfRELA immediate JUMP_SLOT writer %s/%s "
+               "slot=%p bridge=%p sym=%s\n",
+               kzt_patch_spike_result_name(record.result),
+               kzt_patch_spike_failure_name(record.failure), (void *)slot,
+               (void *)bridge_target, symbol_name ? symbol_name : "(none)");
+
+    return record.result == KZT_PATCH_SPIKE_RESULT_APPLIED &&
+           record.skip_legacy_write;
 }
 
 void ResetSpecialCaseMainElf(elfheader_t* h)
@@ -728,12 +771,15 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
                   ) {
                     if (offs){
                         if(p) {
-                            printf_log(LOG_INFO, "RelocateElfRELA : Apply %s R_X86_64_JUMP_SLOT @%p with sym=%s (%p -> %p)\n", (bind==STB_LOCAL)?"Local":"Global", p, symname, *(void**)p, (void*)(offs+rela[i].r_addend));
-                            RelocateElfRELAPlanImmediateJumpSlot(
-                                head, need_resolv != NULL, i, &rela[i], p,
-                                (uintptr_t)(*p), ELF64_R_SYM(rela[i].r_info),
-                                symname, vername);
-                            *p =(uint64_t) (offs + rela[i].r_addend);
+                            uintptr_t bridge_target = offs + rela[i].r_addend;
+
+                            printf_log(LOG_INFO, "RelocateElfRELA : Apply %s R_X86_64_JUMP_SLOT @%p with sym=%s (%p -> %p)\n", (bind==STB_LOCAL)?"Local":"Global", p, symname, *(void**)p, (void*)bridge_target);
+                            if (!RelocateElfRELATryImmediateJumpSlotWriter(
+                                    head, need_resolv != NULL, i, &rela[i], p,
+                                    (uintptr_t)(*p), ELF64_R_SYM(rela[i].r_info),
+                                    symname, vername, bridge_target)) {
+                                *p = (uint64_t)bridge_target;
+                            }
                         } else {
                             printf_log(LOG_INFO, "Warning, Symbol %s found, but Jump Slot Offset is NULL \n", symname);
                         }
