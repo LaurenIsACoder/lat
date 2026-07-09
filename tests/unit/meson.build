@@ -144,6 +144,8 @@ kzt_rela_immediate_candidate_test = executable(
     'kzt/test_rela_immediate_candidate.c',
     '../../target/i386/latx/context/kzt_rela_immediate_candidate.c',
     '../../target/i386/latx/context/kzt_patch_planner.c',
+    '../../target/i386/latx/context/kzt_patch_spike_guard.c',
+    '../../target/i386/latx/context/kzt_patch_spike_writer.c',
   ),
   include_directories: include_directories('../..', '../../target/i386/latx/include'),
 )
