@@ -5,6 +5,9 @@
 #include "dictionnary.h"
 #include <link.h>
 #include "debug.h"
+#include "kzt_guest_library_binding.h"
+#include "kzt_guest_registry_context.h"
+#include "kzt_patch_spike_guard.h"
 
 typedef struct elfheader_s elfheader_t;
 typedef struct cleanup_s cleanup_t;
@@ -346,12 +349,29 @@ typedef struct box64context_s {
     int                 latx_kzt_debugcap;
     int                 latx_kzt_debugsize;        // number of latx_kzt_debug
 #endif
+#ifdef CONFIG_LATX_KZT
+    kzt_guest_registry_context_t kzt_guest_registry_context;
+    kzt_guest_library_access_t kzt_guest_library_access;
+    kzt_patch_spike_guard_t kzt_patch_spike_guard;
+    pthread_mutex_t kzt_bridge_mutex;
+    uintptr_t kzt_lazy_completion_bridge;
+#endif
 } box64context_t;
 
 extern box64context_t *my_context; // global context
 
 box64context_t *NewBox64Context(int argc);
 void FreeBox64Context(box64context_t** context);
+#ifdef CONFIG_LATX_KZT
+kzt_guest_registry_t *KztGuestRegistryForContext(box64context_t *context);
+kzt_guest_library_bindings_t *KztGuestLibraryBindingsForContext(
+    box64context_t *context);
+int KztGuestLibraryLookupForContext(
+    box64context_t *context,
+    const kzt_guest_library_binding_key_t *key,
+    kzt_guest_library_handle_t *handle);
+kzt_patch_spike_guard_t *KztPatchSpikeGuardForContext(box64context_t *context);
+#endif
 
 // return the index of the added header
 int AddElfHeader(box64context_t* ctx, elfheader_t* head);

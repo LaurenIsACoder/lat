@@ -9,8 +9,14 @@
 #include "config-host.h"
 #include "lsenv.h"
 #include "myalign.h"
+#include "debug.h"
+#include "elfmap.h"
 #include "elfloader.h"
 #include "elfloader_private.h"
+#ifdef CONFIG_LATX_KZT
+#include "kzt_observation_adapter.h"
+#include "kzt_guest_library_adapter.h"
+#endif
 #include <sys/epoll.h>
 #include <sys/sem.h>
 #include <sys/syscall.h>
@@ -41,6 +47,78 @@ typedef union {
 } mmx87_regs_t;
 
 static int regs_abi[] = {R_EDI, R_ESI, R_EDX, R_ECX, R_R8, R_R9};
+
+#ifdef CONFIG_LATX_KZT
+static int kzt_registry_debug_dump_line(const char *line, void *opaque)
+{
+    (void)opaque;
+
+    printf_kzt_registry_diagnostics("%s\n", line);
+    return 0;
+}
+
+static int kzt_main_elf_identity(
+    const elfheader_t *head,
+    kzt_guest_link_map_identity_t *identity)
+{
+    size_t i;
+
+    if (!head || !identity || !head->PHEntries) {
+        return -1;
+    }
+    memset(identity, 0, sizeof(*identity));
+    for (i = 0; i < head->numPHEntries; ++i) {
+        const Elf64_Phdr *entry = &head->PHEntries[i];
+
+        if (entry->p_type != PT_DYNAMIC) {
+            continue;
+        }
+        if (head->delta < 0 ||
+            entry->p_vaddr > UINTPTR_MAX - (uintptr_t)head->delta) {
+            return -1;
+        }
+        identity->load_bias = (uintptr_t)head->delta;
+        identity->dynamic_addr = entry->p_vaddr + identity->load_bias;
+        return identity->dynamic_addr ? 0 : -1;
+    }
+    return -1;
+}
+
+static void kzt_callback_diagnostic_log(
+    const kzt_observation_adapter_diagnostic_t *diagnostic,
+    void *opaque)
+{
+    if (!diagnostic) {
+        return;
+    }
+
+    printf_kzt_registry_diagnostics(
+        "KZT registry callback result=%d link_map=0x%lx "
+        "registry_result=%d generation=%lu objects=%lu "
+        "observed=%lu suppressed=%lu\n",
+        diagnostic->result, (unsigned long)diagnostic->link_map_addr,
+        diagnostic->registry.result, diagnostic->registry.generation,
+        diagnostic->registry.object_count,
+        diagnostic->registry.result_observations,
+        diagnostic->registry.result_suppressed);
+
+    if (opaque) {
+        (void)kzt_guest_registry_dump_text(opaque, kzt_registry_debug_dump_line,
+                                           NULL);
+    }
+
+    if (diagnostic->dynamic.comparison_attempted) {
+        char summary[1024];
+
+        if (kzt_guest_dynamic_diagnostics_format_summary(
+                &diagnostic->dynamic.comparison, summary,
+                sizeof(summary)) == 0) {
+            printf_kzt_registry_diagnostics("%s\n", summary);
+        }
+    }
+}
+#endif
+
 uintptr_t getVArgs(int pos, uintptr_t* b, int N)
 {
     CPUX86State *cpu = (CPUX86State *)lsenv->cpu_state;
@@ -2222,30 +2300,105 @@ static char* kzt_find_realsofilepath(char * filepath, char *filetmp)
     return filepath;
 }
 extern const char* libcName;
-static void kzt_tb_callback(CPUX86State *env)
+#ifdef CONFIG_LATX_KZT
+static int kzt_callback_read_memory(uintptr_t guest_addr,
+                                    void *dst,
+                                    size_t size,
+                                    void *opaque)
 {
-    struct link_map_x64 * my_lm = (struct link_map_x64 *)env->regs[R_EAX + ld_info->reg];
+    void *host_ptr;
+
+    (void)opaque;
+    if (!dst && size) {
+        return -1;
+    }
+    if (!size) {
+        return 0;
+    }
+
+    host_ptr = lock_user(VERIFY_READ, (abi_ulong)guest_addr, size, true);
+    if (!host_ptr) {
+        return -1;
+    }
+
+    memcpy(dst, host_ptr, size);
+    unlock_user(host_ptr, (abi_ulong)guest_addr, 0);
+    return 0;
+}
+#endif
+
+static int kzt_tb_callback_legacy(uintptr_t link_map_addr, void *opaque)
+{
+    const kzt_guest_library_loader_scope_t *loader_scope = opaque;
+#ifdef CONFIG_LATX_KZT
+    int loader_scope_active = loader_scope && loader_scope->bindings &&
+                              loader_scope->identity && loader_scope->cookie;
+#endif
+    struct link_map_x64 * my_lm = (struct link_map_x64 *)link_map_addr;
     elfheader_t *h = NULL;
-    if ((!my_lm ||!my_lm->l_name ||!strlen(my_lm->l_name) || ! my_lm->l_addr)&& my_lm->l_addr != info1.load_addr) {
+#ifdef CONFIG_LATX_KZT
+    int relocate_result;
+    int relocate_plt_result;
+#endif
+    uintptr_t map_start = 0;
+    uintptr_t map_end = 0;
+    if (!my_lm) {
+        printf_log(LOG_DEBUG, "error %d debug %s link_map = %p\n",
+                   getpid(), __func__, my_lm);
+        return 0;
+    }
+    if (!my_lm->l_name) {
+        printf_log(LOG_DEBUG,
+                   "error %d debug %s link_map = %p{0x%lx, <null>}\n",
+                   getpid(), __func__, my_lm, my_lm->l_addr);
+        return 0;
+    }
+    if ((!my_lm->l_name[0] || !my_lm->l_addr) &&
+        my_lm->l_addr != info1.load_addr) {
         printf_log(LOG_DEBUG, "error %d debug %s link_map = %p{0x%lx, %s}\n", getpid(), __func__, my_lm, my_lm->l_addr, my_lm->l_name);
-        return;
+        return 0;
     }
     printf_log(LOG_DEBUG, "%d debug %s link_map = %p{0x%lx, %s}\n", getpid(), __func__, my_lm, my_lm->l_addr, my_lm->l_name);
     char * rfilename = my_lm->l_name;
-    if (strstr(basename(rfilename), "ld-linux-x86-64.so.2")) {
-        AddDebugInfo(LIB_EMULATED, my_lm->l_name, my_lm->l_map_start, my_lm->l_map_end);
-        return;
-    }
     char filetmp[PATH_MAX] = {0};
     if (rfilename[0] == '/') {
         rfilename = kzt_find_realsofilepath(rfilename, filetmp);
     }
-    char * rbasename = basename(rfilename);
-    library_t* lib = NewLibrary(rbasename, my_context);
-    if (lib) {
-        const char* libs[] = {rbasename};
-        AddNeededLib(my_context->maplib, &my_context->neededlibs, NULL, 0, 1, libs, 1, my_context);
+    if (strstr(basename(rfilename), "ld-linux-x86-64.so.2")) {
+        FILE *loader_file = fopen(rfilename, "rb");
+        elfheader_t *loader_header = loader_file ?
+            LoadAndCheckElfHeader(loader_file, rfilename, 0) : NULL;
+
+        if (loader_file) {
+            fclose(loader_file);
+        }
+        if (loader_header &&
+            GetElfLoadRange(loader_header->PHEntries,
+                            loader_header->numPHEntries, my_lm->l_addr,
+                            TARGET_PAGE_SIZE, &map_start, &map_end) == 0) {
+            AddDebugInfo(LIB_EMULATED, my_lm->l_name,
+                         map_start, map_end);
+        } else {
+            printf_log(LOG_INFO,
+                       "KZT: cannot determine loader range for %s\n",
+                       my_lm->l_name);
+        }
+        FreeElfHeader(&loader_header);
+        return 0;
     }
+    char * rbasename = basename(rfilename);
+    library_t* lib = NULL;
+    (void)AddNeededLibWithLibrary(
+        my_context->maplib, &my_context->neededlibs, NULL, 0, 1,
+        rbasename, my_context, &lib);
+#ifdef CONFIG_LATX_KZT
+    /* AddNeededLibWithLibrary returns the exact instance selected/created by
+     * this callback operation; no basename lookup is used for binding. */
+    if (loader_scope_active) {
+        kzt_guest_library_note_loader_pair_pending(
+            my_context, loader_scope, link_map_addr, lib);
+    }
+#endif
     if (!lib && (!strncmp(rbasename, "libSDL", 6)||!strncmp(rbasename, "libCgGL.so", strlen("libCgGL.so")))) {
         printf_log(LOG_DEBUG, "%s libSDL need libGL.so.1\n", __func__);
         const char* libs[] = {"libGL.so.1"};
@@ -2254,9 +2407,15 @@ static void kzt_tb_callback(CPUX86State *env)
     FILE *f = fopen(rfilename, "rb");
     if(!f) {
         printf_log(LOG_INFO, "%s Error: Cannot open \"%s\"\n", __func__, rfilename);
-        return;
+        return 0;
     }
     h = LoadAndCheckElfHeader(f, rfilename, 0);
+    if (!h) {
+        fclose(f);
+        printf_log(LOG_INFO, "%s Error: Cannot load ELF header for \"%s\"\n",
+                   __func__, rfilename);
+        return 0;
+    }
     ElfHeadReFix(h, my_lm->l_addr);
     fclose(f);
     collectX86free(h);
@@ -2271,13 +2430,109 @@ static void kzt_tb_callback(CPUX86State *env)
     }
     AddElfHeader(my_context, h);
     LoadNeededLibs(h, my_context->maplib, &my_context->neededlibs, NULL, 0, 0, my_context);
+#ifdef CONFIG_LATX_KZT
+    relocate_result = RelocateElf(my_context->maplib, NULL, 0, h);
+    relocate_plt_result = RelocateElfPlt(my_context->maplib, NULL, 0, h);
+    /* Startup loading has no dlopen scope to publish the pair later.  The
+       callback gate remains held until this function returns.  Failed
+       relocation keeps the legacy fail-open path without publishing. */
+    if (lib && !loader_scope_active && relocate_result == 0 &&
+        relocate_plt_result == 0) {
+        kzt_guest_library_note_loader_pair(my_context, link_map_addr, lib);
+    }
+#else
     RelocateElf(my_context->maplib, NULL, 0, h);
     RelocateElfPlt(my_context->maplib, NULL, 0, h);
-    if (lib) {
-        AddDebugInfo(LIB_WRAPPED, my_lm->l_name, my_lm->l_map_start, my_lm->l_map_end);
+#endif
+    if (GetElfLoadRange(h->PHEntries, h->numPHEntries, h->delta,
+                        TARGET_PAGE_SIZE, &map_start, &map_end) == 0) {
+        AddDebugInfo(lib ? LIB_WRAPPED : LIB_EMULATED, my_lm->l_name,
+                     map_start, map_end);
     } else {
-        AddDebugInfo(LIB_EMULATED, my_lm->l_name, my_lm->l_map_start, my_lm->l_map_end);
+        printf_log(LOG_INFO,
+                   "KZT: cannot determine ELF load range for %s\n",
+                   my_lm->l_name);
     }
+    return 0;
+}
+
+static void kzt_tb_callback(CPUX86State *env)
+{
+    uintptr_t link_map_addr = env->regs[R_EAX + ld_info->reg];
+#ifdef CONFIG_LATX_KZT
+    kzt_guest_registry_t *registry = KztGuestRegistryForContext(my_context);
+    int diagnostics_enabled = kzt_registry_diagnostics_enabled();
+    kzt_guest_registry_diagnostic_config_t diagnostic_config = {
+        .enabled = diagnostics_enabled,
+        .throttle_limit = 1,
+    };
+    const kzt_guest_link_map_reader_ops_t reader_ops = {
+        .read_memory = kzt_callback_read_memory,
+        .opaque = NULL,
+    };
+    kzt_guest_link_map_identity_t main_identity = { 0 };
+    kzt_guest_link_map_identity_t object_identity = { 0 };
+    uintptr_t confirmed_main_head = 0;
+    uintptr_t namespace_head = 0;
+    uintptr_t predecessor = 0;
+    int main_namespace;
+
+    (void)kzt_guest_registry_context_get_main_namespace_head(
+        &my_context->kzt_guest_registry_context, &confirmed_main_head);
+    if (kzt_guest_link_map_read_identity(
+            link_map_addr, &reader_ops, &object_identity) != 0) {
+        main_namespace = -1;
+    } else if (confirmed_main_head &&
+               kzt_guest_registry_context_has_main_namespace_evidence(
+                   &my_context->kzt_guest_registry_context, registry,
+                   link_map_addr, object_identity.load_bias,
+                   object_identity.dynamic_addr)) {
+        main_namespace = 1;
+    } else {
+        if (confirmed_main_head &&
+            kzt_guest_link_map_read_predecessor(
+                link_map_addr, &reader_ops, &predecessor) == 0 &&
+            predecessor == confirmed_main_head) {
+            main_namespace = 1;
+        } else if (confirmed_main_head ||
+            kzt_main_elf_identity(elf_header, &main_identity) == 0) {
+            main_namespace = kzt_guest_link_map_classify_namespace(
+                link_map_addr, &main_identity, confirmed_main_head, &reader_ops,
+                &namespace_head);
+        } else {
+            main_namespace = -1;
+        }
+    }
+    if (main_namespace == 1 && !confirmed_main_head &&
+        kzt_guest_registry_context_confirm_main_namespace_head(
+            &my_context->kzt_guest_registry_context,
+            &my_context->mutex_lock, namespace_head) != 0) {
+        main_namespace = -1;
+    }
+    kzt_observation_adapter_request_t request = {
+        .enabled = option_kzt || wine_option_kzt,
+        .diagnostics_enabled = diagnostics_enabled,
+        .link_map_addr = link_map_addr,
+        .registry = registry,
+        .library_bindings = KztGuestLibraryBindingsForContext(my_context),
+        .loader_scope = &env->kzt_guest_library_loader_scope,
+        .reader_ops = &reader_ops,
+        .namespace_id_present = main_namespace == 1,
+        .namespace_id = 0,
+        .legacy_flow = kzt_tb_callback_legacy,
+        .legacy_opaque = &env->kzt_guest_library_loader_scope,
+        .diagnostic = kzt_callback_diagnostic_log,
+        .diagnostic_opaque = registry,
+    };
+
+    if (registry && diagnostics_enabled) {
+        (void)kzt_guest_registry_configure_diagnostics(registry,
+                                                       &diagnostic_config);
+    }
+    (void)kzt_observe_guest_object_from_callback(&request, NULL);
+#else
+    (void)kzt_tb_callback_legacy(link_map_addr, env);
+#endif
 }
 static TranslationBlock* test_tb;
 static void test_x86free(CPUX86State *env)

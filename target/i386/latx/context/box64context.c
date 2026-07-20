@@ -19,10 +19,18 @@
 #include "librarian.h"
 #include "library.h"
 #include "wrapper.h"
+#ifdef CONFIG_LATX_KZT
+#include "kzt_guest_registry.h"
+#include "kzt_guest_registry_context.h"
+#include "kzt_guest_library_binding.h"
+#endif
 #include <pthread.h>
 
 box64context_t *NewBox64Context(int argc)
 {
+#ifdef CONFIG_LATX_KZT
+    kzt_patch_spike_config_t patch_spike_config;
+#endif
     // init and put default values
     box64context_t *context = (box64context_t*)box_calloc(1, sizeof(box64context_t));
 
@@ -38,8 +46,54 @@ box64context_t *NewBox64Context(int argc)
     context->argc = argc;
     context->argv = (char**)box_calloc(context->argc+1, sizeof(char*));
     pthread_mutex_init(&context->mutex_lock, NULL);
+#ifdef CONFIG_LATX_KZT
+    /* Optional acceleration metadata is created on first KZT use so a
+     * context that never observes a guest link-map keeps the old footprint. */
+    pthread_mutex_init(&context->kzt_bridge_mutex, NULL);
+    (void)kzt_guest_library_access_init(&context->kzt_guest_library_access);
+    kzt_patch_spike_config_from_options(&patch_spike_config);
+    kzt_patch_spike_guard_init(&context->kzt_patch_spike_guard,
+                               &patch_spike_config);
+#endif
 
     return context;
+}
+
+#ifdef CONFIG_LATX_KZT
+kzt_guest_registry_t *KztGuestRegistryForContext(box64context_t *context)
+{
+    if (!context) {
+        return NULL;
+    }
+    return kzt_guest_registry_context_get(
+        &context->kzt_guest_registry_context, &context->mutex_lock);
+}
+
+kzt_guest_library_bindings_t *KztGuestLibraryBindingsForContext(box64context_t *context)
+{
+    return context ? context->kzt_guest_library_access.bindings : NULL;
+}
+
+int KztGuestLibraryLookupForContext(
+    box64context_t *context,
+    const kzt_guest_library_binding_key_t *key,
+    kzt_guest_library_handle_t *handle)
+{
+    return context
+               ? kzt_guest_library_access_lookup(
+                     &context->kzt_guest_library_access, key, handle)
+               : -1;
+}
+#endif
+
+kzt_patch_spike_guard_t *KztPatchSpikeGuardForContext(box64context_t *context)
+{
+#ifdef CONFIG_LATX_KZT
+    return context ? &context->kzt_patch_spike_guard : NULL;
+#else
+    (void)context;
+    return NULL;
+#endif
 }
 
 EXPORTDYN
@@ -53,10 +107,25 @@ void FreeBox64Context(box64context_t** context)
 
     box64context_t* ctx = *context;   // local copy to do the cleanning
 
+#ifdef CONFIG_LATX_KZT
+    /* FreeBox64Context is entered only after guest execution and loader
+     * callbacks have stopped. Close the context-owned lookup gate first and
+     * drain acquired handles, while keeping registry/binding storage alive
+     * for the librarian destruction pass below. */
+    kzt_guest_library_access_begin_teardown(
+        &ctx->kzt_guest_library_access);
+#endif
+
     if(ctx->local_maplib)
         FreeLibrarian(&ctx->local_maplib);
     if(ctx->maplib)
         FreeLibrarian(&ctx->maplib);
+#ifdef CONFIG_LATX_KZT
+    kzt_guest_library_access_destroy(&ctx->kzt_guest_library_access);
+    kzt_guest_registry_context_destroy(&ctx->kzt_guest_registry_context,
+                                       &ctx->mutex_lock);
+    pthread_mutex_destroy(&ctx->kzt_bridge_mutex);
+#endif
     FreeDictionnary(&ctx->versym);
 
     for(int i=0; i<ctx->elfsize; ++i) {

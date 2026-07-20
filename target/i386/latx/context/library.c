@@ -29,6 +29,10 @@
 #include "librarian.h"
 #include "librarian_private.h"
 #include "pathcoll.h"
+#ifdef CONFIG_LATX_KZT
+#include "kzt_guest_library_adapter.h"
+#include "kzt_guest_library_binding.h"
+#endif
 
 #define GO(P, N) int wrapped##N##_init(library_t* lib, box64context_t *box64); \
                  void wrapped##N##_fini(library_t* lib); \
@@ -352,7 +356,6 @@ int AddSymbolsLibrary(lib_t *maplib, library_t* lib)
 
 int ReloadLibrary(library_t* lib)
 {
-    lib->active = 1;
     if(lib->type == LIB_EMULATED) {
         elfheader_t *elf_header = lib->context->elfs[lib->priv.n.elf_index];
         // reload image in memory and re-run the mapping
@@ -383,8 +386,21 @@ int ReloadLibrary(library_t* lib)
             printf_log(LOG_NONE, "Error: relocating symbols in elf %s\n", lib->name);
             return 1;
         }
-        RelocateElfPlt(lib->context->maplib, lib->maplib, 0, elf_header);
+        if(RelocateElfPlt(lib->context->maplib, lib->maplib, 0, elf_header)) {
+            printf_log(LOG_NONE, "Error: relocating PLT symbols in elf %s\n", lib->name);
+            return 1;
+        }
     }
+    lib->active = 1;
+#ifdef CONFIG_LATX_KZT
+    /* Publish only after every reload step has succeeded. On failure the
+     * binding lifecycle remains DEAD and no exact pair is left pending. */
+    if (kzt_guest_library_reactivate(
+            KztGuestLibraryBindingsForContext(lib->context), lib) == 0 &&
+        lib->x86linkmap)
+        kzt_guest_library_note_loader_pair(
+            lib->context, (uintptr_t)lib->x86linkmap, lib);
+#endif
     return 0;
 }
 void InactiveLibrary(library_t* lib)

@@ -31,6 +31,19 @@
 #include "dictionnary.h"
 #include "symbols.h"
 #include "lsenv.h"
+#include "kzt_rela_stub_detector.h"
+#include "kzt_guest_registry.h"
+#include "kzt_observation_adapter.h"
+#include "kzt_jump_slot_production.h"
+#include "kzt_lazy_diagnostics.h"
+#include "kzt_plt_resolver_adapter.h"
+#include "elf_plt_relocation.h"
+#include "elfmap.h"
+
+#ifdef CONFIG_LATX_KZT
+#include "qemu.h"
+extern int wine_option_kzt;
+#endif
 
 void* my__IO_2_1_stderr_ = NULL;
 void* my__IO_2_1_stdin_  = NULL;
@@ -649,6 +662,7 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
         uint64_t *p = (uint64_t*)(rela[i].r_offset + head->delta);
         uintptr_t offs = 0;
         uintptr_t end = 0;
+        library_t *resolved_provider = NULL;
         int version = head->VerSym?((Elf64_Half*)((uintptr_t)head->VerSym+head->delta))[ELF64_R_SYM(rela[i].r_info)]:-1;
         if(version!=-1) version &=0x7fff;
         const char* vername = GetSymbolVersion(head, version);
@@ -664,9 +678,13 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
             }*/
             // so weak symbol are the one left
             if(!offs && !end) {
-                GetGlobalSymbolStartEnd(maplib, symname, &offs, &end, head, version, vername);
+                GetGlobalSymbolStartEndWithProvider(
+                    maplib, symname, &offs, &end, head, version, vername,
+                    &resolved_provider);
                 if(!offs && !end && local_maplib) {
-                    GetGlobalSymbolStartEnd(local_maplib, symname, &offs, &end, head, version, vername);
+                    GetGlobalSymbolStartEndWithProvider(
+                        local_maplib, symname, &offs, &end, head, version,
+                        vername, &resolved_provider);
                 }
             }
         }
@@ -685,19 +703,64 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
                         *p = offs/* + rela[i].r_addend*/;   // not addend it seems
                     }
                 break;
-            case R_X86_64_JUMP_SLOT:
+            case R_X86_64_JUMP_SLOT: {
                 // apply immediatly for gobject closure marshal or for LOCAL binding. Also, apply immediatly if it doesn't jump in the got
-                tmp = (uintptr_t)(*p);
+                uintptr_t slot_observation = (uintptr_t)(*p);
+                uintptr_t expected_guest_target = slot_observation;
+                uintptr_t legacy_target = offs + rela[i].r_addend;
+                int slot_is_unresolved_stub =
+                    kzt_rela_slot_current_is_unresolved_stub(
+                        slot_observation,
+                        KZT_RELA_STUB_COORDINATE_RUNTIME_REBASED,
+                        head->delta, head->plt, head->plt_end,
+                        head->gotplt, head->gotplt_end);
+                tmp = slot_observation;
                 if (bind==STB_LOCAL 
                   || !tmp
                   || !((tmp>=head->plt && tmp<head->plt_end) || (tmp>=head->gotplt && tmp<head->gotplt_end))
                   || !need_resolv
                   || bindnow
-                  ) {
+                ) {
                     if (offs){
                         if(p) {
+#ifdef CONFIG_LATX_KZT
+                            if (option_kzt || wine_option_kzt) {
+                                kzt_jump_slot_route_result_t route_result;
+
+                                if (kzt_production_jump_slot_route(
+                                        my_context, resolved_provider,
+                                        legacy_target, head,
+                                        need_resolv != NULL, i,
+                                        &rela[i], p,
+                                    slot_observation,
+                                        slot_is_unresolved_stub,
+                                        ELF64_R_SYM(rela[i].r_info),
+                                        symname, vername,
+                                        1, expected_guest_target,
+                                        legacy_target,
+                                        &route_result) == 0 &&
+                                    route_result.status ==
+                                        KZT_JUMP_SLOT_ROUTE_NATIVE_APPLIED) {
+                                    break;
+                                }
+                                if (route_result.status ==
+                                        KZT_JUMP_SLOT_ROUTE_GUEST_PRESERVED ||
+                                    route_result.status ==
+                                        KZT_JUMP_SLOT_ROUTE_CAS_MISMATCH) {
+                                    break;
+                                }
+                                printf_kzt_registry_diagnostics(
+                                    "KZT eager route fallback slot=%p "
+                                    "observed=%p legacy=%p selected=%p "
+                                    "status=%d symbol=%s\n",
+                                    p, (void *)slot_observation, (void*)legacy_target,
+                                    (void *)route_result.selected_target,
+                                    route_result.status,
+                                    symname ? symname : "(none)");
+                            }
+#endif
                             printf_log(LOG_INFO, "RelocateElfRELA : Apply %s R_X86_64_JUMP_SLOT @%p with sym=%s (%p -> %p)\n", (bind==STB_LOCAL)?"Local":"Global", p, symname, *(void**)p, (void*)(offs+rela[i].r_addend));
-                            *p =(uint64_t) (offs + rela[i].r_addend);
+                            *p =(uint64_t) legacy_target;
                         } else {
                             printf_log(LOG_INFO, "Warning, Symbol %s found, but Jump Slot Offset is NULL \n", symname);
                         }
@@ -709,6 +772,7 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
                     *need_resolv = 1;
                 }
                 break;
+            }
             /*
             case R_X86_64_NONE:
                 break;
@@ -730,9 +794,189 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
     return 0;
 }
 
+typedef struct elf_plt_rela_context {
+    lib_t *maplib;
+    lib_t *local_maplib;
+    int bindnow;
+    elfheader_t *head;
+    int count;
+    Elf64_Rela *rela;
+} elf_plt_rela_context_t;
+
+static int RelocateElfPltRELA(void *opaque, int *need_resolver)
+{
+    elf_plt_rela_context_t *rela = opaque;
+    return RelocateElfRELA(rela->maplib, rela->local_maplib, rela->bindnow,
+                           rela->head, rela->count, rela->rela,
+                           need_resolver);
+}
+
+#ifdef CONFIG_LATX_KZT
+static void KztLazyBindingCompleteResolver(void);
+
+static int kzt_elfloader_read_guest_memory(uintptr_t guest_addr, void *dst,
+                                           size_t size, void *opaque)
+{
+    void *host_ptr;
+
+    (void)opaque;
+    if ((!dst && size) || (!guest_addr && size)) {
+        return -1;
+    }
+    if (!size) {
+        return 0;
+    }
+    host_ptr = lock_user(VERIFY_READ, (abi_ulong)guest_addr, size, true);
+    if (!host_ptr) {
+        return -1;
+    }
+    memcpy(dst, host_ptr, size);
+    unlock_user(host_ptr, (abi_ulong)guest_addr, 0);
+    return 0;
+}
+
+static int kzt_elfloader_head_identity(
+    const elfheader_t *head,
+    kzt_guest_link_map_identity_t *identity)
+{
+    size_t i;
+
+    if (!head || !identity || !head->PHEntries) {
+        return -1;
+    }
+    memset(identity, 0, sizeof(*identity));
+    for (i = 0; i < head->numPHEntries; ++i) {
+        const Elf64_Phdr *entry = &head->PHEntries[i];
+
+        if (entry->p_type != PT_DYNAMIC) {
+            continue;
+        }
+        if (head->delta < 0 ||
+            entry->p_vaddr > UINTPTR_MAX - (uintptr_t)head->delta) {
+            return -1;
+        }
+        identity->load_bias = (uintptr_t)head->delta;
+        identity->dynamic_addr = entry->p_vaddr + identity->load_bias;
+        return identity->dynamic_addr ? 0 : -1;
+    }
+    return -1;
+}
+
+static void kzt_observe_plt_source(elfheader_t *head,
+                                   uintptr_t guest_link_map,
+                                   const kzt_guest_link_map_identity_t *object_identity)
+{
+    const kzt_guest_link_map_reader_ops_t reader_ops = {
+        .read_memory = kzt_elfloader_read_guest_memory,
+    };
+    kzt_observation_adapter_request_t request;
+    kzt_observation_adapter_result_t result;
+    uintptr_t map_start = 0;
+    uintptr_t map_end = 0;
+    uintptr_t confirmed_main_head = 0;
+    uintptr_t namespace_head = 0;
+    uintptr_t predecessor = 0;
+    kzt_guest_registry_t *registry;
+    kzt_guest_link_map_identity_t main_identity = { 0 };
+    int main_namespace;
+    int range_available;
+
+    if (!head || !guest_link_map || !(option_kzt || wine_option_kzt)) {
+        return;
+    }
+    registry = KztGuestRegistryForContext(my_context);
+    (void)kzt_guest_registry_context_get_main_namespace_head(
+        &my_context->kzt_guest_registry_context, &confirmed_main_head);
+    if (confirmed_main_head && object_identity &&
+        kzt_guest_registry_context_has_main_namespace_evidence(
+            &my_context->kzt_guest_registry_context, registry,
+            guest_link_map, object_identity->load_bias,
+            object_identity->dynamic_addr)) {
+        main_namespace = 1;
+    } else {
+        if (confirmed_main_head &&
+            kzt_guest_link_map_read_predecessor(
+                guest_link_map, &reader_ops, &predecessor) == 0 &&
+            predecessor == confirmed_main_head) {
+            main_namespace = 1;
+        } else if (confirmed_main_head ||
+            kzt_elfloader_head_identity(elf_header, &main_identity) == 0) {
+            main_namespace = kzt_guest_link_map_classify_namespace(
+                guest_link_map, &main_identity, confirmed_main_head, &reader_ops,
+                &namespace_head);
+        } else {
+            main_namespace = -1;
+        }
+        if (main_namespace == 1 && !confirmed_main_head &&
+            kzt_guest_registry_context_confirm_main_namespace_head(
+                &my_context->kzt_guest_registry_context,
+                &my_context->mutex_lock, namespace_head) != 0) {
+            main_namespace = -1;
+        }
+    }
+    range_available = GetElfLoadRange(
+        head->PHEntries, head->numPHEntries, head->delta, TARGET_PAGE_SIZE,
+        &map_start, &map_end) == 0;
+    memset(&request, 0, sizeof(request));
+    request.enabled = 1;
+    request.link_map_addr = guest_link_map;
+    request.registry = registry;
+    request.library_bindings =
+        KztGuestLibraryBindingsForContext(my_context);
+    request.reader_ops = &reader_ops;
+    request.namespace_id_present = main_namespace == 1;
+    request.namespace_id = 0;
+    request.map_range_present = range_available;
+    request.map_start = map_start;
+    request.map_end = map_end;
+    result = KZT_OBSERVATION_ADAPTER_DISABLED;
+    (void)kzt_observe_guest_object_from_callback(&request, &result);
+    printf_kzt_registry_diagnostics(
+        "KZT PLT source observation result=%d link_map=0x%lx "
+        "main_namespace=%d map_start=0x%lx map_end=0x%lx\n",
+        result, (unsigned long)guest_link_map, main_namespace,
+        (unsigned long)map_start, (unsigned long)map_end);
+}
+#endif
+
 int RelocateElfPlt(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t* head)
 {
     int need_resolver = 0;
+    uintptr_t resolver_got = head->pltgot ? head->pltgot : head->got;
+    uintptr_t resolver_got_runtime = resolver_got ?
+        resolver_got + head->delta : 0;
+    uintptr_t guest_link_map = 0;
+    uintptr_t guest_resolver = 0;
+#ifdef CONFIG_LATX_KZT
+    uintptr_t kzt_evidence_got = head->pltgot;
+    uintptr_t kzt_evidence_got_runtime = kzt_evidence_got ?
+        kzt_evidence_got + head->delta : 0;
+    kzt_guest_link_map_identity_t expected_identity = { 0 };
+    kzt_guest_link_map_identity_t observed_identity = { 0 };
+    int resolver_snapshot_available = 0;
+
+    if (kzt_evidence_got_runtime && (option_kzt || wine_option_kzt) &&
+        kzt_elfloader_head_identity(head, &expected_identity) == 0 &&
+        kzt_elfloader_read_guest_memory(
+            kzt_evidence_got_runtime + 8, &guest_link_map,
+            sizeof(guest_link_map), NULL) == 0 &&
+        kzt_elfloader_read_guest_memory(
+            kzt_evidence_got_runtime + 16, &guest_resolver,
+            sizeof(guest_resolver), NULL) == 0 && guest_resolver &&
+        kzt_guest_link_map_read_identity(
+            guest_link_map,
+            &(kzt_guest_link_map_reader_ops_t) {
+                .read_memory = kzt_elfloader_read_guest_memory,
+            },
+            &observed_identity) == 0 &&
+        kzt_guest_link_map_identity_matches(
+            &observed_identity, expected_identity.load_bias,
+            expected_identity.dynamic_addr)) {
+        resolver_snapshot_available = 1;
+        kzt_observe_plt_source(head, guest_link_map, &observed_identity);
+        head->self_link_map = guest_link_map;
+    }
+#endif
     head->had_RelocateElfPlt = 1;
     if(head->pltrel) {
         int cnt = head->pltsz / head->pltent;
@@ -743,32 +987,83 @@ int RelocateElfPlt(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t*
             //    return -1;
             return 0;
         } else if(head->pltrel==DT_RELA) {
+            elf_plt_rela_context_t rela = {
+                .maplib = maplib,
+                .local_maplib = local_maplib,
+                .bindnow = bindnow,
+                .head = head,
+                .count = cnt,
+                .rela = (Elf64_Rela *)(head->jmprel + head->delta),
+            };
             DumpRelATable(head, cnt, (Elf64_Rela *)(head->jmprel + head->delta), "PLT");
             printf_log(LOG_INFO, "Applying %d PLT Relocation(s) with Addend for %s\n", cnt, head->name);
-            if(RelocateElfRELA(maplib, local_maplib, bindnow, head, cnt, (Elf64_Rela *)(head->jmprel + head->delta), &need_resolver))
-                //return -1;
+            if(elf_plt_relocation_apply(RelocateElfPltRELA, &rela,
+                                        &need_resolver)) {
                 printf_log(LOG_INFO, "RelocateElfRELA run ERROR!");
+                return -1;
+            }
         }
         if(need_resolver) {
             if(pltResolver==~0LL) {
                 pltResolver = AddBridge(my_context->system, vFE, PltResolver, 0, "PltResolver");
             }
-            if(head->pltgot) {
-                if(dl_runtime_resolver ==~0LL){
-                    dl_runtime_resolver =  *(uintptr_t*)(head->pltgot+head->delta+16);
+#ifdef CONFIG_LATX_KZT
+            if ((option_kzt || wine_option_kzt) &&
+                !my_context->kzt_lazy_completion_bridge) {
+                my_context->kzt_lazy_completion_bridge = AddBridge(
+                    my_context->system, vFE,
+                    KztLazyBindingCompleteResolver, 0,
+                    "KztLazyBindingCompleteResolver");
+            }
+#endif
+            if(resolver_got_runtime) {
+#ifdef CONFIG_LATX_KZT
+                if (!resolver_snapshot_available) {
+#endif
+                    guest_link_map =
+                        *(uintptr_t *)(resolver_got_runtime + 8);
+                    guest_resolver =
+                        *(uintptr_t *)(resolver_got_runtime + 16);
+#ifdef CONFIG_LATX_KZT
                 }
-                *(uintptr_t*)(head->pltgot+head->delta+16) = pltResolver;
-                head->self_link_map = *(uintptr_t*)(head->pltgot+head->delta+8);
-                *(uintptr_t*)(head->pltgot+head->delta+8) = (uintptr_t)head;
-                printf_log(LOG_INFO, "PLT Resolver injected in plt.got at %p\n", (void*)(head->pltgot+head->delta+16));
-            } else if(head->got) {
+#endif
+#ifdef CONFIG_LATX_KZT
+                if (option_kzt || wine_option_kzt) {
+                    kzt_guest_object_snapshot_t *snapshot = NULL;
+                    kzt_guest_lazy_resolver_t resolver = {
+                        .link_map_slot = resolver_got_runtime + 8,
+                        .resolver_slot = resolver_got_runtime + 16,
+                        .guest_link_map = guest_link_map,
+                        .guest_resolver = guest_resolver,
+                    };
+                    if (kzt_guest_registry_find_by_link_map(
+                            KztGuestRegistryForContext(my_context),
+                            guest_link_map, &snapshot) == 0 && snapshot &&
+                        snapshot->namespace_id.status == KZT_GUEST_FIELD_OK &&
+                        snapshot->namespace_id.value == 0) {
+                        (void)kzt_guest_registry_publish_lazy_resolver(
+                            KztGuestRegistryForContext(my_context),
+                            guest_link_map, snapshot->generation, 0,
+                            &resolver);
+                    }
+                    kzt_guest_object_snapshot_free(snapshot);
+                }
+#endif
                 if(dl_runtime_resolver ==~0LL){
                     dl_runtime_resolver =  *(uintptr_t*)(head->got+head->delta+16);
                 }
-                *(uintptr_t*)(head->got+head->delta+16) = pltResolver;
-                head->self_link_map = *(uintptr_t*)(head->got+head->delta+8);
-                *(uintptr_t*)(head->got+head->delta+8) = (uintptr_t)head;
-                printf_log(LOG_INFO, "PLT Resolver injected in got at %p\n", (void*)(head->got+head->delta+16));
+                *(uintptr_t*)(resolver_got_runtime+16) = pltResolver;
+#ifdef CONFIG_LATX_KZT
+                if (!(option_kzt || wine_option_kzt) ||
+                    resolver_snapshot_available) {
+                    head->self_link_map = guest_link_map;
+                }
+#else
+                head->self_link_map = guest_link_map;
+#endif
+                *(uintptr_t*)(resolver_got_runtime+8) = (uintptr_t)head;
+                printf_log(LOG_INFO, "PLT Resolver injected in got at %p\n",
+                           (void*)(resolver_got_runtime+16));
             }
         }
     }
@@ -1291,6 +1586,114 @@ static void Push64(CPUX86State *cpu, uint64_t v)
 uintptr_t pltResolver = ~0LL;
 uintptr_t dl_runtime_resolver = ~0LL;
 uintptr_t link_map_obj=0;
+#ifdef CONFIG_LATX_KZT
+static void KztLazyBindingCompleteResolver(void)
+{
+    CPUX86State *cpu = (CPUX86State *)lsenv->cpu_state;
+    kzt_lazy_binding_pending_t *pending =
+        &cpu->kzt_lazy_binding_pending;
+    uintptr_t original_return = cpu->kzt_lazy_original_return;
+    uintptr_t slot_addr = pending->slot_addr;
+    char symbol[KZT_LAZY_BINDING_SYMBOL_MAX];
+    kzt_lazy_binding_result_t result;
+
+    (void)slot_addr;
+
+    symbol[0] = '\0';
+    if (pending->symbol) {
+        strncpy(symbol, pending->symbol, sizeof(symbol) - 1);
+        symbol[sizeof(symbol) - 1] = '\0';
+    }
+    if (pending->armed) {
+        if (option_kzt_lazy_diagnostics) {
+            kzt_lazy_binding_pending_t pending_snapshot = *pending;
+            kzt_lazy_diagnostic_emit_result_t diagnostic_result;
+
+            pending_snapshot.symbol = pending->symbol ?
+                pending_snapshot.symbol_storage : NULL;
+            pending_snapshot.version = pending->version ?
+                pending_snapshot.version_storage : NULL;
+            (void)kzt_production_lazy_complete(
+                (void *)pending->context_id, pending, &result);
+            (void)kzt_lazy_diagnostics_emit_production(
+                &pending_snapshot, &result, &diagnostic_result);
+        } else {
+            (void)kzt_production_lazy_complete(
+                (void *)pending->context_id, pending, &result);
+        }
+        printf_log(LOG_DEBUG,
+                   "KZT: lazy complete status=%d reason=%d slot=%p "
+                   "before=%p after=%p sym=%s\n",
+                   result.status, result.reason,
+                   (void *)slot_addr,
+                   (void *)result.slot_before, (void *)result.slot_after,
+                   symbol[0] ? symbol : "(none)");
+    }
+    kzt_lazy_binding_cancel(pending);
+    cpu->kzt_lazy_original_return = 0;
+    Push64(cpu, original_return);
+}
+
+typedef struct kzt_plt_resolver_production_state {
+    elfheader_t *head;
+    uintptr_t slot_addr;
+    uintptr_t unresolved_stub;
+    const char *symbol;
+    const char *version;
+    long addend;
+} kzt_plt_resolver_production_state_t;
+
+static int kzt_plt_resolver_lookup_source(
+    uintptr_t object_head, kzt_plt_resolver_source_t *source, void *opaque)
+{
+    kzt_plt_resolver_production_state_t *state = opaque;
+    kzt_guest_registry_t *registry = KztGuestRegistryForContext(my_context);
+    kzt_guest_object_snapshot_t *snapshot = NULL;
+    kzt_guest_lazy_resolver_t resolver;
+    int result = -1;
+
+    if (!state || !state->head || object_head != (uintptr_t)state->head ||
+        !source || !state->head->self_link_map ||
+        kzt_guest_registry_find_by_link_map(
+            registry, state->head->self_link_map, &snapshot) != 0 ||
+        !snapshot || snapshot->namespace_id.status != KZT_GUEST_FIELD_OK ||
+        snapshot->namespace_id.value != 0 ||
+        kzt_guest_registry_find_lazy_resolver(
+            registry, state->head->self_link_map, snapshot->generation, 0,
+            &resolver) != 0 ||
+        resolver.guest_link_map != state->head->self_link_map) {
+        goto out;
+    }
+    *source = (kzt_plt_resolver_source_t) {
+        .enabled = my_context->kzt_lazy_completion_bridge != 0,
+        .context_id = (uintptr_t)my_context,
+        .object_head = object_head,
+        .source_link_map = state->head->self_link_map,
+        .source_generation = snapshot->generation,
+        .namespace_id = snapshot->namespace_id.value,
+        .namespace_kind = KZT_GUEST_LIBRARY_NAMESPACE_MAIN,
+        .slot_addr = state->slot_addr,
+        .unresolved_stub = state->unresolved_stub,
+        .symbol = state->symbol,
+        .version = state->version,
+        .addend = state->addend,
+        .guest_resolver = resolver.guest_resolver,
+    };
+    result = 0;
+out:
+    kzt_guest_object_snapshot_free(snapshot);
+    return result;
+}
+
+static int kzt_plt_resolver_begin_lazy_binding(
+    const kzt_lazy_binding_begin_request_t *request,
+    kzt_lazy_binding_pending_t *pending,
+    kzt_lazy_binding_result_t *result, void *opaque)
+{
+    (void)opaque;
+    return kzt_lazy_binding_begin(request, pending, result);
+}
+#endif
 void PltResolver(void)
 {
     CPUX86State *cpu = (CPUX86State*)lsenv->cpu_state;
@@ -1311,15 +1714,61 @@ void PltResolver(void)
     uint64_t *p = (uint64_t*)(rel->r_offset + h->delta);
     uintptr_t offs = 0;
     uintptr_t end = 0;
+    library_t *resolved_provider = NULL;
+
+    (void)bind;
+
+#ifdef CONFIG_LATX_KZT
+    if (option_kzt_lazy_diagnostics) {
+        printf_kzt_registry_diagnostics(
+            "kzt_lazy_resolver_entry symbol=%s slot=%p source=%p\n",
+            symname ? symname : "(none)", (void *)p,
+            (void *)h->self_link_map);
+    }
+    if (option_kzt || wine_option_kzt) {
+        kzt_plt_resolver_production_state_t state = {
+            .head = h,
+            .slot_addr = (uintptr_t)p,
+            .unresolved_stub = p ?
+                __atomic_load_n((uintptr_t *)p, __ATOMIC_ACQUIRE) : 0,
+            .symbol = symname,
+            .version = vername,
+            .addend = rel->r_addend,
+        };
+        kzt_plt_resolver_runtime_ops_t ops = {
+            .lookup_source = kzt_plt_resolver_lookup_source,
+            .begin_lazy_binding = kzt_plt_resolver_begin_lazy_binding,
+            .pending = &cpu->kzt_lazy_binding_pending,
+            .completion_bridge = my_context->kzt_lazy_completion_bridge,
+            .original_return = &cpu->kzt_lazy_original_return,
+            .opaque = &state,
+        };
+        kzt_plt_resolver_enter_result_t enter_result;
+
+        if (kzt_plt_resolver_enter(cpu, &ops, &enter_result) == 0 &&
+            enter_result.status != KZT_PLT_RESOLVER_LEGACY_FRAME_RESTORED) {
+            return;
+        }
+    }
+#endif
+
+    (void)Pop64(cpu);
+    (void)Pop64(cpu);
 
     library_t* lib = h->lib;
     lib_t* local_maplib = GetMaplib(lib);
-    GetGlobalSymbolStartEnd(my_context->maplib, symname, &offs, &end, h, version, vername);
+    GetGlobalSymbolStartEndWithProvider(
+        my_context->maplib, symname, &offs, &end, h, version, vername,
+        &resolved_provider);
     if(!offs && !end && local_maplib) {
-        GetGlobalSymbolStartEnd(local_maplib, symname, &offs, &end, h, version, vername);
+        GetGlobalSymbolStartEndWithProvider(
+            local_maplib, symname, &offs, &end, h, version, vername,
+            &resolved_provider);
     }
     if(!offs && !end && !version)
-        GetGlobalSymbolStartEnd(my_context->maplib, symname, &offs, &end, h, -1, NULL);
+        GetGlobalSymbolStartEndWithProvider(
+            my_context->maplib, symname, &offs, &end, h, -1, NULL,
+            &resolved_provider);
 
     if (!offs) {
 //        printf_log(LOG_INFO, "Error: PltResolver: Symbol %s(ver %d: %s%s%s) not found, cannot apply R_X86_64_JUMP_SLOT %p (%p) in %s\n", symname, version, symname, vername?"@":"", vername?vername:"", p, *(void**)p, h->name);
@@ -1331,6 +1780,38 @@ void PltResolver(void)
     } else {
         offs = (uintptr_t)getAlternate((void*)offs);
         if(p) {
+            uintptr_t slot_observation = (uintptr_t)(*p);
+            uintptr_t legacy_target = offs;
+#ifdef CONFIG_LATX_KZT
+            if (option_kzt || wine_option_kzt) {
+                kzt_jump_slot_route_result_t route_result;
+
+                if (kzt_production_jump_slot_route(
+                        my_context, resolved_provider, legacy_target, h,
+                        1, slot, rel, p,
+                    slot_observation, 1,
+                        ELF64_R_SYM(rel->r_info), symname,
+                        vername, 0, 0, legacy_target, &route_result) == 0 &&
+                    route_result.status ==
+                        KZT_JUMP_SLOT_ROUTE_NATIVE_APPLIED) {
+                    printf_kzt_registry_diagnostics(
+                        "KZT lazy route applied slot=%p observed=%p "
+                        "legacy=%p selected=%p symbol=%s\n",
+                        p, (void *)slot_observation, (void*)legacy_target,
+                        (void *)route_result.selected_target,
+                        symname ? symname : "(none)");
+                    Push64(cpu, route_result.selected_target);
+                    return;
+                }
+                if (route_result.status ==
+                        KZT_JUMP_SLOT_ROUTE_GUEST_PRESERVED ||
+                    route_result.status ==
+                        KZT_JUMP_SLOT_ROUTE_CAS_MISMATCH) {
+                    Push64(cpu, route_result.final_value);
+                    return;
+                }
+            }
+#endif
             printf_log(LOG_INFO, "            Apply %s R_X86_64_JUMP_SLOT %p with sym=%s(ver %d: %s%s%s) (%p -> %p / %s)\n", (bind==STB_LOCAL)?"Local":"Global", p, symname, version, symname, vername?"@":"", vername?vername:"",*(void**)p, (void*)offs, ElfName(FindElfAddress(my_context, offs)));
             *p = offs;
         } else {

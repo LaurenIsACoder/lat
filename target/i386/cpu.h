@@ -24,6 +24,10 @@
 #include "cpu-qom.h"
 #include "exec/cpu-defs.h"
 #include "qapi/qapi-types-common.h"
+#ifdef CONFIG_LATX_KZT
+#include "kzt_lazy_binding.h"
+#include "kzt_loader_callback_scope.h"
+#endif
 
 /* The x86 has a strong memory model with some store-after-load re-ordering */
 #define TCG_GUEST_DEFAULT_MO      (TCG_MO_ALL & ~TCG_MO_ST_LD)
@@ -1404,6 +1408,11 @@ typedef struct HVFX86LazyFlags {
 
 typedef struct CPUX86State {
 #ifdef CONFIG_LATX
+#ifdef CONFIG_LATX_KZT
+    kzt_lazy_binding_pending_t kzt_lazy_binding_pending;
+    uintptr_t kzt_lazy_original_return;
+    kzt_guest_library_loader_scope_t kzt_guest_library_loader_scope;
+#endif
     void*  checksum_fail_tb;
     void *ibtc_table_p;
     uint64_t vregs[5];

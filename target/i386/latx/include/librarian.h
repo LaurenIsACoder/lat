@@ -30,6 +30,10 @@ kh_mapsymbols_t* GetWeakSymbol(lib_t* maplib);
 kh_mapsymbols_t* GetLocalSymbol(lib_t* maplib);
 kh_mapsymbols_t* GetGlobalData(lib_t* maplib);
 int AddNeededLib(lib_t* maplib, needed_libs_t* neededlibs, library_t *deplib, int local, int bindnow, const char** paths, int npath, box64context_t* box64); // 0=success, 1=error
+int AddNeededLibWithLibrary(lib_t* maplib, needed_libs_t* neededlibs,
+                            library_t *deplib, int local, int bindnow,
+                            const char* path, box64context_t* box64,
+                            library_t **exact_library); // AddNeededLib return semantics; exact_library is NULL on failure
 int AddNeededLib_add(lib_t* maplib, needed_libs_t* neededlibs, library_t* deplib, int local, const char* path, box64context_t* box64);
 library_t* GetLibMapLib(lib_t* maplib, const char* name);
 library_t* GetLibInternal(const char* name);
@@ -37,6 +41,7 @@ uintptr_t FindGlobalSymbol(lib_t *maplib, const char* name, int version, const c
 int GetNoSelfSymbolStartEnd(lib_t *maplib, const char* name, uintptr_t* start, uintptr_t* end, elfheader_t* self, int version, const char* vername);
 int GetSelfSymbolStartEnd(lib_t *maplib, const char* name, uintptr_t* start, uintptr_t* end, elfheader_t *self, int version, const char* vername);
 int GetGlobalSymbolStartEnd(lib_t *maplib, const char* name, uintptr_t* start, uintptr_t* end, elfheader_t *self, int version, const char* vername);
+int GetGlobalSymbolStartEndWithProvider(lib_t *maplib, const char* name, uintptr_t* start, uintptr_t* end, elfheader_t *self, int version, const char* vername, library_t **provider);
 int GetGlobalNoWeakSymbolStartEnd(lib_t *maplib, const char* name, uintptr_t* start, uintptr_t* end, int version, const char* vername);
 int GetLocalSymbolStartEnd(lib_t *maplib, const char* name,khint_t pre_k, uintptr_t* start, uintptr_t* end, elfheader_t *self, int version, const char* vername);
 int GetNoWeakSymbolStartEnd(lib_t *maplib, const char* name, uintptr_t* start, uintptr_t* end, elfheader_t *self, int version, const char* vername);

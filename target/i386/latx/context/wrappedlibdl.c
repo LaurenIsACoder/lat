@@ -27,6 +27,12 @@
 #include "callback.h"
 #include "myalign.h"
 #include "fileutils.h"
+#include "dlopen_recycle_transaction.h"
+#ifdef CONFIG_LATX_KZT
+#include "kzt_guest_library_adapter.h"
+#include "kzt_guest_library_binding.h"
+#endif
+#include "kzt_loader_callback_scope.h"
 
 #define FORWORDBACK 0
 dlprivate_t *NewDLPrivate(void) {
@@ -81,13 +87,62 @@ int init_x86dlfun(void)
     my_context->dlprivate->x86dlinfo = rsyms[5];
     return 0;
 }
-static int callx86dlopen(void *filename, int flag, elfheader_t * h, int is_local) {
-    struct link_map* ret = (struct link_map*)(uintptr_t)RunFunctionWithState((uintptr_t)my_context->dlprivate->x86dlopen, 2, filename, flag);
+static uint64_t run_guest_dlopen_scoped(uintptr_t function,
+                                        void *filename, int flag,
+                                        kzt_guest_library_loader_scope_t *scope)
+{
+#ifdef CONFIG_LATX_KZT
+    __MY_CPU;
+    kzt_guest_library_loader_scope_t previous =
+        cpu->kzt_guest_library_loader_scope;
+    kzt_guest_library_bindings_t *bindings =
+        KztGuestLibraryBindingsForContext(my_context);
+    int scoped = scope &&
+        kzt_guest_library_loader_scope_begin(bindings, scope) == 0;
+    uint64_t result;
+
+    if (scoped) cpu->kzt_guest_library_loader_scope = *scope;
+    result = RunFunctionWithState(function, 2, filename, flag);
+    cpu->kzt_guest_library_loader_scope = previous;
+    return result;
+#else
+    (void)scope;
+    return RunFunctionWithState(function, 2, filename, flag);
+#endif
+}
+
+static void finish_guest_dlopen_scoped(
+    kzt_guest_library_loader_scope_t *scope, uintptr_t link_map_addr,
+    library_t *library, int publish)
+{
+#ifdef CONFIG_LATX_KZT
+    if (publish && link_map_addr) {
+        if (library)
+            kzt_guest_library_publish_loader_pair_scoped(
+                my_context, scope, link_map_addr, library);
+        else
+            kzt_guest_library_publish_loader_observed_scoped(
+                my_context, scope, link_map_addr);
+    }
+    kzt_guest_library_loader_scope_end(scope);
+#else
+    (void)scope; (void)link_map_addr; (void)library; (void)publish;
+#endif
+}
+
+static int callx86dlopen(void *filename, int flag, elfheader_t * h,
+                         int is_local, int publish_pair) {
+    kzt_guest_library_loader_scope_t scope = { 0 };
+    struct link_map* ret = (struct link_map*)(uintptr_t)
+        run_guest_dlopen_scoped(
+            (uintptr_t)my_context->dlprivate->x86dlopen, filename, flag,
+            &scope);
     if (ret) {
         printf_dlsym(LOG_DEBUG, "latx RunFunctionWithState dlopen %s addr %p\n", (char *)filename, (void *)ret->l_addr);
         h->lib->x86linkmap = ret;
     } else {
         //open error
+        finish_guest_dlopen_scoped(&scope, 0, NULL, 0);
         return -1;
     }
     h->delta = ret->l_addr;
@@ -101,6 +156,8 @@ static int callx86dlopen(void *filename, int flag, elfheader_t * h, int is_local
         printf_dlsym(LOG_INFO, "Failure to Add lib => fail\n");
         lsassert(0);
     }
+    finish_guest_dlopen_scoped(&scope, (uintptr_t)ret, h->lib,
+                               publish_pair);
     return 0;
 }
 static void LatxResetElf(elfheader_t * h)
@@ -110,6 +167,72 @@ static void LatxResetElf(elfheader_t * h)
     h->had_RelocateElf = 0;
     h->latx_type = 0;
     h->latx_hasfix = 0;
+}
+
+typedef struct dlopen_recycle_context {
+    void *filename;
+    int flag;
+    elfheader_t *header;
+    library_t *library;
+    int is_local;
+    int guest_open_required;
+} dlopen_recycle_context_t;
+
+static void recycle_reset_loader_state(dlopen_recycle_context_t *recycle)
+{
+    linkmap_t *lm;
+
+    recycle->library->x86linkmap = NULL;
+    if (!recycle->header)
+        return;
+    LatxResetElf(recycle->header);
+    recycle->header->delta = 0;
+    lm = getLinkMapLib(recycle->library);
+    if (lm)
+        lm->l_addr = 0;
+}
+
+static void recycle_prepare(void *opaque)
+{
+    dlopen_recycle_context_t *recycle = opaque;
+    if (!recycle->guest_open_required)
+        return;
+    recycle_reset_loader_state(recycle);
+}
+
+static int recycle_guest_open(void *opaque)
+{
+    dlopen_recycle_context_t *recycle = opaque;
+#ifdef CONFIG_LATX_KZT
+    if (recycle->guest_open_required &&
+        kzt_guest_library_reactivate(
+            KztGuestLibraryBindingsForContext(recycle->library->context),
+            recycle->library) != 0)
+        return -1;
+#endif
+    return recycle->guest_open_required
+               ? callx86dlopen(recycle->filename, recycle->flag,
+                                recycle->header, recycle->is_local, 0)
+               : 0;
+}
+
+static int recycle_reload(void *opaque)
+{
+    dlopen_recycle_context_t *recycle = opaque;
+    return ReloadLibrary(recycle->library);
+}
+
+static void recycle_rollback(void *opaque, int guest_opened)
+{
+    dlopen_recycle_context_t *recycle = opaque;
+    InactiveLibrary(recycle->library);
+    if (guest_opened && recycle->guest_open_required &&
+        recycle->library->x86linkmap &&
+        my_context->dlprivate->x86dlclose)
+        (void)RunFunctionWithState(
+            (uintptr_t)my_context->dlprivate->x86dlclose, 1,
+            recycle->library->x86linkmap);
+    recycle_reset_loader_state(recycle);
 }
 void* my_dlopen(void *filename, int flag){
     // TODO, handling special values for filename, like RTLD_SELF?
@@ -166,14 +289,31 @@ void* my_dlopen(void *filename, int flag){
                     int idx = GetElfIndex(dl->libs[i]);
                     if(idx!=-1) {
                         printf_dlsym(LOG_DEBUG, "dlopen: Recycling, calling Init for %p (%s)\n", (void*)(i+1), rfilename);
-                        //TODO
+                        dlopen_recycle_context_t recycle = {
+                            .filename = rfilename,
+                            .flag = flag,
+                            .library = dl->libs[i],
+                            .is_local = is_local,
+                        };
                         if (IsEmuLib(dl->libs[i])) {
-                            elfheader_t * h = my_context->elfs[idx];
-                            lsassert(h);
-                            LatxResetElf(h);
-                            callx86dlopen(rfilename, flag, h, is_local);
+                            recycle.header = my_context->elfs[idx];
+                            lsassert(recycle.header);
+                            recycle.guest_open_required = 1;
                         }
-                        ReloadLibrary(dl->libs[i]);    // reset memory image, redo reloc, run inits
+                        void *handle = dlopen_recycle_transaction(
+                            (void *)(i + 1), &dl->count[i], !(flag & 0x4),
+                            &recycle, recycle_prepare, recycle_guest_open,
+                            recycle_reload, recycle_rollback);
+                        if (!handle) {
+                            if(!dl->last_error)
+                                dl->last_error = box_malloc(129);
+                            snprintf(dl->last_error, 129,
+                                     "Cannot recycle dlopen(\"%s\"/%p, %X)\n",
+                                     rfilename, filename, flag);
+                            return NULL;
+                        }
+                        printf_dlsym(LOG_DEBUG, "dlopen: Recycling %s/%p count=%ld (dlopened=%ld, elf_index=%d)\n", rfilename, (void*)(i+1), dl->count[i], dl->dlopened[i], GetElfIndex(dl->libs[i]));
+                        return handle;
                     }
                 }
                 if(!(flag&0x4))
@@ -198,7 +338,12 @@ void* my_dlopen(void *filename, int flag){
             printf_dlsym(LOG_DEBUG, "warning call x86dlopen filename is %s %x\n", (char *)filename, flag);
             return NULL;
 #else
-            uint64_t ret = RunFunctionWithState((uintptr_t)my_context->dlprivate->x86dlopen, 2, filename, flag);
+            kzt_guest_library_loader_scope_t scope = { 0 };
+            uint64_t ret = run_guest_dlopen_scoped(
+                (uintptr_t)my_context->dlprivate->x86dlopen, filename, flag,
+                &scope);
+            finish_guest_dlopen_scoped(&scope, (uintptr_t)ret, NULL,
+                                       ret != 0);
             printf_dlsym(LOG_DEBUG, "warning call call x86dlopen filename %s %x ret=0x%lx\n",  (char *)filename, flag, ret);
             //lsassert(0);
             if (ret) {
@@ -211,15 +356,14 @@ void* my_dlopen(void *filename, int flag){
             return NULL;
 #endif
         }
-        if(AddNeededLib(NULL, NULL, NULL, is_local, bindnow, libs, 1, my_context)) {
+        if(AddNeededLibWithLibrary(NULL, NULL, NULL, is_local, bindnow,
+                                  rfilename, my_context, &lib) || !lib) {
             printf_dlsym(strchr(rfilename,'/')?LOG_DEBUG:LOG_INFO, "Warning: Cannot dlopen(\"%s\"/%p, %X)\n", rfilename, filename, flag);
             if(!dl->last_error)
                 dl->last_error = box_malloc(129);
             snprintf(dl->last_error, 129, "Cannot dlopen(\"%s\"/%p, %X)\n", rfilename, filename, flag);
             return NULL;
         }
-        lib = GetLibInternal(rfilename);
-        if (!lib) return NULL;
         lib->x86dlopenflag = flag;
         if (lib && lib->type == LIB_EMULATED) {
             // if dlopened = 0 ---> lib added but not loaded
@@ -228,7 +372,7 @@ void* my_dlopen(void *filename, int flag){
             elfheader_t * h = my_context->elfs[libidx];
             lsassert(h);
             if (!h->latx_hasfix || !lib->x86linkmap) {//lib->x86linkmap is null ---- this lib has been needed by other elf and opened 
-                callx86dlopen(rfilename, flag, h, is_local);
+                callx86dlopen(rfilename, flag, h, is_local, 1);
             }
         }
         //TODO:RunDeferedElfInit;
@@ -446,13 +590,20 @@ void* my_dlsym(void *handle, void *symbol){
             #if 1
             if(!dl->libs[nlib]->x86linkmap) {
                 //redlopen
-                uint64_t ret = RunFunctionWithState((uintptr_t)my_context->dlprivate->x86dlopen, 2, dl->libs[nlib]->name, dl->libs[nlib]->x86dlopenflag);
+                kzt_guest_library_loader_scope_t scope = { 0 };
+                uint64_t ret = run_guest_dlopen_scoped(
+                    (uintptr_t)my_context->dlprivate->x86dlopen,
+                    dl->libs[nlib]->name, dl->libs[nlib]->x86dlopenflag,
+                    &scope);
                 if (!ret) {//user sometime test for finding a func.
+                    finish_guest_dlopen_scoped(&scope, 0, NULL, 0);
                     printf_dlsym(LOG_NEVER, "redlopen %p return %p\n", rsymbol, (void*)NULL);
                     return NULL;
                 }
                 lsassert(ret);
                 dl->libs[nlib]->x86linkmap = (void *)ret;
+                finish_guest_dlopen_scoped(
+                    &scope, (uintptr_t)ret, dl->libs[nlib], 1);
                 ret = RunFunctionWithState((uintptr_t)my_context->dlprivate->x86dlsym, 2, dl->libs[nlib]->x86linkmap , cpu->regs[R_ESI]);
                 printf_dlsym(LOG_DEBUG, "call x86dlsym filename %s is wrapped but not find symbol, dlsym(%p, %s) ret=0x%lx\n",
                 dl->libs[nlib]->name, dl->libs[nlib]->x86linkmap, (char *)cpu->regs[R_ESI], ret);
@@ -643,4 +794,3 @@ int my_dlinfo(void* handle, int request, void* info)
 }
 
 #include "wrappedlib_init.h"
-
