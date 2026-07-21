@@ -16,6 +16,7 @@
 #include "debug.h"
 #include "elfloader.h"
 #include "bridge.h"
+#include "guestobject.h"
 #include "librarian.h"
 #include "library.h"
 #include "wrapper.h"
@@ -34,6 +35,9 @@ box64context_t *NewBox64Context(int argc)
     context->versym = NewDictionnary();
     context->system = NewBridge();
     context->dlprivate = NewDLPrivate();
+    context->guest_objects = NewGuestObjectRegistry();
+    if (!context->guest_objects)
+        printf_log(LOG_INFO, "Warning: guest object registry is unavailable\n");
     context->box64lib = dlopen(NULL, RTLD_NOW|RTLD_GLOBAL);
     context->argc = argc;
     context->argv = (char**)box_calloc(context->argc+1, sizeof(char*));
@@ -63,6 +67,7 @@ void FreeBox64Context(box64context_t** context)
         FreeElfHeader(&ctx->elfs[i]);
     }
     box_free(ctx->elfs);
+    FreeGuestObjectRegistry(&ctx->guest_objects);
 
     FreeCollection(&ctx->box64_path);
     FreeCollection(&ctx->box64_ld_lib);

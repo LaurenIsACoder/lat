@@ -30,6 +30,8 @@ Contents:
    qtest
    decodetree
    secure-coding-practices
+   kzt-loader-refactor
+   kzt-loader-refactor-zh
    tcg
    tcg-icount
    tracing

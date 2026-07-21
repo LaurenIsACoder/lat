@@ -9,8 +9,11 @@
 #include "config-host.h"
 #include "lsenv.h"
 #include "myalign.h"
+#include "elfmap.h"
 #include "elfloader.h"
 #include "elfloader_private.h"
+#include "guestdynamic.h"
+#include "guestobject.h"
 #include <sys/epoll.h>
 #include <sys/sem.h>
 #include <sys/syscall.h>
@@ -2058,6 +2061,19 @@ static int CalcLoadAddrNative(elfheader_t* head, size_t align)
     head->stackalign = 16;   // default align for stack
     return 0;
 }
+
+/*
+ * Stage 5 lets the guest loader own ordinary guest dependencies.  KZT still
+ * registers wrappers for objects after the guest loader maps them, but it no
+ * longer expands a guest object's DT_NEEDED list or RPATH/RUNPATH itself.
+ */
+static void kzt_skip_guest_needed_side_load(const char *scope,
+                                           const char *path)
+{
+    printf_log(LOG_DEBUG, "%s Skip guest DT_NEEDED side loading for \"%s\"\n",
+               scope, path ? path : "(unknown)");
+}
+
 static void init_main_elf(elfheader_t* elf_header,int fd, uintptr_t load_addr,
         size_t align)
 {
@@ -2078,9 +2094,7 @@ static void init_main_elf(elfheader_t* elf_header,int fd, uintptr_t load_addr,
 
     AddMainElfToLinkmap(elf_header);
 
-    if (LoadNeededLibs(elf_header, my_context->maplib, &my_context->neededlibs, NULL, 0, 0, my_context)) {
-        printf_log(LOG_INFO, "Error: loading needed libs in elf %s\n", my_context->argv[0]);
-    }
+    kzt_skip_guest_needed_side_load("kzt_init", my_context->argv[0]);
     ResetSpecialCaseMainElf(elf_header);
 }
 int wine_option_kzt;
@@ -2117,11 +2131,159 @@ int kzt_init(char** argv, int argc,char** target_argv, int target_argc,
     return 0;
 }
 
-struct x86_ld_info {
+typedef struct KztGlibcLoaderHook {
     int reg;
-    intptr_t addr;
+    uintptr_t addr;
+} KztGlibcLoaderHook;
+
+typedef void (*KztTbCallback)(CPUX86State *);
+typedef KztGlibcLoaderHook *(*KztGlibcLoaderHookResolver)(void *);
+
+typedef struct KztGlibcLoaderEventSource {
+    const char *name;
+    KztGlibcLoaderHook *hook;
+    int hook_resolved;
+    const char *loader_path;
+    abi_ulong loader_load_bias;
+    KztTbCallback callback;
+    KztGlibcLoaderHookResolver resolve_hook;
+} KztGlibcLoaderEventSource;
+
+typedef struct KztRDebug {
+    int r_version;
+    struct link_map_x64 *r_map;
+    Elf64_Addr r_brk;
+    int r_state;
+    Elf64_Addr r_ldbase;
+} KztRDebug;
+
+typedef struct KztRDebugEventSource {
+    const char *name;
+    uintptr_t addr;
+} KztRDebugEventSource;
+
+#define KZT_R_DEBUG_VERSION 1
+#define KZT_RT_CONSISTENT 0
+#define KZT_RT_ADD 1
+#define KZT_RT_DELETE 2
+
+typedef struct KztTbCallbackBridge {
+    uintptr_t addr;
+    KztTbCallback callback;
+} KztTbCallbackBridge;
+
+typedef struct KztGlibcLoaderHookCandidate {
+    uintptr_t offset;
+    uint64_t value;
+    const char *glibc_version;
+} KztGlibcLoaderHookCandidate;
+
+typedef struct KztGlibcLoaderImage {
+    uint8_t *start;
+    size_t file_len;
+    char path[PATH_MAX];
+    char glibc_version[16];
+} KztGlibcLoaderImage;
+
+#define KZT_GLIBC_LOADER_EVENT_SOURCE_NAME "glibc_loader_fallback"
+#define KZT_R_DEBUG_EVENT_SOURCE_NAME "r_debug"
+
+static void kzt_glibc_loader_callback(CPUX86State *env);
+static KztGlibcLoaderHook *kzt_find_glibc_loader_event_source_hook(void *info);
+static void kzt_prepare_r_debug_event_source(char *file_name,
+                                             abi_ulong start);
+
+static KztGlibcLoaderEventSource kzt_glibc_loader_event_source = {
+    .name = KZT_GLIBC_LOADER_EVENT_SOURCE_NAME,
+    .callback = kzt_glibc_loader_callback,
+    .resolve_hook = kzt_find_glibc_loader_event_source_hook,
 };
-static struct x86_ld_info * ld_info = NULL;
+static KztRDebugEventSource kzt_r_debug_event_source = {
+    .name = KZT_R_DEBUG_EVENT_SOURCE_NAME,
+};
+
+static KztGlibcLoaderEventSource *kzt_glibc_loader_event_source_default(void)
+{
+    return &kzt_glibc_loader_event_source;
+}
+
+static KztRDebugEventSource *kzt_r_debug_event_source_default(void)
+{
+    return &kzt_r_debug_event_source;
+}
+
+static const char *kzt_glibc_loader_event_source_name(
+    KztGlibcLoaderEventSource *source)
+{
+    if (!source || !source->name)
+        return KZT_GLIBC_LOADER_EVENT_SOURCE_NAME;
+    return source->name;
+}
+
+static KztGlibcLoaderHook *kzt_glibc_loader_event_source_hook(
+    KztGlibcLoaderEventSource *source)
+{
+    return source ? source->hook : NULL;
+}
+
+static void kzt_glibc_loader_event_source_set_hook(
+    KztGlibcLoaderEventSource *source,
+    KztGlibcLoaderHook *hook)
+{
+    lsassert(source);
+    source->hook = hook;
+}
+
+static void kzt_glibc_loader_event_source_prepare(
+    KztGlibcLoaderEventSource *source,
+    struct image_info *execinfo)
+{
+    if (!source || !execinfo)
+        return;
+
+    if (source->loader_path == execinfo->interpreter_path
+        && source->loader_load_bias == execinfo->load_bias) {
+        return;
+    }
+
+    free(source->hook);
+    source->hook = NULL;
+    source->hook_resolved = 0;
+    source->loader_path = execinfo->interpreter_path;
+    source->loader_load_bias = execinfo->load_bias;
+}
+
+static KztTbCallback kzt_glibc_loader_event_source_callback(
+    KztGlibcLoaderEventSource *source)
+{
+    if (!source)
+        return NULL;
+
+    KztTbCallback callback = source->callback;
+
+    return callback;
+}
+
+static KztGlibcLoaderHookResolver
+kzt_glibc_loader_event_source_hook_resolver(
+    KztGlibcLoaderEventSource *source)
+{
+    if (!source)
+        return NULL;
+
+    KztGlibcLoaderHookResolver resolver = source->resolve_hook;
+
+    return resolver;
+}
+
+static uintptr_t kzt_glibc_loader_event_source_hook_addr(
+    KztGlibcLoaderEventSource *source)
+{
+    KztGlibcLoaderHook *hook = kzt_glibc_loader_event_source_hook(source);
+
+    return hook ? hook->addr : 0;
+}
+
 extern void* x86free;
 extern void* x86realloc;
 extern void* x86pthread_setcanceltype;
@@ -2169,7 +2331,7 @@ found:
     /*
       * If the plt of this elf file has free, __libc_free, __free jump_slot, this jump_slot will be rewrited by kzt bridge, a moment later.
       * So this file should be skiped. If do not do this, when x86free be called, Target exe will fall into dead loop.
-    */
+     */
     cnt = h->pltsz / h->pltent;
     rela = (Elf64_Rela *)(h->jmprel + h->delta);
     for (int i=0; i<cnt; ++i) {
@@ -2218,66 +2380,1653 @@ static char* kzt_find_realsofilepath(char * filepath, char *filetmp)
         printf_log(LOG_DEBUG, "%s filename change to \"%s\"\n", __func__, filepath);
         return filetmp;
     }
-    //file must exist for kzt_tb_callback.
+    // file must exist for the glibc loader fallback.
     return filepath;
 }
 extern const char* libcName;
-static void kzt_tb_callback(CPUX86State *env)
+static const char *kzt_object_basename(const char *path)
 {
-    struct link_map_x64 * my_lm = (struct link_map_x64 *)env->regs[R_EAX + ld_info->reg];
-    elfheader_t *h = NULL;
-    if ((!my_lm ||!my_lm->l_name ||!strlen(my_lm->l_name) || ! my_lm->l_addr)&& my_lm->l_addr != info1.load_addr) {
-        printf_log(LOG_DEBUG, "error %d debug %s link_map = %p{0x%lx, %s}\n", getpid(), __func__, my_lm, my_lm->l_addr, my_lm->l_name);
+    const char *basename = strrchr(path, '/');
+    return basename ? basename + 1 : path;
+}
+
+typedef struct KztGuestObject {
+    struct link_map_x64 *link_map;
+    const char *event_source;
+    uintptr_t load_bias;
+    uintptr_t dynamic_addr;
+    char *object_name;
+    char *filename;
+    const char *basename;
+    char filetmp[PATH_MAX];
+    int is_loader;
+    uintptr_t map_start;
+    uintptr_t map_end;
+    KztDynamicView dynamic_view;
+    KztDynamicInfo dynamic_info;
+    int has_dynamic_info;
+    guest_object_observation_t observation;
+} KztGuestObject;
+
+/*
+ * Stage 8 keeps the private glibc hook as an event source first.  Everything
+ * below this structure should be reusable when the source becomes r_debug,
+ * mmap/RELRO observation, or another loader notification path.
+ */
+typedef struct KztLoaderEvent {
+    const char *source;
+    struct link_map_x64 *link_map;
+    uintptr_t load_bias;
+    uintptr_t dynamic_addr;
+    char *object_name;
+    char object_name_snapshot[PATH_MAX];
+} KztLoaderEvent;
+
+static const char *kzt_loader_event_name(const char *source)
+{
+    return source ? source : KZT_GLIBC_LOADER_EVENT_SOURCE_NAME;
+}
+
+static int kzt_guest_range_is_readable(const void *addr, size_t size)
+{
+    if (!addr)
+        return 0;
+
+    return access_ok_untagged(VERIFY_READ, (abi_ulong)(uintptr_t)addr, size);
+}
+
+static int kzt_guest_dynamic_range_is_readable(const void *addr, size_t size,
+                                               void *opaque)
+{
+    (void)opaque;
+    return kzt_guest_range_is_readable(addr, size);
+}
+
+static int kzt_guest_cstring_start_is_readable(const char *addr)
+{
+    return kzt_guest_range_is_readable(addr, 1);
+}
+
+static int kzt_guest_cstring_snapshot(const char *addr, char *snapshot,
+                                      size_t snapshot_size,
+                                      const char *source)
+{
+    if (!addr || !snapshot_size)
+        return 0;
+
+    ssize_t len = target_strlen((abi_ulong)(uintptr_t)addr);
+    if (len < 0 || (size_t)len >= snapshot_size) {
+        printf_log(LOG_DEBUG,
+                   "error %d debug %s string %p is not readable\n",
+                   getpid(), kzt_loader_event_name(source), addr);
+        return 0;
+    }
+
+    memcpy(snapshot, addr, (size_t)len + 1);
+    return 1;
+}
+
+static int kzt_host_cstring_snapshot(const char *addr, char *snapshot,
+                                     size_t snapshot_size)
+{
+    if (!addr || !snapshot_size)
+        return 0;
+
+    size_t len = strnlen(addr, snapshot_size);
+    if (len >= snapshot_size)
+        return 0;
+
+    memcpy(snapshot, addr, len + 1);
+    return 1;
+}
+
+static int kzt_guest_link_map_is_readable(struct link_map_x64 *link_map,
+                                          const char *source)
+{
+    if (kzt_guest_range_is_readable(link_map, sizeof(*link_map)))
+        return 1;
+
+    printf_log(LOG_DEBUG,
+               "error %d debug %s link_map = %p is not readable\n",
+               getpid(), kzt_loader_event_name(source), link_map);
+    return 0;
+}
+
+static int kzt_loader_link_map_is_valid(struct link_map_x64 *link_map,
+                                        const char *source)
+{
+    if (!link_map) {
+        printf_log(LOG_DEBUG, "error %d debug %s link_map = NULL\n",
+                   getpid(), kzt_loader_event_name(source));
+        return 0;
+    }
+    if (!kzt_guest_link_map_is_readable(link_map, source))
+        return 0;
+    if (!link_map->l_addr && link_map->l_addr != info1.load_addr) {
+        printf_log(LOG_DEBUG,
+                   "error %d debug %s link_map = %p{0x%lx, %s}\n",
+                   getpid(), kzt_loader_event_name(source), link_map,
+                   link_map->l_addr,
+                   link_map->l_name ? link_map->l_name : "<null>");
+        return 0;
+    }
+    return 1;
+}
+
+static struct link_map_x64 *kzt_get_glibc_loader_link_map(
+    KztGlibcLoaderEventSource *source,
+    CPUX86State *env)
+{
+    if (!source || !env) {
+        printf_log(LOG_DEBUG,
+                   "%s skip loader event: source=%p env=%p\n",
+                   kzt_glibc_loader_event_source_name(source), source, env);
+        return NULL;
+    }
+
+    KztGlibcLoaderHook *hook = kzt_glibc_loader_event_source_hook(source);
+    int reg = hook ? R_EAX + hook->reg : -1;
+
+    if (!hook || hook->reg < 0 || reg < 0 || reg >= CPU_NB_REGS) {
+        printf_log(LOG_DEBUG,
+                   "%s skip loader event: env=%p hook=%p reg=%d index=%d\n",
+                   kzt_glibc_loader_event_source_name(source), env, hook,
+                   hook ? hook->reg : -1, reg);
+        return NULL;
+    }
+
+    return (struct link_map_x64 *)env->regs[reg];
+}
+
+static char *kzt_get_object_name(struct link_map_x64 *my_lm,
+                                 const char *source,
+                                 char *snapshot, size_t snapshot_size)
+{
+    char *object_name = my_lm->l_name;
+
+    if (object_name && !kzt_guest_cstring_start_is_readable(object_name)) {
+        printf_log(LOG_DEBUG,
+                   "error %d debug %s link_map = %p name %p is not readable\n",
+                   getpid(), kzt_loader_event_name(source), my_lm,
+                   object_name);
+        return NULL;
+    }
+
+    if (!object_name || !object_name[0]) {
+        if (my_lm->l_addr != info1.load_addr) {
+            printf_log(LOG_DEBUG,
+                       "error %d debug %s link_map = %p has no name\n",
+                       getpid(), kzt_loader_event_name(source), my_lm);
+            return NULL;
+        }
+        object_name = my_context->fullpath;
+        if ((!object_name || !object_name[0]) && my_context->argv)
+            object_name = my_context->argv[0];
+        if (!object_name || !object_name[0]) {
+            printf_log(LOG_DEBUG,
+                       "error %d debug %s main object has no filename\n",
+                       getpid(), kzt_loader_event_name(source));
+            return NULL;
+        }
+        if (!kzt_host_cstring_snapshot(object_name, snapshot, snapshot_size)) {
+            printf_log(LOG_DEBUG,
+                       "error %d debug %s main object filename is too long\n",
+                       getpid(), kzt_loader_event_name(source));
+            return NULL;
+        }
+        return snapshot;
+    }
+    if (!kzt_guest_cstring_snapshot(object_name, snapshot, snapshot_size,
+                                    source)) {
+        return NULL;
+    }
+    return snapshot;
+}
+
+static int kzt_capture_loader_event_from_link_map(const char *source,
+                                                  struct link_map_x64 *link_map,
+                                                  KztLoaderEvent *event)
+{
+    if (!kzt_loader_link_map_is_valid(link_map, source))
+        return 0;
+
+    event->source = kzt_loader_event_name(source);
+    event->link_map = link_map;
+    event->object_name = kzt_get_object_name(
+        link_map, source, event->object_name_snapshot,
+        sizeof(event->object_name_snapshot));
+    if (!event->object_name)
+        return 0;
+
+    event->load_bias = link_map->l_addr;
+    event->dynamic_addr = (uintptr_t)link_map->l_ld;
+    return 1;
+}
+
+static size_t kzt_guest_dynamic_readable_entries(KztGuestObject *object)
+{
+    if (!object->dynamic_addr)
+        return 0;
+
+    Elf64_Dyn *dynamic = (Elf64_Dyn *)object->dynamic_addr;
+    for (size_t i = 0; i < KZT_DYNAMIC_SCAN_MAX; ++i) {
+        if (!kzt_guest_range_is_readable(dynamic + i, sizeof(*dynamic))) {
+            printf_log(LOG_DEBUG,
+                       "%s Dynamic scan stopped for %s: entry %zu is not readable\n",
+                       object->event_source, object->object_name, i);
+            return i;
+        }
+        if (dynamic[i].d_tag == DT_NULL)
+            return i + 1;
+    }
+    return KZT_DYNAMIC_SCAN_MAX;
+}
+
+static void kzt_parse_guest_object_dynamic(KztGuestObject *object)
+{
+    size_t readable_entries = kzt_guest_dynamic_readable_entries(object);
+
+    KztParseDynamicView(&object->dynamic_view,
+                        (Elf64_Dyn *)object->dynamic_addr,
+                        readable_entries);
+
+    if (object->dynamic_view.status != KZT_DYNAMIC_VIEW_READY)
+        return;
+
+    KztBuildDynamicInfo(&object->dynamic_info, &object->dynamic_view);
+    KztDynamicInfoSetRangeValidator(&object->dynamic_info,
+                                    kzt_guest_dynamic_range_is_readable,
+                                    NULL);
+    KztResolveDynamicSymbolCount(&object->dynamic_info,
+                                 object->load_bias);
+    object->has_dynamic_info = 1;
+}
+
+static uintptr_t kzt_guest_object_link_map_addr(KztGuestObject *object)
+{
+    return (uintptr_t)object->link_map;
+}
+
+static guest_object_observation_t kzt_observe_guest_object(
+    KztGuestObject *object)
+{
+    return ObserveGuestObject(my_context->guest_objects,
+                              kzt_guest_object_link_map_addr(object),
+                              object->load_bias,
+                              object->dynamic_addr,
+                              object->object_name);
+}
+
+static void kzt_log_guest_object_observation(
+    KztGuestObject *object,
+    guest_object_observation_t observation)
+{
+    if (observation != GUEST_OBJECT_OBSERVE_NEW
+        && observation != GUEST_OBJECT_OBSERVE_CHANGED) {
         return;
     }
-    printf_log(LOG_DEBUG, "%d debug %s link_map = %p{0x%lx, %s}\n", getpid(), __func__, my_lm, my_lm->l_addr, my_lm->l_name);
-    char * rfilename = my_lm->l_name;
-    if (strstr(basename(rfilename), "ld-linux-x86-64.so.2")) {
-        AddDebugInfo(LIB_EMULATED, my_lm->l_name, my_lm->l_map_start, my_lm->l_map_end);
-        return;
+
+    printf_log(LOG_DEBUG,
+               "%s guest object %s: map=%p bias=0x%lx dynamic=%p name=%s\n",
+               object->event_source,
+               observation == GUEST_OBJECT_OBSERVE_NEW ? "discovered"
+                                                      : "changed",
+               object->link_map, object->load_bias,
+               (void *)object->dynamic_addr, object->object_name);
+}
+
+static int kzt_register_guest_object(KztGuestObject *object)
+{
+    printf_log(LOG_DEBUG, "%d debug %s link_map = %p{0x%lx, %s}\n",
+               getpid(), object->event_source, object->link_map,
+               object->load_bias, object->object_name);
+
+    object->observation = kzt_observe_guest_object(object);
+    kzt_log_guest_object_observation(object, object->observation);
+    if (object->observation == GUEST_OBJECT_OBSERVE_INVALID) {
+        printf_log(LOG_DEBUG,
+                   "%s skip guest object map=%p name=%s reason=registry\n",
+                   object->event_source, object->link_map,
+                   object->object_name);
+        return 0;
     }
-    char filetmp[PATH_MAX] = {0};
-    if (rfilename[0] == '/') {
-        rfilename = kzt_find_realsofilepath(rfilename, filetmp);
+
+    kzt_parse_guest_object_dynamic(object);
+    return 1;
+}
+
+static void kzt_guest_object_from_loader_event(const KztLoaderEvent *event,
+                                               KztGuestObject *object)
+{
+    object->event_source = event->source;
+    object->link_map = event->link_map;
+    object->load_bias = event->load_bias;
+    object->dynamic_addr = event->dynamic_addr;
+    object->object_name = event->object_name;
+}
+
+static int kzt_begin_legacy_guest_object_processing(KztGuestObject *object)
+{
+    guest_object_process_result_t processing = BeginGuestObjectProcessing(
+        my_context->guest_objects, kzt_guest_object_link_map_addr(object));
+    if (processing == GUEST_OBJECT_PROCESS_IN_PROGRESS) {
+        printf_log(LOG_DEBUG,
+                   "%s skip guest object map=%p name=%s reason=processing\n",
+                   object->event_source, object->link_map,
+                   object->object_name);
+        return 0;
     }
-    char * rbasename = basename(rfilename);
-    library_t* lib = NewLibrary(rbasename, my_context);
-    if (lib) {
-        const char* libs[] = {rbasename};
-        AddNeededLib(my_context->maplib, &my_context->neededlibs, NULL, 0, 1, libs, 1, my_context);
+    if (processing == GUEST_OBJECT_PROCESS_DONE) {
+        printf_log(LOG_DEBUG,
+                   "%s skip guest object map=%p name=%s reason=done\n",
+                   object->event_source, object->link_map,
+                   object->object_name);
+        return 0;
     }
-    if (!lib && (!strncmp(rbasename, "libSDL", 6)||!strncmp(rbasename, "libCgGL.so", strlen("libCgGL.so")))) {
-        printf_log(LOG_DEBUG, "%s libSDL need libGL.so.1\n", __func__);
-        const char* libs[] = {"libGL.so.1"};
-        AddNeededLib(my_context->maplib, &my_context->neededlibs, NULL, 0, 1, libs, 1, my_context);
+    if (processing == GUEST_OBJECT_PROCESS_INVALID)
+        printf_log(LOG_DEBUG, "%s guest object registry unavailable\n",
+                   object->event_source);
+    return 1;
+}
+
+static int kzt_set_guest_object_state(KztGuestObject *object,
+                                      guest_object_state_t state)
+{
+    return SetGuestObjectState(my_context->guest_objects,
+                               kzt_guest_object_link_map_addr(object), state);
+}
+
+static void kzt_mark_guest_elf_unavailable(KztGuestObject *object)
+{
+    kzt_set_guest_object_state(object,
+                               object->is_loader ? GUEST_OBJECT_EMULATED
+                                                 : GUEST_OBJECT_FAILED);
+}
+
+static void kzt_resolve_guest_object_path(KztGuestObject *object)
+{
+    object->filename = object->object_name;
+    if (object->filename[0] == '/') {
+        object->filename =
+            kzt_find_realsofilepath(object->filename, object->filetmp);
     }
-    FILE *f = fopen(rfilename, "rb");
-    if(!f) {
-        printf_log(LOG_INFO, "%s Error: Cannot open \"%s\"\n", __func__, rfilename);
-        return;
+    object->basename = kzt_object_basename(object->filename);
+    object->is_loader =
+        strstr(object->basename, "ld-linux-x86-64.so.2") != NULL;
+}
+
+static elfheader_t *kzt_open_guest_elf(KztGuestObject *object)
+{
+    FILE *f = fopen(object->filename, "rb");
+    if (!f) {
+        printf_log(LOG_INFO, "%s Error: Cannot open \"%s\"\n",
+                   object->event_source, object->filename);
+        kzt_mark_guest_elf_unavailable(object);
+        return NULL;
     }
-    h = LoadAndCheckElfHeader(f, rfilename, 0);
-    ElfHeadReFix(h, my_lm->l_addr);
+
+    elfheader_t *h = LoadAndCheckElfHeader(f, object->filename, 0);
+    if (!h) {
+        printf_log(LOG_INFO, "%s Error: Cannot parse ELF header for \"%s\"\n",
+                   object->event_source, object->filename);
+        fclose(f);
+        kzt_mark_guest_elf_unavailable(object);
+        return NULL;
+    }
     fclose(f);
+    return h;
+}
+
+static int kzt_dynamic_ptr_matches(uintptr_t old_value, uintptr_t new_value,
+                                   uintptr_t load_bias)
+{
+    if (old_value == new_value)
+        return 1;
+    if (load_bias && old_value && old_value <= UINTPTR_MAX - load_bias
+        && old_value + load_bias == new_value)
+        return 1;
+    if (load_bias && new_value >= load_bias
+        && new_value - load_bias == old_value)
+        return 1;
+    return 0;
+}
+
+static __thread const char *kzt_dynamic_compare_source;
+
+static const char *kzt_dynamic_compare_log_source(void)
+{
+    return kzt_dynamic_compare_source
+        ? kzt_dynamic_compare_source
+        : KZT_GLIBC_LOADER_EVENT_SOURCE_NAME;
+}
+
+static const char *kzt_dynamic_compare_push_source(const char *source)
+{
+    const char *previous = kzt_dynamic_compare_source;
+
+    kzt_dynamic_compare_source = source ? source
+                                        : KZT_GLIBC_LOADER_EVENT_SOURCE_NAME;
+    return previous;
+}
+
+static void kzt_dynamic_compare_pop_source(const char *previous)
+{
+    kzt_dynamic_compare_source = previous;
+}
+
+static int kzt_dynamic_note_size_mismatch(const char *name, size_t old_value,
+                                          size_t new_value)
+{
+    if (old_value == new_value)
+        return 0;
+
+    printf_log(LOG_INFO,
+               "%s Dynamic mismatch %s: old=0x%zx new=0x%zx\n",
+               kzt_dynamic_compare_log_source(), name, old_value, new_value);
+    return 1;
+}
+
+static int kzt_dynamic_note_ptr_mismatch(const char *name, uintptr_t old_value,
+                                         uintptr_t new_value,
+                                         uintptr_t load_bias)
+{
+    if (kzt_dynamic_ptr_matches(old_value, new_value, load_bias))
+        return 0;
+
+    printf_log(LOG_INFO,
+               "%s Dynamic mismatch %s: old=0x%lx new=0x%lx bias=0x%lx\n",
+               kzt_dynamic_compare_log_source(), name, old_value, new_value,
+               load_bias);
+    return 1;
+}
+
+static int kzt_dynamic_note_error_mismatch(const char *name,
+                                           unsigned old_errors,
+                                           unsigned new_errors)
+{
+    if (old_errors == new_errors)
+        return 0;
+
+    printf_log(LOG_INFO,
+               "%s Dynamic mismatch %s: old=0x%x new=0x%x\n",
+               kzt_dynamic_compare_log_source(), name, old_errors, new_errors);
+    return 1;
+}
+
+#define KZT_DYNAMIC_SYMBOL_MISMATCH_LOG_LIMIT 32
+
+static int kzt_compare_dynamic_string_tag(const char *name, int tag,
+                                          KztDynamicView *old_view,
+                                          KztDynamicStringTable *old_strtab,
+                                          KztDynamicView *new_view,
+                                          KztDynamicStringTable *new_strtab)
+{
+    size_t new_index = 0;
+    int mismatches = 0;
+
+    for (size_t old_index = 0; old_index < old_view->entry_count;) {
+        KztDynamicStringEntry old_entry;
+        KztDynamicStringEntry new_entry;
+
+        if (!KztNextDynamicString(old_view, tag, &old_index, old_strtab,
+                                  &old_entry))
+            break;
+
+        if (!KztNextDynamicString(new_view, tag, &new_index, new_strtab,
+                                  &new_entry)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic mismatch %s: missing new entry for old offset=0x%lx\n",
+                       kzt_dynamic_compare_log_source(), name, old_entry.offset);
+            ++mismatches;
+            continue;
+        }
+
+        if (!old_entry.value || !new_entry.value) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic mismatch %s: invalid string offset old=0x%lx new=0x%lx\n",
+                       kzt_dynamic_compare_log_source(), name, old_entry.offset,
+                       new_entry.offset);
+            ++mismatches;
+            continue;
+        }
+        if (strcmp(old_entry.value, new_entry.value)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic mismatch %s: old=\"%s\" new=\"%s\"\n",
+                       kzt_dynamic_compare_log_source(), name, old_entry.value,
+                       new_entry.value);
+            ++mismatches;
+        }
+    }
+
+    return mismatches;
+}
+
+static int kzt_note_dynamic_symbol_mismatch(const char *name, size_t index,
+                                            int *mismatches)
+{
+    ++*mismatches;
+    if (*mismatches == KZT_DYNAMIC_SYMBOL_MISMATCH_LOG_LIMIT) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic symbol compare reached mismatch log limit at %s[%zu]\n",
+                   kzt_dynamic_compare_log_source(), name, index);
+    }
+    return *mismatches >= KZT_DYNAMIC_SYMBOL_MISMATCH_LOG_LIMIT;
+}
+
+static int kzt_compare_dynamic_symbols(elfheader_t *h,
+                                       KztDynamicInfo *old_info,
+                                       KztDynamicInfo *new_info,
+                                       uintptr_t load_bias)
+{
+    KztDynamicSymbolTable old_symbols = {
+        .symbols = h->DynSym,
+        .count = old_info->dynsym_count,
+        .strings = {
+            .data = h->DynStr,
+            .size = h->szDynStrTab,
+        },
+    };
+    KztDynamicSymbolTable new_symbols;
+    int has_new_symbols =
+        KztDynamicSymbolTableFromInfo(new_info, load_bias, &new_symbols);
+    size_t count = old_symbols.count < new_symbols.count
+                       ? old_symbols.count
+                       : new_symbols.count;
+    int mismatches = 0;
+
+    if (!old_info->has_dynsym_count || !new_info->has_dynsym_count
+        || !old_symbols.symbols || !has_new_symbols
+        || !old_symbols.strings.data || !new_symbols.strings.data) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic symbol compare skipped: old_symbols=%p old_count=%zu new_symbols=%p new_count=%zu\n",
+                   kzt_dynamic_compare_log_source(),
+                   old_symbols.symbols, old_symbols.count,
+                   new_symbols.symbols, new_symbols.count);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        KztDynamicSymbolEntry old_entry;
+        KztDynamicSymbolEntry new_entry;
+
+        if (!KztDynamicSymbolAt(&old_symbols, i, &old_entry)
+            || !KztDynamicSymbolAt(&new_symbols, i, &new_entry)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic symbol mismatch entry[%zu]: missing symbol\n",
+                       kzt_dynamic_compare_log_source(), i);
+            if (kzt_note_dynamic_symbol_mismatch("entry", i, &mismatches))
+                break;
+            continue;
+        }
+
+        if (!old_entry.name || !new_entry.name) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic symbol mismatch name[%zu]: old_off=0x%x new_off=0x%x\n",
+                       kzt_dynamic_compare_log_source(), i, old_entry.symbol->st_name,
+                       new_entry.symbol->st_name);
+            if (kzt_note_dynamic_symbol_mismatch("name", i, &mismatches))
+                break;
+            continue;
+        }
+
+        if (strcmp(old_entry.name, new_entry.name)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic symbol mismatch name[%zu]: old=\"%s\" new=\"%s\"\n",
+                       kzt_dynamic_compare_log_source(), i, old_entry.name,
+                       new_entry.name);
+            if (kzt_note_dynamic_symbol_mismatch("name", i, &mismatches))
+                break;
+        }
+        if (old_entry.symbol->st_info != new_entry.symbol->st_info) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic symbol mismatch info[%zu]: old=0x%x new=0x%x\n",
+                       kzt_dynamic_compare_log_source(), i, old_entry.symbol->st_info,
+                       new_entry.symbol->st_info);
+            if (kzt_note_dynamic_symbol_mismatch("info", i, &mismatches))
+                break;
+        }
+        if (old_entry.symbol->st_other != new_entry.symbol->st_other) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic symbol mismatch other[%zu]: old=0x%x new=0x%x\n",
+                       kzt_dynamic_compare_log_source(), i, old_entry.symbol->st_other,
+                       new_entry.symbol->st_other);
+            if (kzt_note_dynamic_symbol_mismatch("other", i, &mismatches))
+                break;
+        }
+        if (old_entry.symbol->st_shndx != new_entry.symbol->st_shndx) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic symbol mismatch shndx[%zu]: old=0x%x new=0x%x\n",
+                       kzt_dynamic_compare_log_source(), i, old_entry.symbol->st_shndx,
+                       new_entry.symbol->st_shndx);
+            if (kzt_note_dynamic_symbol_mismatch("shndx", i, &mismatches))
+                break;
+        }
+        if (!kzt_dynamic_ptr_matches(old_entry.symbol->st_value,
+                                     new_entry.symbol->st_value,
+                                     load_bias)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic symbol mismatch value[%zu]: old=0x%lx new=0x%lx bias=0x%lx\n",
+                       kzt_dynamic_compare_log_source(), i, old_entry.symbol->st_value,
+                       new_entry.symbol->st_value, load_bias);
+            if (kzt_note_dynamic_symbol_mismatch("value", i, &mismatches))
+                break;
+        }
+        if (old_entry.symbol->st_size != new_entry.symbol->st_size) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic symbol mismatch size[%zu]: old=0x%lx new=0x%lx\n",
+                       kzt_dynamic_compare_log_source(), i, old_entry.symbol->st_size,
+                       new_entry.symbol->st_size);
+            if (kzt_note_dynamic_symbol_mismatch("size", i, &mismatches))
+                break;
+        }
+    }
+
+    return mismatches;
+}
+
+static int kzt_note_dynamic_relocation_mismatch(const char *name,
+                                                size_t index,
+                                                int *mismatches)
+{
+    ++*mismatches;
+    if (*mismatches == KZT_DYNAMIC_SYMBOL_MISMATCH_LOG_LIMIT) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic relocation compare reached mismatch log limit at %s[%zu]\n",
+                   kzt_dynamic_compare_log_source(), name, index);
+    }
+    return *mismatches >= KZT_DYNAMIC_SYMBOL_MISMATCH_LOG_LIMIT;
+}
+
+static int kzt_compare_dynamic_relocation_table(const char *name,
+                                                KztDynamicInfo *new_info,
+                                                uintptr_t old_ptr,
+                                                int old_entry_size,
+                                                size_t old_count,
+                                                uintptr_t new_ptr,
+                                                int new_entry_size,
+                                                size_t new_count,
+                                                uintptr_t load_bias)
+{
+    KztDynamicRelocationTable old_table = {
+        .entries = KztDynamicRelocationsFromPtr(old_ptr, load_bias),
+        .count = old_count,
+        .entry_size = old_entry_size,
+    };
+    KztDynamicRelocationTable new_table = {
+        .entries = KztDynamicRelocationsFromInfo(
+            new_info, new_ptr, load_bias, new_count, new_entry_size),
+        .count = new_count,
+        .entry_size = new_entry_size,
+    };
+    size_t count = old_count < new_count ? old_count : new_count;
+    int mismatches = 0;
+
+    if (!count)
+        return 0;
+
+    if (old_entry_size != new_entry_size) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic relocation compare skipped %s: old_entry=0x%x new_entry=0x%x\n",
+                   kzt_dynamic_compare_log_source(), name, old_entry_size,
+                   new_entry_size);
+        return 0;
+    }
+
+    if (!old_table.entries || !new_table.entries) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic relocation compare skipped %s: old=%p new=%p old_count=%zu new_count=%zu\n",
+                   kzt_dynamic_compare_log_source(), name, old_table.entries,
+                   new_table.entries, old_count, new_count);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        KztDynamicRelocationEntry old_entry;
+        KztDynamicRelocationEntry new_entry;
+
+        if (!KztDynamicRelocationAt(&old_table, i, &old_entry)
+            || !KztDynamicRelocationAt(&new_table, i, &new_entry)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic relocation mismatch %s[%zu]: missing entry\n",
+                       kzt_dynamic_compare_log_source(), name, i);
+            if (kzt_note_dynamic_relocation_mismatch(name, i,
+                                                     &mismatches))
+                break;
+            continue;
+        }
+
+        if (!kzt_dynamic_ptr_matches(old_entry.offset, new_entry.offset,
+                                     load_bias)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic relocation mismatch %s[%zu].offset: old=0x%lx new=0x%lx bias=0x%lx\n",
+                       kzt_dynamic_compare_log_source(), name, i, old_entry.offset,
+                       new_entry.offset, load_bias);
+            if (kzt_note_dynamic_relocation_mismatch(name, i,
+                                                     &mismatches))
+                break;
+        }
+        if (old_entry.info != new_entry.info) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic relocation mismatch %s[%zu].info: old=0x%lx new=0x%lx\n",
+                       kzt_dynamic_compare_log_source(), name, i,
+                       (unsigned long)old_entry.info,
+                       (unsigned long)new_entry.info);
+            if (kzt_note_dynamic_relocation_mismatch(name, i,
+                                                     &mismatches))
+                break;
+        }
+        if (old_entry.has_addend != new_entry.has_addend) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic relocation mismatch %s[%zu].addend-kind: old=%d new=%d\n",
+                       kzt_dynamic_compare_log_source(), name, i, old_entry.has_addend,
+                       new_entry.has_addend);
+            if (kzt_note_dynamic_relocation_mismatch(name, i,
+                                                     &mismatches))
+                break;
+        }
+        if (old_entry.has_addend && new_entry.has_addend
+            && old_entry.addend != new_entry.addend) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic relocation mismatch %s[%zu].addend: old=0x%lx new=0x%lx\n",
+                       kzt_dynamic_compare_log_source(), name, i,
+                       (unsigned long)old_entry.addend,
+                       (unsigned long)new_entry.addend);
+            if (kzt_note_dynamic_relocation_mismatch(name, i,
+                                                     &mismatches))
+                break;
+        }
+    }
+
+    return mismatches;
+}
+
+static int kzt_compare_dynamic_relocations(KztDynamicInfo *old_info,
+                                           KztDynamicInfo *new_info,
+                                           uintptr_t load_bias)
+{
+    int mismatches = 0;
+
+    if (old_info->has_rel_count && new_info->has_rel_count) {
+        mismatches += kzt_compare_dynamic_relocation_table(
+            "DT_REL", new_info, old_info->rel, old_info->relent,
+            old_info->rel_count, new_info->rel, new_info->relent,
+            new_info->rel_count, load_bias);
+    }
+
+    if (old_info->has_rela_count && new_info->has_rela_count) {
+        mismatches += kzt_compare_dynamic_relocation_table(
+            "DT_RELA", new_info, old_info->rela, old_info->relaent,
+            old_info->rela_count, new_info->rela, new_info->relaent,
+            new_info->rela_count, load_bias);
+    }
+
+    if (old_info->has_plt_count && new_info->has_plt_count) {
+        mismatches += kzt_compare_dynamic_relocation_table(
+            "DT_JMPREL", new_info, old_info->jmprel, old_info->pltent,
+            old_info->plt_count, new_info->jmprel, new_info->pltent,
+            new_info->plt_count, load_bias);
+    }
+
+    return mismatches;
+}
+
+static int kzt_compare_dynamic_versym(elfheader_t *h,
+                                      KztDynamicInfo *old_info,
+                                      KztDynamicInfo *new_info,
+                                      uintptr_t load_bias)
+{
+    const Elf64_Half *old_versym =
+        KztDynamicVersymFromPtr((uintptr_t)h->VerSym, load_bias);
+    const Elf64_Half *new_versym =
+        KztDynamicVersymFromInfo(new_info, load_bias);
+    size_t count = old_info->dynsym_count < new_info->dynsym_count
+                       ? old_info->dynsym_count
+                       : new_info->dynsym_count;
+    int mismatches = 0;
+
+    if (!old_info->has_dynsym_count || !new_info->has_dynsym_count
+        || !old_versym || !new_versym) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic versym compare skipped: old=%p new=%p old_count=%zu new_count=%zu\n",
+                   kzt_dynamic_compare_log_source(), old_versym, new_versym,
+                   old_info->dynsym_count, new_info->dynsym_count);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        if (old_versym[i] == new_versym[i])
+            continue;
+
+        printf_log(LOG_INFO,
+                   "%s Dynamic versym mismatch[%zu]: old=0x%x new=0x%x\n",
+                   kzt_dynamic_compare_log_source(), i, old_versym[i],
+                   new_versym[i]);
+        if (kzt_note_dynamic_symbol_mismatch("versym", i, &mismatches))
+            break;
+    }
+
+    return mismatches;
+}
+
+static int kzt_compare_dynamic_verneed(elfheader_t *h,
+                                       KztDynamicInfo *old_info,
+                                       KztDynamicInfo *new_info,
+                                       uintptr_t load_bias)
+{
+    const Elf64_Verneed *old_base =
+        KztDynamicVerneedFromPtr((uintptr_t)h->VerNeed, load_bias);
+    const Elf64_Verneed *new_base =
+        KztDynamicVerneedFromInfo(new_info, load_bias);
+    KztDynamicStringTable old_strtab = {
+        .data = h->DynStr,
+        .size = h->szDynStrTab,
+    };
+    KztDynamicStringTable new_strtab;
+    size_t old_count = old_info->verneed_count > 0
+                           ? (size_t)old_info->verneed_count
+                           : 0;
+    size_t new_count = new_info->verneed_count > 0
+                           ? (size_t)new_info->verneed_count
+                           : 0;
+    size_t count = old_count < new_count ? old_count : new_count;
+    int mismatches = 0;
+
+    KztDynamicStringTableFromInfo(new_info, load_bias, &new_strtab);
+
+    if (!old_base || !new_base || !old_strtab.data || !new_strtab.data) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic verneed compare skipped: old=%p new=%p old_count=%zu new_count=%zu\n",
+                   kzt_dynamic_compare_log_source(), old_base, new_base, old_count,
+                   new_count);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        KztDynamicVerneedEntry old_need;
+        KztDynamicVerneedEntry new_need;
+        size_t aux_count;
+
+        if (!KztDynamicVerneedAt(old_base, i, &old_strtab, &old_need)
+            || !KztDynamicVerneedAtFromInfo(new_info, new_base, i,
+                                            &new_strtab, &new_need)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verneed mismatch entry[%zu]: missing record\n",
+                       kzt_dynamic_compare_log_source(), i);
+            if (kzt_note_dynamic_symbol_mismatch("verneed", i,
+                                                 &mismatches))
+                break;
+            continue;
+        }
+
+        if (!old_need.file || !new_need.file
+            || strcmp(old_need.file, new_need.file)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verneed mismatch file[%zu]: old=\"%s\" new=\"%s\"\n",
+                       kzt_dynamic_compare_log_source(), i,
+                       old_need.file ? old_need.file : "<invalid>",
+                       new_need.file ? new_need.file : "<invalid>");
+            if (kzt_note_dynamic_symbol_mismatch("verneed-file", i,
+                                                 &mismatches))
+                break;
+        }
+        if (old_need.record->vn_version != new_need.record->vn_version) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verneed mismatch version[%zu]: old=0x%x new=0x%x\n",
+                       kzt_dynamic_compare_log_source(), i, old_need.record->vn_version,
+                       new_need.record->vn_version);
+            if (kzt_note_dynamic_symbol_mismatch("verneed-version", i,
+                                                 &mismatches))
+                break;
+        }
+        if (old_need.record->vn_cnt != new_need.record->vn_cnt) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verneed mismatch aux-count[%zu]: old=0x%x new=0x%x\n",
+                       kzt_dynamic_compare_log_source(), i, old_need.record->vn_cnt,
+                       new_need.record->vn_cnt);
+            if (kzt_note_dynamic_symbol_mismatch("verneed-count", i,
+                                                 &mismatches))
+                break;
+        }
+
+        aux_count = old_need.record->vn_cnt < new_need.record->vn_cnt
+                        ? old_need.record->vn_cnt
+                        : new_need.record->vn_cnt;
+        for (size_t j = 0; j < aux_count; ++j) {
+            KztDynamicVernauxEntry old_aux;
+            KztDynamicVernauxEntry new_aux;
+
+            if (!KztDynamicVernauxAt(&old_need, j, &old_strtab, &old_aux)
+                || !KztDynamicVernauxAt(&new_need, j, &new_strtab,
+                                        &new_aux)) {
+                printf_log(LOG_INFO,
+                           "%s Dynamic verneed mismatch aux[%zu:%zu]: missing record\n",
+                           kzt_dynamic_compare_log_source(), i, j);
+                if (kzt_note_dynamic_symbol_mismatch("vernaux", i,
+                                                     &mismatches))
+                    return mismatches;
+                continue;
+            }
+
+            if (!old_aux.name || !new_aux.name
+                || strcmp(old_aux.name, new_aux.name)) {
+                printf_log(LOG_INFO,
+                           "%s Dynamic verneed mismatch aux-name[%zu:%zu]: old=\"%s\" new=\"%s\"\n",
+                           kzt_dynamic_compare_log_source(), i, j,
+                           old_aux.name ? old_aux.name : "<invalid>",
+                           new_aux.name ? new_aux.name : "<invalid>");
+                if (kzt_note_dynamic_symbol_mismatch("vernaux-name", i,
+                                                     &mismatches))
+                    return mismatches;
+            }
+            if (old_aux.record->vna_hash != new_aux.record->vna_hash) {
+                printf_log(LOG_INFO,
+                           "%s Dynamic verneed mismatch aux-hash[%zu:%zu]: old=0x%x new=0x%x\n",
+                           kzt_dynamic_compare_log_source(), i, j,
+                           old_aux.record->vna_hash,
+                           new_aux.record->vna_hash);
+                if (kzt_note_dynamic_symbol_mismatch("vernaux-hash", i,
+                                                     &mismatches))
+                    return mismatches;
+            }
+            if (old_aux.record->vna_flags != new_aux.record->vna_flags) {
+                printf_log(LOG_INFO,
+                           "%s Dynamic verneed mismatch aux-flags[%zu:%zu]: old=0x%x new=0x%x\n",
+                           kzt_dynamic_compare_log_source(), i, j,
+                           old_aux.record->vna_flags,
+                           new_aux.record->vna_flags);
+                if (kzt_note_dynamic_symbol_mismatch("vernaux-flags", i,
+                                                     &mismatches))
+                    return mismatches;
+            }
+            if (old_aux.record->vna_other != new_aux.record->vna_other) {
+                printf_log(LOG_INFO,
+                           "%s Dynamic verneed mismatch aux-other[%zu:%zu]: old=0x%x new=0x%x\n",
+                           kzt_dynamic_compare_log_source(), i, j,
+                           old_aux.record->vna_other,
+                           new_aux.record->vna_other);
+                if (kzt_note_dynamic_symbol_mismatch("vernaux-other", i,
+                                                     &mismatches))
+                    return mismatches;
+            }
+        }
+    }
+
+    return mismatches;
+}
+
+static int kzt_compare_dynamic_verdef(elfheader_t *h,
+                                      KztDynamicInfo *old_info,
+                                      KztDynamicInfo *new_info,
+                                      uintptr_t load_bias)
+{
+    const Elf64_Verdef *old_base =
+        KztDynamicVerdefFromPtr((uintptr_t)h->VerDef, load_bias);
+    const Elf64_Verdef *new_base =
+        KztDynamicVerdefFromInfo(new_info, load_bias);
+    KztDynamicStringTable old_strtab = {
+        .data = h->DynStr,
+        .size = h->szDynStrTab,
+    };
+    KztDynamicStringTable new_strtab;
+    size_t old_count = old_info->verdef_count > 0
+                           ? (size_t)old_info->verdef_count
+                           : 0;
+    size_t new_count = new_info->verdef_count > 0
+                           ? (size_t)new_info->verdef_count
+                           : 0;
+    size_t count = old_count < new_count ? old_count : new_count;
+    int mismatches = 0;
+
+    KztDynamicStringTableFromInfo(new_info, load_bias, &new_strtab);
+
+    if (!old_base || !new_base || !old_strtab.data || !new_strtab.data) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic verdef compare skipped: old=%p new=%p old_count=%zu new_count=%zu\n",
+                   kzt_dynamic_compare_log_source(), old_base, new_base, old_count,
+                   new_count);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; ++i) {
+        KztDynamicVerdefEntry old_def;
+        KztDynamicVerdefEntry new_def;
+        size_t aux_count;
+
+        if (!KztDynamicVerdefAt(old_base, i, &old_def)
+            || !KztDynamicVerdefAtFromInfo(new_info, new_base, i,
+                                           &new_def)) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verdef mismatch entry[%zu]: missing record\n",
+                       kzt_dynamic_compare_log_source(), i);
+            if (kzt_note_dynamic_symbol_mismatch("verdef", i,
+                                                 &mismatches))
+                break;
+            continue;
+        }
+
+        if (old_def.record->vd_version != new_def.record->vd_version) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verdef mismatch version[%zu]: old=0x%x new=0x%x\n",
+                       kzt_dynamic_compare_log_source(), i, old_def.record->vd_version,
+                       new_def.record->vd_version);
+            if (kzt_note_dynamic_symbol_mismatch("verdef-version", i,
+                                                 &mismatches))
+                break;
+        }
+        if (old_def.record->vd_flags != new_def.record->vd_flags) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verdef mismatch flags[%zu]: old=0x%x new=0x%x\n",
+                       kzt_dynamic_compare_log_source(), i, old_def.record->vd_flags,
+                       new_def.record->vd_flags);
+            if (kzt_note_dynamic_symbol_mismatch("verdef-flags", i,
+                                                 &mismatches))
+                break;
+        }
+        if (old_def.record->vd_ndx != new_def.record->vd_ndx) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verdef mismatch index[%zu]: old=0x%x new=0x%x\n",
+                       kzt_dynamic_compare_log_source(), i, old_def.record->vd_ndx,
+                       new_def.record->vd_ndx);
+            if (kzt_note_dynamic_symbol_mismatch("verdef-index", i,
+                                                 &mismatches))
+                break;
+        }
+        if (old_def.record->vd_cnt != new_def.record->vd_cnt) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verdef mismatch aux-count[%zu]: old=0x%x new=0x%x\n",
+                       kzt_dynamic_compare_log_source(), i, old_def.record->vd_cnt,
+                       new_def.record->vd_cnt);
+            if (kzt_note_dynamic_symbol_mismatch("verdef-count", i,
+                                                 &mismatches))
+                break;
+        }
+        if (old_def.record->vd_hash != new_def.record->vd_hash) {
+            printf_log(LOG_INFO,
+                       "%s Dynamic verdef mismatch hash[%zu]: old=0x%x new=0x%x\n",
+                       kzt_dynamic_compare_log_source(), i, old_def.record->vd_hash,
+                       new_def.record->vd_hash);
+            if (kzt_note_dynamic_symbol_mismatch("verdef-hash", i,
+                                                 &mismatches))
+                break;
+        }
+
+        aux_count = old_def.record->vd_cnt < new_def.record->vd_cnt
+                        ? old_def.record->vd_cnt
+                        : new_def.record->vd_cnt;
+        for (size_t j = 0; j < aux_count; ++j) {
+            KztDynamicVerdauxEntry old_aux;
+            KztDynamicVerdauxEntry new_aux;
+
+            if (!KztDynamicVerdauxAt(&old_def, j, &old_strtab, &old_aux)
+                || !KztDynamicVerdauxAt(&new_def, j, &new_strtab,
+                                        &new_aux)) {
+                printf_log(LOG_INFO,
+                           "%s Dynamic verdef mismatch aux[%zu:%zu]: missing record\n",
+                           kzt_dynamic_compare_log_source(), i, j);
+                if (kzt_note_dynamic_symbol_mismatch("verdaux", i,
+                                                     &mismatches))
+                    return mismatches;
+                continue;
+            }
+
+            if (!old_aux.name || !new_aux.name
+                || strcmp(old_aux.name, new_aux.name)) {
+                printf_log(LOG_INFO,
+                           "%s Dynamic verdef mismatch aux-name[%zu:%zu]: old=\"%s\" new=\"%s\"\n",
+                           kzt_dynamic_compare_log_source(), i, j,
+                           old_aux.name ? old_aux.name : "<invalid>",
+                           new_aux.name ? new_aux.name : "<invalid>");
+                if (kzt_note_dynamic_symbol_mismatch("verdaux-name", i,
+                                                     &mismatches))
+                    return mismatches;
+            }
+        }
+    }
+
+    return mismatches;
+}
+
+static int kzt_compare_dynamic_strings(elfheader_t *h,
+                                       KztDynamicView *old_view,
+                                       KztDynamicInfo *new_info,
+                                       KztDynamicView *new_view,
+                                       uintptr_t load_bias)
+{
+    KztDynamicStringTable old_strtab = {
+        .data = h->DynStr,
+        .size = h->szDynStrTab,
+    };
+    KztDynamicStringTable new_strtab;
+    int mismatches = 0;
+
+    KztDynamicStringTableFromInfo(new_info, load_bias, &new_strtab);
+
+    if (!old_strtab.data || !old_strtab.size || !new_strtab.data
+        || !new_strtab.size) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic string compare skipped: old_strtab=%p old_size=0x%zx new_strtab=%p new_size=0x%zx\n",
+                   kzt_dynamic_compare_log_source(), old_strtab.data, old_strtab.size,
+                   new_strtab.data, new_strtab.size);
+        return 0;
+    }
+
+    mismatches += kzt_compare_dynamic_string_tag(
+        "DT_NEEDED", DT_NEEDED, old_view, &old_strtab, new_view,
+        &new_strtab);
+    mismatches += kzt_compare_dynamic_string_tag(
+        "DT_RPATH", DT_RPATH, old_view, &old_strtab, new_view, &new_strtab);
+    mismatches += kzt_compare_dynamic_string_tag(
+        "DT_RUNPATH", DT_RUNPATH, old_view, &old_strtab, new_view,
+        &new_strtab);
+
+    return mismatches;
+}
+
+static void kzt_build_legacy_dynamic_info(KztDynamicInfo *info,
+                                          const KztDynamicView *view,
+                                          elfheader_t *h)
+{
+    KztBuildDynamicInfo(info, view);
+    info->dynsym_count = h->numDynSym;
+    info->has_dynsym_count = h->DynSym && h->numDynSym;
+}
+
+static int kzt_compare_guest_dynamic_info(KztDynamicInfo *old_info,
+                                          KztDynamicInfo *new_info,
+                                          uintptr_t load_bias)
+{
+    int mismatches = 0;
+
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_STRTAB", old_info->strtab, new_info->strtab, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_STRSZ", old_info->strsz, new_info->strsz);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_SYMTAB", old_info->symtab, new_info->symtab, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.dynsym_count_available", old_info->has_dynsym_count,
+        new_info->has_dynsym_count);
+    if (old_info->has_dynsym_count && new_info->has_dynsym_count) {
+        mismatches += kzt_dynamic_note_size_mismatch(
+            "info.dynsym_count", old_info->dynsym_count,
+            new_info->dynsym_count);
+    }
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_REL", old_info->rel, new_info->rel, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_RELSZ", old_info->relsz, new_info->relsz);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_RELENT", old_info->relent, new_info->relent);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.rel_count_available", old_info->has_rel_count,
+        new_info->has_rel_count);
+    if (old_info->has_rel_count && new_info->has_rel_count) {
+        mismatches += kzt_dynamic_note_size_mismatch(
+            "info.rel_count", old_info->rel_count, new_info->rel_count);
+    }
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_RELA", old_info->rela, new_info->rela, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_RELASZ", old_info->relasz, new_info->relasz);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_RELAENT", old_info->relaent, new_info->relaent);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.rela_count_available", old_info->has_rela_count,
+        new_info->has_rela_count);
+    if (old_info->has_rela_count && new_info->has_rela_count) {
+        mismatches += kzt_dynamic_note_size_mismatch(
+            "info.rela_count", old_info->rela_count, new_info->rela_count);
+    }
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_JMPREL", old_info->jmprel, new_info->jmprel, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_PLTRELSZ", old_info->pltsz, new_info->pltsz);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.plt_entry", old_info->pltent, new_info->pltent);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.plt_count_available", old_info->has_plt_count,
+        new_info->has_plt_count);
+    if (old_info->has_plt_count && new_info->has_plt_count) {
+        mismatches += kzt_dynamic_note_size_mismatch(
+            "info.plt_count", old_info->plt_count, new_info->plt_count);
+    }
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_PLTREL", old_info->pltrel, new_info->pltrel);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_PLTGOT", old_info->pltgot, new_info->pltgot, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_INIT", old_info->initentry, new_info->initentry, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_INIT_ARRAY", old_info->initarray, new_info->initarray,
+        load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_INIT_ARRAYSZ", old_info->initarray_count,
+        new_info->initarray_count);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_FINI", old_info->finientry, new_info->finientry, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_FINI_ARRAY", old_info->finiarray, new_info->finiarray,
+        load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_FINI_ARRAYSZ", old_info->finiarray_count,
+        new_info->finiarray_count);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_VERSYM", old_info->versym, new_info->versym, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_VERNEED", old_info->verneed, new_info->verneed, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_VERNEEDNUM", old_info->verneed_count,
+        new_info->verneed_count);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "info.DT_VERDEF", old_info->verdef, new_info->verdef, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "info.DT_VERDEFNUM", old_info->verdef_count,
+        new_info->verdef_count);
+    mismatches += kzt_dynamic_note_error_mismatch(
+        "info.errors", old_info->errors, new_info->errors);
+
+    return mismatches;
+}
+
+static void kzt_compare_guest_dynamic(KztGuestObject *object, elfheader_t *h)
+{
+    KztDynamicView old_view;
+    KztDynamicInfo old_info;
+    KztDynamicSummary *old_dynamic = &old_view.summary;
+    KztDynamicView *new_view = &object->dynamic_view;
+    KztDynamicInfo *new_info = &object->dynamic_info;
+    KztDynamicSummary *new_dynamic = &new_view->summary;
+    uintptr_t load_bias = object->load_bias;
+    int mismatches = 0;
+    const char *previous_source =
+        kzt_dynamic_compare_push_source(object->event_source);
+
+    KztParseDynamicView(&old_view, h->Dynamic, h->numDynamic);
+
+    if (old_view.status == KZT_DYNAMIC_VIEW_EMPTY) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic compare skipped for \"%s\": old parser has no dynamic table\n",
+                   kzt_dynamic_compare_log_source(), object->filename);
+        goto out;
+    }
+    if (new_view->status == KZT_DYNAMIC_VIEW_EMPTY) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic compare skipped for \"%s\": link_map has no l_ld\n",
+                   kzt_dynamic_compare_log_source(), object->filename);
+        goto out;
+    }
+    if (new_view->status == KZT_DYNAMIC_VIEW_TRUNCATED) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic compare skipped for \"%s\": no DT_NULL within %d entries\n",
+                   kzt_dynamic_compare_log_source(), object->filename,
+                   KZT_DYNAMIC_SCAN_MAX);
+        goto out;
+    }
+    if (!object->has_dynamic_info) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic compare skipped for \"%s\": parser info is unavailable\n",
+                   kzt_dynamic_compare_log_source(), object->filename);
+        goto out;
+    }
+
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "entries", old_dynamic->entries, new_dynamic->entries);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "needed_count", old_dynamic->needed_count, new_dynamic->needed_count);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "rpath_count", old_dynamic->rpath_count, new_dynamic->rpath_count);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "runpath_count", old_dynamic->runpath_count, new_dynamic->runpath_count);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_STRTAB", old_dynamic->strtab, new_dynamic->strtab, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_STRSZ", old_dynamic->strsz, new_dynamic->strsz);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_SYMTAB", old_dynamic->symtab, new_dynamic->symtab, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_SYMENT", old_dynamic->syment, new_dynamic->syment);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_HASH", old_dynamic->hash, new_dynamic->hash, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_GNU_HASH", old_dynamic->gnu_hash, new_dynamic->gnu_hash, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_REL", old_dynamic->rel, new_dynamic->rel, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_RELSZ", old_dynamic->relsz, new_dynamic->relsz);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_RELENT", old_dynamic->relent, new_dynamic->relent);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_RELA", old_dynamic->rela, new_dynamic->rela, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_RELASZ", old_dynamic->relasz, new_dynamic->relasz);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_RELAENT", old_dynamic->relaent, new_dynamic->relaent);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_JMPREL", old_dynamic->jmprel, new_dynamic->jmprel, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_PLTRELSZ", old_dynamic->pltrelsz, new_dynamic->pltrelsz);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_PLTREL", old_dynamic->pltrel, new_dynamic->pltrel);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_PLTGOT", old_dynamic->pltgot, new_dynamic->pltgot, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_INIT", old_dynamic->init, new_dynamic->init, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_INIT_ARRAY", old_dynamic->init_array, new_dynamic->init_array,
+        load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_INIT_ARRAYSZ", old_dynamic->init_arraysz,
+        new_dynamic->init_arraysz);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_FINI", old_dynamic->fini, new_dynamic->fini, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_FINI_ARRAY", old_dynamic->fini_array, new_dynamic->fini_array,
+        load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_FINI_ARRAYSZ", old_dynamic->fini_arraysz,
+        new_dynamic->fini_arraysz);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_VERSYM", old_dynamic->versym, new_dynamic->versym, load_bias);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_VERNEED", old_dynamic->verneed, new_dynamic->verneed, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_VERNEEDNUM", old_dynamic->verneednum, new_dynamic->verneednum);
+    mismatches += kzt_dynamic_note_ptr_mismatch(
+        "DT_VERDEF", old_dynamic->verdef, new_dynamic->verdef, load_bias);
+    mismatches += kzt_dynamic_note_size_mismatch(
+        "DT_VERDEFNUM", old_dynamic->verdefnum, new_dynamic->verdefnum);
+
+    kzt_build_legacy_dynamic_info(&old_info, &old_view, h);
+    mismatches += kzt_compare_guest_dynamic_info(&old_info, new_info,
+                                                 load_bias);
+    mismatches += kzt_compare_dynamic_strings(h, &old_view, new_info,
+                                              new_view, load_bias);
+    mismatches += kzt_compare_dynamic_symbols(h, &old_info, new_info,
+                                              load_bias);
+    mismatches += kzt_compare_dynamic_relocations(&old_info, new_info,
+                                                  load_bias);
+    mismatches += kzt_compare_dynamic_versym(h, &old_info, new_info,
+                                             load_bias);
+    mismatches += kzt_compare_dynamic_verneed(h, &old_info, new_info,
+                                              load_bias);
+    mismatches += kzt_compare_dynamic_verdef(h, &old_info, new_info,
+                                             load_bias);
+
+    if (mismatches) {
+        printf_log(LOG_INFO,
+                   "%s Dynamic compare found %d mismatches for \"%s\"\n",
+                   kzt_dynamic_compare_log_source(), mismatches,
+                   object->filename);
+        goto out;
+    }
+
+    printf_log(LOG_DEBUG,
+               "%s Dynamic compare matched for \"%s\": entries=%zu needed=%zu bias=0x%lx\n",
+               kzt_dynamic_compare_log_source(), object->filename,
+               new_dynamic->entries, new_dynamic->needed_count, load_bias);
+
+out:
+    kzt_dynamic_compare_pop_source(previous_source);
+}
+
+static void kzt_record_guest_load_range(KztGuestObject *object,
+                                        elfheader_t *h)
+{
+    if (!GetElfLoadRange(h->PHEntries, h->numPHEntries,
+                         object->load_bias, TARGET_PAGE_SIZE,
+                         &object->map_start, &object->map_end)) {
+        SetGuestObjectMapRange(my_context->guest_objects,
+                               kzt_guest_object_link_map_addr(object),
+                               object->map_start, object->map_end);
+    } else {
+        printf_log(LOG_INFO,
+                   "%s Warning: Cannot determine load range for \"%s\"\n",
+                   object->event_source, object->filename);
+    }
+}
+
+static library_t *kzt_register_guest_library_policy(KztGuestObject *object)
+{
+    if (!object->basename || !FindLibIsWrapped((char *)object->basename)) {
+        return NULL;
+    }
+
+    const char *libs[] = {object->basename};
+    if (AddNeededLib(my_context->maplib, &my_context->neededlibs, NULL, 0,
+                     1, libs, 1, my_context)) {
+        printf_log(LOG_INFO, "%s Error: registering wrapper for \"%s\"\n",
+                   object->event_source, object->basename);
+        return NULL;
+    }
+    return GetLibInternal(object->basename);
+}
+
+static void kzt_add_guest_object_debug_info(KztGuestObject *object, int type)
+{
+    if (object->map_start < object->map_end)
+        AddDebugInfo(type, object->object_name, object->map_start,
+                     object->map_end);
+}
+
+static void kzt_finish_guest_loader_object(KztGuestObject *object,
+                                           elfheader_t **h)
+{
+    kzt_add_guest_object_debug_info(object, LIB_EMULATED);
+    FreeElfHeader(h);
+    kzt_set_guest_object_state(object, GUEST_OBJECT_EMULATED);
+}
+
+static void kzt_finish_guest_object_success(KztGuestObject *object,
+                                            library_t *lib)
+{
+    if (lib) {
+        kzt_add_guest_object_debug_info(object, LIB_WRAPPED);
+        kzt_set_guest_object_state(object, GUEST_OBJECT_WRAPPED);
+    } else {
+        kzt_add_guest_object_debug_info(object, LIB_EMULATED);
+        kzt_set_guest_object_state(object, GUEST_OBJECT_EMULATED);
+    }
+}
+
+static int kzt_relocate_guest_object_legacy(KztGuestObject *object,
+                                            elfheader_t *h)
+{
+    if (RelocateElf(my_context->maplib, NULL, 0, h)) {
+        printf_log(LOG_INFO, "%s Error: relocating symbols for \"%s\"\n",
+                   object->event_source, object->filename);
+        kzt_set_guest_object_state(object, GUEST_OBJECT_FAILED);
+        return -1;
+    }
+    if (RelocateElfPlt(my_context->maplib, NULL, 0, h)) {
+        printf_log(LOG_INFO, "%s Error: relocating PLT symbols for \"%s\"\n",
+                   object->event_source, object->filename);
+        kzt_set_guest_object_state(object, GUEST_OBJECT_FAILED);
+        return -1;
+    }
+    return 0;
+}
+
+static void kzt_prepare_guest_object_legacy_elf(KztGuestObject *object,
+                                                elfheader_t *h)
+{
+    ElfHeadReFix(h, object->load_bias);
     collectX86free(h);
-    if(!x86free &&!strcmp(rbasename, libcName)) {
+    if(!x86free &&!strcmp(object->basename, libcName)) {
         struct malloc_map * m = SearchMallocMap(my_context, (char *)libcName);
         lsassert(m);
         x86free = m->freep;
         x86realloc = m->reallocp;
     }
-    if(!x86pthread_setcanceltype &&!strcmp(rbasename, libcName)) {
+    if(!x86pthread_setcanceltype &&!strcmp(object->basename, libcName)) {
         findx86pthread_setcanceltype(h);
     }
     AddElfHeader(my_context, h);
-    LoadNeededLibs(h, my_context->maplib, &my_context->neededlibs, NULL, 0, 0, my_context);
-    RelocateElf(my_context->maplib, NULL, 0, h);
-    RelocateElfPlt(my_context->maplib, NULL, 0, h);
-    if (lib) {
-        AddDebugInfo(LIB_WRAPPED, my_lm->l_name, my_lm->l_map_start, my_lm->l_map_end);
-    } else {
-        AddDebugInfo(LIB_EMULATED, my_lm->l_name, my_lm->l_map_start, my_lm->l_map_end);
+    kzt_skip_guest_needed_side_load(object->event_source, object->filename);
+}
+
+static void kzt_process_regular_guest_object_legacy(KztGuestObject *object,
+                                                    elfheader_t *h)
+{
+    library_t *lib = kzt_register_guest_library_policy(object);
+
+    kzt_prepare_guest_object_legacy_elf(object, h);
+    if (kzt_relocate_guest_object_legacy(object, h))
+        return;
+
+    kzt_finish_guest_object_success(object, lib);
+}
+
+static elfheader_t *kzt_prepare_guest_object_discovery(KztGuestObject *object)
+{
+    kzt_resolve_guest_object_path(object);
+    elfheader_t *h = kzt_open_guest_elf(object);
+    if (!h)
+        return NULL;
+
+    kzt_compare_guest_dynamic(object, h);
+    kzt_record_guest_load_range(object, h);
+    return h;
+}
+
+static void kzt_finish_discovered_guest_object(KztGuestObject *object,
+                                               elfheader_t **h)
+{
+    if (object->is_loader) {
+        kzt_finish_guest_loader_object(object, h);
+        return;
     }
+
+    kzt_process_regular_guest_object_legacy(object, *h);
+}
+
+static void kzt_dispatch_guest_object_compat(KztGuestObject *object)
+{
+    if (!kzt_begin_legacy_guest_object_processing(object))
+        return;
+
+    elfheader_t *h = kzt_prepare_guest_object_discovery(object);
+    if (!h)
+        return;
+
+    kzt_finish_discovered_guest_object(object, &h);
+}
+
+static void kzt_handle_loader_event(const KztLoaderEvent *event)
+{
+    KztGuestObject object = {0};
+
+    kzt_guest_object_from_loader_event(event, &object);
+
+    if (!kzt_register_guest_object(&object))
+        return;
+
+    kzt_dispatch_guest_object_compat(&object);
+}
+
+static int kzt_submit_loader_link_map_event(const char *source,
+                                            struct link_map_x64 *link_map)
+{
+    KztLoaderEvent event = {0};
+
+    if (!kzt_capture_loader_event_from_link_map(source, link_map, &event))
+        return 0;
+
+    kzt_handle_loader_event(&event);
+    return 1;
+}
+
+#define KZT_R_DEBUG_LINK_MAP_LIMIT 512
+
+static int kzt_r_debug_is_scannable(KztRDebugEventSource *source,
+                                    KztRDebug *r_debug)
+{
+    const char *source_name = source->name ? source->name
+                                           : KZT_R_DEBUG_EVENT_SOURCE_NAME;
+
+    if (r_debug->r_version != KZT_R_DEBUG_VERSION) {
+        printf_log(LOG_DEBUG, "%s skip r_debug: version=%d\n",
+                   source_name, r_debug->r_version);
+        return 0;
+    }
+
+    switch (r_debug->r_state) {
+        case KZT_RT_CONSISTENT:
+            return 1;
+        case KZT_RT_ADD:
+        case KZT_RT_DELETE:
+            printf_log(LOG_DEBUG, "%s skip r_debug while state=%d\n",
+                       source_name, r_debug->r_state);
+            return 0;
+        default:
+            printf_log(LOG_DEBUG, "%s skip r_debug: state=%d\n",
+                       source_name, r_debug->r_state);
+            return 0;
+    }
+}
+
+static int kzt_submit_r_debug_events(KztRDebugEventSource *source)
+{
+    if (!source || !source->addr)
+        return 0;
+
+    KztRDebug *r_debug = (KztRDebug *)source->addr;
+    const char *source_name = source->name ? source->name
+                                           : KZT_R_DEBUG_EVENT_SOURCE_NAME;
+    if (!kzt_guest_range_is_readable(r_debug, sizeof(*r_debug))) {
+        printf_log(LOG_DEBUG, "%s skip r_debug: addr=%p is not readable\n",
+                   source_name, r_debug);
+        return 0;
+    }
+    if (!kzt_r_debug_is_scannable(source, r_debug))
+        return 0;
+
+    struct link_map_x64 *link_map = r_debug->r_map;
+    int submitted = 0;
+
+    for (int i = 0; link_map && i < KZT_R_DEBUG_LINK_MAP_LIMIT; ++i) {
+        if (!kzt_guest_link_map_is_readable(link_map, source_name))
+            return submitted;
+
+        struct link_map_x64 *next = link_map->l_next;
+        submitted |= kzt_submit_loader_link_map_event(source_name, link_map);
+        if (next == link_map) {
+            printf_log(LOG_DEBUG,
+                       "%s stop link_map scan: self loop at %p\n",
+                       source_name, link_map);
+            return submitted;
+        }
+        if (next && !kzt_guest_link_map_is_readable(next, source_name))
+            return submitted;
+        if (next && next->l_prev != link_map) {
+            printf_log(LOG_DEBUG,
+                       "%s stop link_map scan: broken prev link %p -> %p\n",
+                       source_name, link_map, next);
+            return submitted;
+        }
+        link_map = next;
+    }
+    if (link_map) {
+        printf_log(LOG_DEBUG, "%s stop link_map scan: limit=%d\n",
+                   source_name, KZT_R_DEBUG_LINK_MAP_LIMIT);
+    }
+    return submitted;
+}
+
+static void kzt_submit_glibc_loader_event_source(
+    KztGlibcLoaderEventSource *source,
+    CPUX86State *env)
+{
+    kzt_submit_r_debug_events(kzt_r_debug_event_source_default());
+
+    kzt_submit_loader_link_map_event(
+        kzt_glibc_loader_event_source_name(source),
+        kzt_get_glibc_loader_link_map(source, env));
+}
+
+static void kzt_glibc_loader_callback(CPUX86State *env)
+{
+    kzt_submit_glibc_loader_event_source(
+        kzt_glibc_loader_event_source_default(), env);
 }
 static TranslationBlock* test_tb;
 static void test_x86free(CPUX86State *env)
@@ -2345,7 +4094,11 @@ static void finiReFlesh(elfheader_t* exech)
 {
     CPUState *cpu;
     static uint32 test_ld [2] = {0};
-    lsassert(my_context->mallocmapsize);
+    if (!my_context->mallocmapsize) {
+        printf_log(LOG_DEBUG, "%s skip malloc hook setup for %s: no malloc map\n",
+                   __func__, exech ? ElfPath(exech) : "<unknown>");
+        return;
+    }
     struct malloc_map * m;
 
     if (my_context->mallocmapsize == 1) {
@@ -2361,7 +4114,7 @@ static void finiReFlesh(elfheader_t* exech)
       * all of them provide symbols with the same name (such as free functions),
       * the dynamic linker will parse the symbols according to the loading order of the libraries.
       * The symbols defined in the first loaded library have higher priority.
-    */
+     */
     if (my_context->mallocmaps[0]->h == my_context->elfs[0]) {//elf[0] is exe file
         if (my_context->mallocmapsize > 2) {
             qsort(my_context->mallocmaps[1], my_context->mallocmapsize - 1, sizeof(struct malloc_map *), tb_sort_cmp);
@@ -2385,6 +4138,7 @@ static void finiReFlesh(elfheader_t* exech)
 }
 static void kzt_exectb_callback(CPUX86State *env)
 {
+    kzt_submit_r_debug_events(kzt_r_debug_event_source_default());
     finiReFlesh(elf_header);
     x64free_fini = 1;
     RelocateElf(my_context->maplib, NULL, 0, elf_header);
@@ -2455,30 +4209,382 @@ static TranslationBlock* kzt_add_fucn_by_addr(uint32* inst_old, CPUState *cpu, u
     }
     return tb;
 }
-struct ins_part_s {
+typedef struct KztGlibcLoaderPatternInsn {
     char search[5];
     int search_len;
     uint32_t offset;
-};
-#define MY_PARTY_OFFSET 0x32 - 1
-#define MY_PARTY_OFFSET_UBUNTU 0x36 - 1
+} KztGlibcLoaderPatternInsn;
 
-#define MY_PARTY_INS_MAX 8
-static struct x86_ld_info * find_ld_part(char * start, int len)
+#define KZT_GLIBC_LOADER_PATTERN_INSNS 7
+
+typedef struct KztGlibcLoaderPattern {
+    KztGlibcLoaderPatternInsn ins[KZT_GLIBC_LOADER_PATTERN_INSNS];
+    int part_offset;
+    const char *glibc_version;
+} KztGlibcLoaderPattern;
+
+#define KZT_GLIBC_LOADER_PATTERN_OFFSET_DEBIAN (0x32 - 1)
+#define KZT_GLIBC_LOADER_PATTERN_OFFSET_UBUNTU (0x36 - 1)
+
+#define KZT_GLIBC_LOADER_PATTERN_PROBE_SIZE 8
+#define KZT_GLIBC_LOADER_HOOK_MASK 0xffffffffff00ffff
+
+static KztGlibcLoaderHook *kzt_new_glibc_loader_hook(uint8_t *addr)
 {
-    struct x86_ld_info * ret = NULL;
-    char * old_start = start;
-    char searchpopret_part[] = {
-        0x5b,                   //pop    rbx
-        0x41, 0x5c,        //pop    r12
-        0x41, 0x5d,        //pop    r13
-        0x41, 0x5e,       //pop    r14
-        0x41, 0x5f,        //pop    r15
-        0x5d,                 //pop    rbp
-        0xc3                  //ret
+    KztGlibcLoaderHook *hook = malloc(sizeof(KztGlibcLoaderHook));
+    if (!hook)
+        return NULL;
+
+    hook->addr = (uintptr_t)addr;
+    hook->reg = (*(addr + 2)) & 0xf;
+    if (hook->reg >= CPU_NB_REGS) {
+        free(hook);
+        return NULL;
+    }
+
+    printf_log(LOG_DEBUG, "debug find ld so 0x%lx reg = %d\n",
+               hook->addr, hook->reg);
+    return hook;
+}
+
+static int kzt_glibc_loader_hook_matches(uint8_t *addr, uint64_t mask,
+                                         uint64_t value)
+{
+    uint64_t insn;
+
+    memcpy(&insn, addr, sizeof(insn));
+    return (insn & mask) == value;
+}
+
+static int kzt_glibc_loader_hook_candidate_in_file(
+    const KztGlibcLoaderHookCandidate *candidate,
+    size_t file_len)
+{
+    return candidate->offset <= file_len
+        && file_len - candidate->offset >= sizeof(uint64_t);
+}
+
+static int kzt_glibc_loader_scan_range_in_file(char *base, size_t file_len,
+                                               char *addr, size_t size)
+{
+    uintptr_t base_addr = (uintptr_t)base;
+    uintptr_t addr_value = (uintptr_t)addr;
+
+    if (file_len > UINTPTR_MAX - base_addr)
+        return 0;
+
+    uintptr_t end_addr = base_addr + file_len;
+    return addr_value >= base_addr
+        && addr_value <= end_addr
+        && size <= end_addr - addr_value;
+}
+
+static int kzt_glibc_loader_scan_remaining(char *base, size_t file_len,
+                                           char *scan, size_t *remaining)
+{
+    uintptr_t base_addr = (uintptr_t)base;
+    uintptr_t scan_addr = (uintptr_t)scan;
+
+    if (!kzt_glibc_loader_scan_range_in_file(base, file_len, scan, 0))
+        return 0;
+
+    *remaining = file_len - (scan_addr - base_addr);
+    return 1;
+}
+
+static int kzt_is_decimal_digit(char ch)
+{
+    return ch >= '0' && ch <= '9';
+}
+
+static int kzt_glibc_loader_copy_version(const char *start,
+                                         const char *end,
+                                         char *version,
+                                         size_t version_size)
+{
+    const char *cursor = start;
+    size_t len = 0;
+
+    if (!version_size)
+        return 0;
+    while (cursor < end && len + 1 < version_size) {
+        char ch = *cursor;
+        if (!kzt_is_decimal_digit(ch) && ch != '.')
+            break;
+        version[len++] = ch;
+        ++cursor;
+    }
+
+    version[len] = '\0';
+    return len >= 3 && strchr(version, '.');
+}
+
+static int kzt_glibc_loader_read_file(const char *path, char **data,
+                                      size_t *size)
+{
+    FILE *file = fopen(path, "rb");
+    if (!file)
+        return 0;
+
+    if (fseek(file, 0, SEEK_END)) {
+        fclose(file);
+        return 0;
+    }
+    long file_size = ftell(file);
+    if (file_size <= 0) {
+        fclose(file);
+        return 0;
+    }
+    if (fseek(file, 0, SEEK_SET)) {
+        fclose(file);
+        return 0;
+    }
+
+    char *buffer = malloc((size_t)file_size);
+    if (!buffer) {
+        fclose(file);
+        return 0;
+    }
+
+    size_t read_size = fread(buffer, 1, (size_t)file_size, file);
+    fclose(file);
+    if (read_size != (size_t)file_size) {
+        free(buffer);
+        return 0;
+    }
+
+    *data = buffer;
+    *size = read_size;
+    return 1;
+}
+
+static int kzt_glibc_loader_find_version(const char *data, size_t size,
+                                         char *version,
+                                         size_t version_size)
+{
+    static const char marker[] = "GNU C Library";
+    static const char glibc_prefix[] = "glibc-";
+    const char *cursor = data;
+    size_t remaining = size;
+
+    while (remaining) {
+        char *match = memmem(cursor, remaining, marker, sizeof(marker) - 1);
+        if (!match)
+            break;
+
+        const char *end = data + size;
+        for (const char *scan = match + sizeof(marker) - 1;
+             scan + 2 < end; ++scan) {
+            if (!kzt_is_decimal_digit(scan[0]) || scan[1] != '.'
+                || !kzt_is_decimal_digit(scan[2])) {
+                continue;
+            }
+            if (kzt_glibc_loader_copy_version(scan, end, version,
+                                              version_size)) {
+                return 1;
+            }
+        }
+
+        remaining = size - (size_t)(match + 1 - data);
+        cursor = match + 1;
+    }
+
+    cursor = data;
+    remaining = size;
+    while (remaining) {
+        char *match = memmem(cursor, remaining, glibc_prefix,
+                             sizeof(glibc_prefix) - 1);
+        if (!match)
+            break;
+
+        const char *start = match + sizeof(glibc_prefix) - 1;
+        if (kzt_glibc_loader_copy_version(start, data + size, version,
+                                          version_size)) {
+            return 1;
+        }
+
+        remaining = size - (size_t)(match + 1 - data);
+        cursor = match + 1;
+    }
+
+    return 0;
+}
+
+static int kzt_glibc_loader_version_from_path(const char *path,
+                                              char *version,
+                                              size_t version_size)
+{
+    const char *base = path ? strrchr(path, '/') : NULL;
+
+    base = base ? base + 1 : path;
+    if (!base || strncmp(base, "ld-", 3))
+        return 0;
+
+    const char *start = base + 3;
+    const char *end = base + strlen(base);
+    return kzt_glibc_loader_copy_version(start, end, version, version_size);
+}
+
+static int kzt_glibc_loader_read_version(const char *path, char *version,
+                                         size_t version_size)
+{
+    char *data = NULL;
+    size_t size = 0;
+    int found = 0;
+
+    if (!kzt_glibc_loader_read_file(path, &data, &size))
+        return 0;
+
+    found = kzt_glibc_loader_find_version(data, size, version, version_size);
+    free(data);
+    if (found)
+        return 1;
+    return kzt_glibc_loader_version_from_path(path, version, version_size);
+}
+
+static int kzt_glibc_loader_version_supported(const char *version)
+{
+    static const char *supported[] = {
+        "2.28",
+        "2.31",
+        "2.40",
+        "2.41",
+        "2.42",
     };
-    char *ld_find = NULL;
-    static char* _dl_relocate_object_end;
+
+    if (!version || !version[0])
+        return 0;
+    for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); ++i) {
+        if (!strcmp(version, supported[i]))
+            return 1;
+    }
+    return 0;
+}
+
+static int kzt_glibc_loader_version_matches(const char *actual,
+                                            const char *expected)
+{
+    return actual && expected && !strcmp(actual, expected);
+}
+
+static int kzt_glibc_loader_pattern_matches(
+    char *base,
+    size_t file_len,
+    char *candidate,
+    const KztGlibcLoaderPattern *pattern)
+{
+    uintptr_t probe_addr = (uintptr_t)candidate;
+
+    for (int i = 0; i < KZT_GLIBC_LOADER_PATTERN_INSNS; i++) {
+        if (pattern->ins[i].offset > UINTPTR_MAX - probe_addr)
+            return 0;
+
+        probe_addr += pattern->ins[i].offset;
+        char *probe = (char *)probe_addr;
+        if (!kzt_glibc_loader_scan_range_in_file(
+                base, file_len, probe,
+                KZT_GLIBC_LOADER_PATTERN_PROBE_SIZE)) {
+            return 0;
+        }
+
+        if (pattern->ins[i].offset &&
+            memmem(probe, KZT_GLIBC_LOADER_PATTERN_PROBE_SIZE,
+                   pattern->ins[i].search,
+                   pattern->ins[i].search_len) != probe) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static int kzt_glibc_loader_pattern_candidate(
+    char *base,
+    size_t file_len,
+    char *anchor,
+    size_t anchor_len,
+    const KztGlibcLoaderPattern *pattern,
+    char **candidate)
+{
+    uintptr_t base_addr = (uintptr_t)base;
+    uintptr_t anchor_addr = (uintptr_t)anchor;
+
+    if (pattern->part_offset < 0)
+        return 0;
+    if (file_len > UINTPTR_MAX - base_addr)
+        return 0;
+    if (anchor_len > UINTPTR_MAX - anchor_addr)
+        return 0;
+
+    uintptr_t end_addr = base_addr + file_len;
+    uintptr_t anchor_end = anchor_addr + anchor_len;
+    if (anchor_addr < base_addr || anchor_end > end_addr)
+        return 0;
+
+    uintptr_t anchor_end_offset = anchor_end - base_addr;
+    if ((uintptr_t)pattern->part_offset > anchor_end_offset)
+        return 0;
+
+    uintptr_t candidate_addr = anchor_end - (uintptr_t)pattern->part_offset;
+    if (candidate_addr < base_addr || candidate_addr > end_addr)
+        return 0;
+
+    *candidate = (char *)candidate_addr;
+    return 1;
+}
+
+static int kzt_resolve_glibc_loader_image(void *info,
+                                          KztGlibcLoaderImage *image)
+{
+    struct image_info *execinfo = (struct image_info *)info;
+    struct stat st;
+
+    if (!execinfo || !execinfo->interpreter_path ||
+        !execinfo->interpreter_path[0] || !execinfo->load_bias) {
+        return 0;
+    }
+
+    char *real_dl_file = ResolveFile(kzt_object_basename(
+                                         execinfo->interpreter_path),
+                                     &my_context->box64_ld_lib);
+    int image_ok = real_dl_file
+        && !stat(real_dl_file, &st)
+        && st.st_size > 0
+        && (uintmax_t)st.st_size <= SIZE_MAX;
+    if (!image_ok) {
+        if (real_dl_file)
+            free(real_dl_file);
+        return 0;
+    }
+
+    snprintf(image->path, sizeof(image->path), "%s", real_dl_file);
+    if (!kzt_glibc_loader_read_version(real_dl_file, image->glibc_version,
+                                       sizeof(image->glibc_version))) {
+        printf_log(LOG_NONE,
+                   "KZT: cannot identify glibc loader version from %s\n",
+                   real_dl_file);
+        free(real_dl_file);
+        return 0;
+    }
+    if (!kzt_glibc_loader_version_supported(image->glibc_version)) {
+        printf_log(LOG_NONE,
+                   "KZT: unsupported glibc loader version %s from %s\n",
+                   image->glibc_version, real_dl_file);
+        free(real_dl_file);
+        return 0;
+    }
+    printf_log(LOG_DEBUG, "KZT: glibc loader version %s from %s\n",
+               image->glibc_version, real_dl_file);
+    free(real_dl_file);
+
+    image->start = (uint8_t *)execinfo->load_bias;
+    image->file_len = st.st_size;
+    return 1;
+}
+
+static const KztGlibcLoaderPattern *kzt_glibc_loader_fallback_patterns(
+    size_t *count)
+{
 #define K_OR(offset_s)          {.search = {0x41, 0x80}, .search_len = 2, .offset = offset_s}
 #define K_CMP_48(offset_s)      {.search = {0x48, 0x83}, .search_len = 2, .offset = offset_s}
 #define K_CMP_49(offset_s)      {.search = {0x49, 0x83}, .search_len = 2, .offset = offset_s}
@@ -2488,15 +4594,7 @@ static struct x86_ld_info * find_ld_part(char * start, int len)
 #define K_TEST(offset_s)        {.search = {0x48, 0x85}, .search_len = 2, .offset = offset_s}
 #define K_SKIP(offset_s)        {.search = {0, 0}, .search_len = 0, .offset = offset_s}
 
-#define K_ISNOT_SKIP(p)         (p.offset != 0)
-#define MAX_INS_PART_S          7
-
-	struct ld_part_s {
-	    struct ins_part_s ins [MAX_INS_PART_S];
-	    int part_offset;
-	};
-
-	struct ld_part_s all_part[] = {
+    static const KztGlibcLoaderPattern patterns[] = {
         {
             .ins = {
                 K_OR(0),
@@ -2507,7 +4605,8 @@ static struct x86_ld_info * find_ld_part(char * start, int len)
                 K_LEA(6),
                 K_SKIP(0),
             },
-            .part_offset = MY_PARTY_OFFSET//for debian
+            .glibc_version = "2.28",
+            .part_offset = KZT_GLIBC_LOADER_PATTERN_OFFSET_DEBIAN//for debian
         },
         {
             .ins = {
@@ -2519,7 +4618,8 @@ static struct x86_ld_info * find_ld_part(char * start, int len)
                 K_JNE(3),
                 K_LEA(6),
             },
-            .part_offset = MY_PARTY_OFFSET_UBUNTU//for Ubuntu 21.04
+            .glibc_version = "2.31",
+            .part_offset = KZT_GLIBC_LOADER_PATTERN_OFFSET_UBUNTU//for Ubuntu 21.04
         },
         {   // AOSC 25.05.16 GNU C Library (GNU libc) stable release version 2.40.
             .ins = {
@@ -2531,6 +4631,7 @@ static struct x86_ld_info * find_ld_part(char * start, int len)
                 K_LEA(6),         // 0x48 0x8d 0x65 0xd8                        (lea    -0x28(%rbp),%rsp)
                 K_SKIP(0),
             },
+            .glibc_version = "2.40",
             .part_offset = 0x33
         },
         {   // AOSC OS (Core 12.2.2), glibc 2.40 (EmuKit 20250909~pre20250911T080911Z)
@@ -2543,6 +4644,7 @@ static struct x86_ld_info * find_ld_part(char * start, int len)
                 K_LEA(6),         // 0x48 0x8d 0x65 0xd8                        (lea    -0x28(%rbp),%rsp)
                 K_SKIP(0),
             },
+            .glibc_version = "2.40",
             .part_offset = 0x2e
         },
         {   // debian sid GNU C Library (Debian GLIBC 2.41-7) stable release version 2.41.
@@ -2552,6 +4654,7 @@ static struct x86_ld_info * find_ld_part(char * start, int len)
                 K_JNE(3),         // 0x0f 0x85 0xbd 0x14 0x00 0x00              (jne)
                 K_LEA(6),         // 0x48 0x8d 0x64 0xd8                        (lea -0x28(%rbp),%rsp)
             },
+            .glibc_version = "2.41",
             .part_offset = 0x20
         },
         {   // glibc 2.42 (Yongbao x86_64_runtime)
@@ -2562,122 +4665,315 @@ static struct x86_ld_info * find_ld_part(char * start, int len)
                 K_LEA(6),         // 0x48 0x8d 0x65 0xd8                        (lea    -0x28(%rbp),%rsp)
                 K_SKIP(0),
             },
+            .glibc_version = "2.42",
             .part_offset = 0x25
         }
     };
-    while((_dl_relocate_object_end = memmem(start, len - (start - old_start), searchpopret_part,
-    sizeof(searchpopret_part)))) {
-        start = _dl_relocate_object_end + 1;
-        for (int j = 0; j < sizeof(all_part) / sizeof(struct ld_part_s); j++) {
-            char *my_start = _dl_relocate_object_end - all_part[j].part_offset + sizeof(searchpopret_part);
-            int no_match = 0;
-            for (int i = 0; i < MAX_INS_PART_S; i++) {
-                my_start += all_part[j].ins[i].offset;
-                if (K_ISNOT_SKIP(all_part[j].ins[i]) &&
-                    memmem(my_start, MY_PARTY_INS_MAX, all_part[j].ins[i].search, all_part[j].ins[i].search_len) != my_start) {
-                    no_match = 1;
-                    break;
-                }
+
+    *count = sizeof(patterns) / sizeof(patterns[0]);
+    return patterns;
+}
+
+#undef K_OR
+#undef K_CMP_48
+#undef K_CMP_49
+#undef K_JNE
+#undef K_LEA
+#undef K_MOV
+#undef K_TEST
+#undef K_SKIP
+
+static const KztGlibcLoaderHookCandidate *kzt_glibc_loader_fixed_candidates(
+    size_t *count)
+{
+    static const KztGlibcLoaderHookCandidate candidates[] = {
+        {0xbc15, 0x040000031c008041, "2.28"},
+        {0xdcc2, 0x040000031c008041, "2.31"}, // Ubuntu 21.04 ld-2.31.so
+        {0xdb72, 0x0800000354008041, "2.40"}, // AOSC 25.05.16 glibc 2.40
+        {0xdffe, 0x0800000354008041, "2.41"}, // Debian sid glibc 2.41-7
+    };
+
+    *count = sizeof(candidates) / sizeof(candidates[0]);
+    return candidates;
+}
+
+static KztGlibcLoaderHook *kzt_find_glibc_loader_hook_fixed(
+    const KztGlibcLoaderImage *image)
+{
+    size_t candidate_count = 0;
+    const KztGlibcLoaderHookCandidate *candidates =
+        kzt_glibc_loader_fixed_candidates(&candidate_count);
+    uint8_t *matched_addr = NULL;
+
+    for (size_t i = 0; i < candidate_count; ++i) {
+        if (!kzt_glibc_loader_version_matches(image->glibc_version,
+                                              candidates[i].glibc_version)) {
+            continue;
+        }
+        if (!kzt_glibc_loader_hook_candidate_in_file(&candidates[i],
+                                                     image->file_len)) {
+            continue;
+        }
+
+        uint8_t *fix_addr = image->start + candidates[i].offset;
+        if (kzt_glibc_loader_hook_matches(fix_addr,
+                                          KZT_GLIBC_LOADER_HOOK_MASK,
+                                          candidates[i].value)) {
+            if (matched_addr) {
+                printf_log(LOG_NONE,
+                           "KZT: ambiguous glibc fixed hook for %s %s\n",
+                           image->path, image->glibc_version);
+                return NULL;
             }
-            if (!no_match) {
-                ld_find = _dl_relocate_object_end - all_part[j].part_offset + sizeof(searchpopret_part);
-                goto suc;
+            matched_addr = fix_addr;
+        }
+    }
+
+    return matched_addr ? kzt_new_glibc_loader_hook(matched_addr) : NULL;
+}
+
+static KztGlibcLoaderHook *kzt_find_glibc_loader_hook_pattern(
+    const KztGlibcLoaderImage *image)
+{
+    char *base = (char *)image->start;
+    char *scan = base;
+    static const char popret_anchor[] = {
+        0x5b,                   //pop    rbx
+        0x41, 0x5c,        //pop    r12
+        0x41, 0x5d,        //pop    r13
+        0x41, 0x5e,       //pop    r14
+        0x41, 0x5f,        //pop    r15
+        0x5d,                 //pop    rbp
+        0xc3                  //ret
+    };
+    char *relocate_object_end = NULL;
+    size_t pattern_count = 0;
+    const KztGlibcLoaderPattern *patterns =
+        kzt_glibc_loader_fallback_patterns(&pattern_count);
+    size_t remaining = 0;
+    char *matched_addr = NULL;
+    while (kzt_glibc_loader_scan_remaining(base, image->file_len, scan,
+                                           &remaining)) {
+        if (!remaining)
+            break;
+
+        relocate_object_end = memmem(scan, remaining,
+                                     popret_anchor,
+                                     sizeof(popret_anchor));
+        if (!relocate_object_end)
+            break;
+
+        scan = relocate_object_end + 1;
+        for (size_t j = 0; j < pattern_count; j++) {
+            char *ld_find = NULL;
+            if (!kzt_glibc_loader_version_matches(
+                    image->glibc_version, patterns[j].glibc_version)) {
+                continue;
+            }
+            if (!kzt_glibc_loader_pattern_candidate(
+                    base, image->file_len, relocate_object_end,
+                    sizeof(popret_anchor), &patterns[j], &ld_find)) {
+                continue;
+            }
+            if (kzt_glibc_loader_pattern_matches(base, image->file_len,
+                                                 ld_find, &patterns[j])) {
+                if (matched_addr) {
+                    printf_log(LOG_NONE,
+                               "KZT: ambiguous glibc pattern hook for %s %s\n",
+                               image->path, image->glibc_version);
+                    return NULL;
+                }
+                matched_addr = ld_find;
             }
         }
     }
-    fprintf(stderr, "Lat can't find ldinfo.\n");
-    return NULL;
-suc:
-    ret = malloc(sizeof(struct x86_ld_info));
-    ret->addr = (uintptr_t) ld_find;
-    ret->reg = (*(ld_find+ 2)) & 0xf;
-    printf_log(LOG_DEBUG, "debug find ld so 0x%lx reg = %d\n", ret->addr, ret->reg);
-    return ret;
-}
-static struct x86_ld_info *find_ld_bridge(void* info)
-{
-    struct image_info * execinfo = (struct image_info *)info;
-    struct x86_ld_info * ret = NULL;
-    struct stat st;
-    uint8_t *ld_start = (uint8_t *)execinfo->load_bias;
-    char *real_dl_file = ResolveFile(basename(execinfo->interpreter_path), &my_context->box64_ld_lib);
-    if (stat(real_dl_file, &st)) {
+    if (!matched_addr) {
+        printf_log(LOG_NONE, "KZT: cannot find glibc hook for %s %s\n",
+                   image->path, image->glibc_version);
         return NULL;
     }
-    size_t file_len = st.st_size;
+    return kzt_new_glibc_loader_hook((uint8_t *)matched_addr);
+}
+static KztGlibcLoaderHook *kzt_find_glibc_loader_event_source_hook(void *info)
+{
+    KztGlibcLoaderImage image = {0};
 
-    uint8_t* fix_addr = (uint8_t *)(ld_start+0xbc15);
-    if ((*(uint64_t *)fix_addr & 0xffffffffff00ffff) == 0x040000031c008041) {
-        ret = malloc(sizeof(struct x86_ld_info));
-        ret->addr = (uintptr_t) fix_addr;
-        ret->reg = (*(fix_addr+ 2)) & 0xf;
-        printf_log(LOG_DEBUG, "debug find ld so 0x%lx reg = %d\n", ret->addr, ret->reg);
-        return ret;
+    if (!kzt_resolve_glibc_loader_image(info, &image))
+        return NULL;
+
+    KztGlibcLoaderHook *hook = kzt_find_glibc_loader_hook_fixed(&image);
+    if (hook)
+        return hook;
+
+    return kzt_find_glibc_loader_hook_pattern(&image);
+}
+
+static int kzt_install_tb_callback_bridge(
+    CPUState *cpu,
+    uint32 *saved_inst,
+    const KztTbCallbackBridge *bridge)
+{
+    if (!cpu || !saved_inst || !bridge || !bridge->addr || !bridge->callback)
+        return 0;
+
+    kzt_add_fucn_by_addr(saved_inst, cpu, bridge->addr,
+                         target_latx_ld_callback, bridge->callback);
+    return 1;
+}
+
+static KztTbCallbackBridge kzt_exec_entry_callback_bridge(
+    struct image_info *execinfo)
+{
+    KztTbCallbackBridge bridge = {
+        .callback = kzt_exectb_callback,
+    };
+
+    if (execinfo)
+        bridge.addr = execinfo->exec_entry;
+    return bridge;
+}
+
+static int kzt_install_exec_entry_callback(CPUState *cpu,
+                                           struct image_info *execinfo,
+                                           uint32 *saved_inst)
+{
+    KztTbCallbackBridge bridge = kzt_exec_entry_callback_bridge(execinfo);
+
+    return kzt_install_tb_callback_bridge(cpu, saved_inst, &bridge);
+}
+
+static KztTbCallbackBridge kzt_glibc_loader_event_source_bridge(
+    KztGlibcLoaderEventSource *source)
+{
+    KztTbCallbackBridge bridge = {
+        .addr = kzt_glibc_loader_event_source_hook_addr(source),
+        .callback = kzt_glibc_loader_event_source_callback(source),
+    };
+
+    return bridge;
+}
+
+static int kzt_install_glibc_loader_event_source(
+    CPUState *cpu,
+    uint32 *saved_inst,
+    KztGlibcLoaderEventSource *source)
+{
+    KztTbCallbackBridge bridge =
+        kzt_glibc_loader_event_source_bridge(source);
+
+    /*
+     * This is the Stage 8 fallback event source.  It still patches a private
+     * glibc location today, but the rest of KZT now consumes only loader
+     * events, so this function can later be replaced or version-gated.
+     */
+    return kzt_install_tb_callback_bridge(cpu, saved_inst, &bridge);
+}
+
+static KztGlibcLoaderHook *kzt_resolve_glibc_loader_event_source(
+    KztGlibcLoaderEventSource *source,
+    void *info)
+{
+    KztGlibcLoaderHookResolver resolver =
+        kzt_glibc_loader_event_source_hook_resolver(source);
+
+    if (!source || !resolver)
+        return NULL;
+
+    if (!source->hook_resolved) {
+        kzt_glibc_loader_event_source_set_hook(
+            source, resolver(info));
+        source->hook_resolved = 1;
     }
-    fix_addr = (uint8_t *)(ld_start+ 0xdcc2);
-    if ((*(uint64_t *)fix_addr & 0xffffffffff00ffff) == 0x040000031c008041) {//for Ubuntu 21.04 ld-2.31.so
-        ret = malloc(sizeof(struct x86_ld_info));
-        ret->addr = (uintptr_t) fix_addr;
-        ret->reg = (*(fix_addr+ 2)) & 0xf;
-        printf_log(LOG_DEBUG, "debug find ld so 0x%lx reg = %d\n", ret->addr, ret->reg);
-        return ret;
+    return kzt_glibc_loader_event_source_hook(source);
+}
+
+static void kzt_handle_missing_glibc_loader_event_source(
+    KztGlibcLoaderEventSource *source)
+{
+    printf_log(LOG_NONE,
+               "KZT: cannot find %s event source, use r_debug events\n",
+               kzt_glibc_loader_event_source_name(source));
+}
+
+static int kzt_prepare_glibc_loader_event_source(
+    KztGlibcLoaderEventSource *source,
+    void *info)
+{
+    if (kzt_resolve_glibc_loader_event_source(source, info)) {
+        return 1;
     }
-    fix_addr = (uint8_t *)(ld_start+0xe6d8);
-    if ((*(uint64_t *)fix_addr & 0xffffffffff00ffff) == 0x0800000334008041) {
-        ret = malloc(sizeof(struct x86_ld_info));
-        ret->addr = (uintptr_t) fix_addr;
-        ret->reg = (*(fix_addr+ 2)) & 0xf;
-        printf_log(LOG_DEBUG, "debug find ld so 0x%lx reg = %d\n", ret->addr, ret->reg);
-        return ret;
+
+    kzt_handle_missing_glibc_loader_event_source(source);
+    return 0;
+}
+
+static int kzt_install_callback_bridges(CPUState *cpu,
+                                        struct image_info *execinfo,
+                                        uint32 *exec_saved_inst,
+                                        uint32 *loader_saved_inst,
+                                        KztGlibcLoaderEventSource *source)
+{
+    if (!cpu || !execinfo || !exec_saved_inst)
+        return 0;
+
+    if (!kzt_install_exec_entry_callback(cpu, execinfo, exec_saved_inst))
+        return 0;
+    if (!loader_saved_inst) {
+        kzt_handle_missing_glibc_loader_event_source(source);
+        return 1;
     }
-    fix_addr = (uint8_t *)(ld_start+ 0xe7cd);
-    if ((*(uint64_t *)fix_addr & 0xffffffffff00ffff) == 0x0800000354008041) {
-        ret = malloc(sizeof(struct x86_ld_info));
-        ret->addr = (uintptr_t) fix_addr;
-        ret->reg = (*(fix_addr+ 2)) & 0xf;
-        printf_log(LOG_DEBUG, "debug find ld so 0x%lx reg = %d\n", ret->addr, ret->reg);
-        return ret;
+    if (!kzt_prepare_glibc_loader_event_source(source, execinfo))
+        return 1;
+    if (!kzt_install_glibc_loader_event_source(cpu, loader_saved_inst,
+                                              source)) {
+        kzt_handle_missing_glibc_loader_event_source(source);
     }
-    // AOSC 25.05.16 GNU C Library ( GLIBC 2.40)
-    fix_addr = (uint8_t *)(ld_start+ 0xdb72);
-    if ((*(uint64_t *)fix_addr & 0xffffffffff00ffff) == 0x0800000354008041) {
-        ret = malloc(sizeof(struct x86_ld_info));
-        ret->addr = (uintptr_t) fix_addr;
-        ret->reg = (*(fix_addr+ 2)) & 0xf;
-        printf_log(LOG_DEBUG, "debug find ld so 0x%lx reg = %d\n", ret->addr, ret->reg);
-        return ret;
+    return 1;
+}
+
+static int kzt_install_callback_bridges_preserve_eip(
+    CPUState *cpu,
+    struct image_info *execinfo,
+    uint32 *exec_saved_inst,
+    uint32 *loader_saved_inst,
+    KztGlibcLoaderEventSource *source)
+{
+    if (!cpu || !cpu->env_ptr)
+        return 0;
+
+    CPUArchState *env = cpu->env_ptr;
+    target_ulong eip = env->eip;
+
+    int installed = kzt_install_callback_bridges(
+        cpu, execinfo, exec_saved_inst, loader_saved_inst, source);
+    env->eip = eip;
+    return installed;
+}
+
+static void kzt_init_callback_bridge(CPUState *cpu,
+                                     struct image_info *execinfo)
+{
+    static uint32 jmpinst_exec [2] = {0};
+    static uint32 jmpinst_ld [2] = {0};
+    KztGlibcLoaderEventSource *source =
+        kzt_glibc_loader_event_source_default();
+
+    kzt_glibc_loader_event_source_prepare(source, execinfo);
+    if (execinfo && execinfo->interpreter_path && execinfo->load_bias) {
+        kzt_prepare_r_debug_event_source(execinfo->interpreter_path,
+                                         execinfo->load_bias);
     }
-    // debian sid GNU C Library (Debian GLIBC 2.41-7) stable release version 2.41. addr 0x4008403ffe
-    fix_addr = (uint8_t *)(ld_start+ 0xdffe);
-    if ((*(uint64_t *)fix_addr & 0xffffffffff00ffff) == 0x0800000354008041) {
-        ret = malloc(sizeof(struct x86_ld_info));
-        ret->addr = (uintptr_t) fix_addr;
-        ret->reg = (*(fix_addr+ 2)) & 0xf;
-        printf_log(LOG_DEBUG, "debug find ld so 0x%lx reg = %d\n", ret->addr, ret->reg);
-        return ret;
+    if (!kzt_install_callback_bridges_preserve_eip(
+            cpu, execinfo, (uint32 *)&jmpinst_exec,
+            (uint32 *)&jmpinst_ld, source)) {
+        option_kzt = 0;
+        wine_option_kzt = 0;
     }
-    return find_ld_part((char *)ld_start, file_len);
-    return NULL;
 }
 
 void init_tb_callback_bridge(CPUState *cpu, void* info)
 {
-    struct image_info * execinfo = (struct image_info *)info;
-    static uint32 jmpinst_exec [2] = {0};
-    static uint32 jmpinst_ld [2] = {0};
-    if (!ld_info) {
-        ld_info = find_ld_bridge(info);
-    }
-    if (!ld_info) {
-        lsassertm(0,"can't find ld callback tb.");
-        option_kzt = 0;
-        return;
-    }
-    CPUArchState *env = cpu->env_ptr;
-    target_ulong eip = env->eip;
-    kzt_add_fucn_by_addr((uint32 *)&jmpinst_exec, cpu, execinfo->exec_entry, target_latx_ld_callback, kzt_exectb_callback);
-    kzt_add_fucn_by_addr((uint32 *)&jmpinst_ld, cpu, ld_info->addr, target_latx_ld_callback, kzt_tb_callback);
-    env->eip = eip;
+    kzt_init_callback_bridge(cpu, (struct image_info *)info);
 }
 void kzt_bridge_init(void)
 {
@@ -2702,6 +4998,105 @@ static void m_handle_wine64(char * file_name, abi_ulong start)
     init_main_elf(wine_elf_header, -1, start, info->alignment);
     fclose(f);
 }
+
+static size_t kzt_elf_section_size(elfheader_t *h, const char *name)
+{
+    if (!h || !h->SHEntries || !h->numSHEntries || !h->SHStrTab || !name)
+        return 0;
+
+    int index = FindSection(h->SHEntries, h->numSHEntries, h->SHStrTab, name);
+
+    if (index <= 0)
+        return 0;
+    if (strcmp(h->SHStrTab + h->SHEntries[index].sh_name, name))
+        return 0;
+    return h->SHEntries[index].sh_size;
+}
+
+static int kzt_elf_symbol_name_is_valid(const Elf64_Sym *sym,
+                                        const char *strings,
+                                        size_t strings_size)
+{
+    if (!strings || !strings_size || sym->st_name >= strings_size)
+        return 0;
+
+    return memchr(strings + sym->st_name, '\0',
+                  strings_size - sym->st_name) != NULL;
+}
+
+static uintptr_t kzt_resolve_elf_symbol(Elf64_Sym *symbols, size_t count,
+                                        const char *strings,
+                                        size_t strings_size,
+                                        abi_ulong start, const char *name)
+{
+    if (!symbols || !strings || !strings_size || !name)
+        return 0;
+
+    for (size_t i = 0; i < count; ++i) {
+        Elf64_Sym *sym = symbols + i;
+        if (!kzt_elf_symbol_name_is_valid(sym, strings, strings_size))
+            continue;
+
+        const char *symname = strings + sym->st_name;
+        if (sym->st_shndx != SHN_UNDEF && sym->st_value
+            && !strcmp(symname, name)) {
+            return (uintptr_t)start + sym->st_value;
+        }
+    }
+    return 0;
+}
+
+static uintptr_t kzt_resolve_loader_symbol(char *file_name, abi_ulong start,
+                                           const char *name)
+{
+    char *real_file = ResolveFile(kzt_object_basename(file_name),
+                                  &my_context->box64_ld_lib);
+    if (!real_file)
+        return 0;
+
+    FILE *f = fopen(real_file, "rb");
+    if (!f) {
+        printf_log(LOG_INFO, "%s Error: Cannot open \"%s\"\n",
+                   __func__, real_file);
+        free(real_file);
+        return 0;
+    }
+
+    elfheader_t *h = LoadAndCheckElfHeader(f, real_file, 0);
+    fclose(f);
+    if (!h) {
+        free(real_file);
+        return 0;
+    }
+
+    uintptr_t addr = kzt_resolve_elf_symbol(h->DynSym, h->numDynSym,
+                                            h->DynStr, h->szDynStrTab,
+                                            start, name);
+    if (!addr) {
+        size_t strtab_size = kzt_elf_section_size(h, ".strtab");
+        addr = kzt_resolve_elf_symbol(h->SymTab, h->numSymTab,
+                                      h->StrTab, strtab_size, start, name);
+    }
+    FreeElfHeader(&h);
+    free(real_file);
+    return addr;
+}
+
+static void kzt_prepare_r_debug_event_source(char *file_name, abi_ulong start)
+{
+    KztRDebugEventSource *source = kzt_r_debug_event_source_default();
+
+    source->addr = kzt_resolve_loader_symbol(file_name, start, "_r_debug");
+    if (!source->addr) {
+        printf_log(LOG_NONE,
+                   "KZT: cannot find _r_debug in guest loader %s\n",
+                   file_name);
+        return;
+    }
+    printf_log(LOG_DEBUG, "KZT: use _r_debug at %p from %s\n",
+               (void *)source->addr, file_name);
+}
+
 static void m_handle_ld(char * file_name, abi_ulong start)
 {
     elf_header = wine_elf_header;

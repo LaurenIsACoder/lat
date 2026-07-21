@@ -2,9 +2,6 @@
 #define __ELF_LOADER_H_
 #include <stdio.h>
 #include "elf.h"
-extern uintptr_t pltResolver;
-extern uintptr_t dl_runtime_resolver;
-extern uintptr_t link_map_obj;
 typedef struct elfheader_s elfheader_t;
 typedef struct lib_s lib_t;
 typedef struct library_s library_t;
@@ -32,7 +29,6 @@ int RelocateElf(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t* he
 int RelocateElfPlt(lib_t *maplib, lib_t* local_maplib, int bindnow, elfheader_t* head);
 void CalcStack(elfheader_t* h, uint64_t* stacksz, size_t* stackalign);
 void AddSymbols(lib_t *maplib, kh_mapsymbols_t* mapsymbols, kh_mapsymbols_t* weaksymbols, kh_mapsymbols_t* localsymbols, elfheader_t* h);
-int LoadNeededLibs(elfheader_t* h, lib_t *maplib, needed_libs_t* neededlibs, library_t *deplib, int local, int bindnow, box64context_t *box64);
 
 uintptr_t GetElfInit(elfheader_t* h);
 uintptr_t GetElfFini(elfheader_t* h);
@@ -58,8 +54,6 @@ const char* GetNeededVersionString(elfheader_t* h, const char* libname, int idx)
 void* GetNativeSymbolUnversionned(void* lib, const char* name);
 
 void AddMainElfToLinkmap(elfheader_t* lib);
-void PltResolver(void);
-
 int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t* head, int cnt, Elf64_Rela *rela, int* need_resolv);
 uintptr_t loadSoaddrFromMap(char * real_path);
 void ElfHeadReFix (elfheader_t* head, uintptr_t delta);

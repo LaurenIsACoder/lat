@@ -635,6 +635,16 @@ static void handle_arg_latx_kzt(const char *arg)
 {
     option_kzt = strtol(arg, NULL, 0);
 }
+
+static void handle_arg_latx_kzt_patch_guest_owner(const char *arg)
+{
+    option_kzt_patch_guest_owner = strtol(arg, NULL, 0);
+}
+
+static void handle_arg_latx_kzt_patch_shadow(const char *arg)
+{
+    option_kzt_patch_shadow = strtol(arg, NULL, 0);
+}
 #endif
 
 static void handle_arg_latx_fputag(const char *arg)
@@ -818,6 +828,10 @@ static const struct qemu_argument arg_table[] = {
 #if defined(CONFIG_LATX_KZT)
     {"latx-kzt",    "LATX_KZT",     true,  handle_arg_latx_kzt,
     "",           "enable kuzhitong"},
+    {"latx-kzt-patch-guest-owner",    "LATX_KZT_PATCH_GUEST_OWNER",     true,  handle_arg_latx_kzt_patch_guest_owner,
+    "",           "enable kzt guest owner patch target selection"},
+    {"latx-kzt-patch-shadow",    "LATX_KZT_PATCH_SHADOW",     true,  handle_arg_latx_kzt_patch_shadow,
+    "",           "enable kzt patch planner shadow comparison"},
 #endif
     {"latx-fputag",    "LATX_FPUTAG",     true,  handle_arg_latx_fputag,
     "",           "enable fputag"},

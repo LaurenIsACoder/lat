@@ -13,6 +13,8 @@
 
 #if defined(CONFIG_LATX_KZT)
 int option_kzt = 0;
+int option_kzt_patch_guest_owner = 0;
+int option_kzt_patch_shadow = 0;
 #endif
 
 #ifdef CONFIG_LATX_AVX_OPT

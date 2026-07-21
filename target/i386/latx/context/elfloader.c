@@ -24,12 +24,15 @@
 #include "elfloader_private.h"
 #include "librarian.h"
 #include "bridge.h"
-#include "wrapper.h"
 #include "box64context.h"
 #include "library.h"
 #include "library_private.h"
 #include "dictionnary.h"
 #include "symbols.h"
+#include "guestlazy.h"
+#include "guestobject.h"
+#include "guestpatch.h"
+#include "latx-options.h"
 #include "lsenv.h"
 
 void* my__IO_2_1_stderr_ = NULL;
@@ -160,8 +163,10 @@ uintptr_t loadSoaddrFromMap(char * real_path)
 void ElfHeadReFix (elfheader_t* head, uintptr_t delta)
 {
     head->latx_hasfix = 1;
-    lsassert(delta);
     head->delta = delta;
+    if (!delta) {
+        return;
+    }
     #define GO(a) if ((uintptr_t)head->a > 0) {   \
             if ((uintptr_t)head->a > (uintptr_t)head->delta) {   \
                 head->delta = 0;                           \
@@ -634,6 +639,702 @@ static int FindR64COPYRel(elfheader_t* h, const char* name, uintptr_t *offs, uin
 }
 */
 
+static void kzt_patch_fill_owner(lib_t *maplib, uintptr_t target,
+                                 const char **owner,
+                                 uintptr_t *owner_base)
+{
+    const char *name = NULL;
+    void *base = NULL;
+
+    *owner = NULL;
+    *owner_base = 0;
+
+    if (!maplib || !target)
+        return;
+
+    FindSymbolName(maplib, (void *)target, NULL, NULL, &name, &base, NULL);
+    *owner = name;
+    *owner_base = (uintptr_t)base;
+}
+
+static void kzt_patch_fill_guest_object(uintptr_t target,
+                                        const char **guest_object,
+                                        uintptr_t *guest_object_base)
+{
+    elfheader_t *owner = NULL;
+
+    *guest_object = NULL;
+    *guest_object_base = 0;
+
+    if (!my_context || !target)
+        return;
+
+    guest_object_lookup_t lookup;
+    if (!LookupGuestObjectByAddress(my_context->guest_objects, target,
+                                    &lookup)) {
+        *guest_object = lookup.name;
+        *guest_object_base = lookup.load_bias;
+        return;
+    }
+
+    owner = FindElfAddress(my_context, target);
+    if (!owner)
+        return;
+
+    *guest_object = ElfName(owner);
+    *guest_object_base = owner->delta;
+}
+
+static const char *kzt_patch_basename(const char *name)
+{
+    const char *base;
+
+    if (!name)
+        return NULL;
+
+    base = strrchr(name, '/');
+    return base ? base + 1 : name;
+}
+
+static int kzt_patch_same_basename(const char *left, const char *right)
+{
+    const char *left_name = kzt_patch_basename(left);
+    const char *right_name = kzt_patch_basename(right);
+
+    return left_name && right_name && strcmp(left_name, right_name) == 0;
+}
+
+static int kzt_patch_is_self_plt_target(const KztPatchDecision *decision)
+{
+    return decision->relocation_type == R_X86_64_JUMP_SLOT
+        && kzt_patch_same_basename(decision->old_guest_object,
+                                   decision->object);
+}
+
+typedef struct KztPatchGuestOwnerCandidate {
+    int valid;
+    uintptr_t bridge;
+    const char *library;
+    const char *owner;
+    uintptr_t owner_base;
+} KztPatchGuestOwnerCandidate;
+
+static KztPatchGuestOwnerCandidate kzt_patch_guest_owner_candidate_init(void)
+{
+    KztPatchGuestOwnerCandidate candidate = {
+        .valid = 0,
+        .bridge = 0,
+        .library = NULL,
+        .owner = NULL,
+        .owner_base = 0,
+    };
+
+    return candidate;
+}
+
+typedef struct KztPatchGuestOwnerProbe {
+    int probed;
+    KztPatchShadowResult failure;
+    KztPatchGuestOwnerCandidate candidate;
+} KztPatchGuestOwnerProbe;
+
+static KztPatchGuestOwnerProbe kzt_patch_guest_owner_probe_init(void)
+{
+    KztPatchGuestOwnerProbe probe = {
+        .probed = 0,
+        .failure = KZT_PATCH_SHADOW_DISABLED,
+        .candidate = kzt_patch_guest_owner_candidate_init(),
+    };
+
+    return probe;
+}
+
+static int kzt_patch_guest_owner_probe_has_target(
+    const KztPatchGuestOwnerProbe *probe)
+{
+    return probe->candidate.valid;
+}
+
+typedef struct KztPatchTargetResolution {
+    lib_t *owner;
+    uintptr_t start;
+    uintptr_t end;
+    KztPatchDecisionReason unresolved_reason;
+    KztPatchGuestOwnerProbe guest_owner_probe;
+} KztPatchTargetResolution;
+
+static KztPatchTargetResolution kzt_patch_target_resolution_init(
+    lib_t *owner)
+{
+    KztPatchTargetResolution resolution = {
+        .owner = owner,
+        .start = 0,
+        .end = 0,
+        .unresolved_reason = KZT_PATCH_REASON_SYMBOL_MISSING,
+        .guest_owner_probe = kzt_patch_guest_owner_probe_init(),
+    };
+
+    return resolution;
+}
+
+static int kzt_patch_target_resolution_has_target(
+    const KztPatchTargetResolution *resolution)
+{
+    return resolution->start || resolution->end;
+}
+
+static int kzt_patch_target_resolution_has_bridge(
+    const KztPatchTargetResolution *resolution)
+{
+    return resolution->start != 0;
+}
+
+static uintptr_t kzt_patch_target_resolution_bridge(
+    const KztPatchTargetResolution *resolution,
+    uintptr_t addend)
+{
+    return resolution->start + addend;
+}
+
+static KztPatchGuestOwnerProbe kzt_patch_probe_guest_owner_target(
+    const KztPatchDecision *decision)
+{
+    const char *guest_owner_name;
+    KztPatchTargetResolution target =
+        kzt_patch_target_resolution_init(my_context ? my_context->maplib
+                                                    : NULL);
+    KztPatchGuestOwnerProbe probe = kzt_patch_guest_owner_probe_init();
+
+    probe.probed = 1;
+
+    if (!decision->old_guest_object) {
+        probe.failure = KZT_PATCH_SHADOW_NO_GUEST_OWNER;
+        return probe;
+    }
+    if (!decision->symbol || !decision->symbol[0]) {
+        probe.failure = KZT_PATCH_SHADOW_SYMBOL_MISSING;
+        return probe;
+    }
+    if (kzt_patch_is_self_plt_target(decision)) {
+        probe.failure = KZT_PATCH_SHADOW_SELF_PLT;
+        return probe;
+    }
+
+    guest_owner_name = kzt_patch_basename(decision->old_guest_object);
+    library_t *guest_owner = GetLibInternal(decision->old_guest_object);
+    if (!guest_owner) {
+        if (guest_owner_name != decision->old_guest_object)
+            guest_owner = GetLibInternal(guest_owner_name);
+    }
+    if (!guest_owner) {
+        probe.failure = FindLibIsWrapped((char *)guest_owner_name)
+            ? KZT_PATCH_SHADOW_NO_LIBRARY
+            : KZT_PATCH_SHADOW_NO_WRAPPER;
+        return probe;
+    }
+
+    if (!GetLibSymbolStartEnd(guest_owner, decision->symbol, 0,
+                              &target.start,
+                              &target.end,
+                              decision->symbol_version,
+                              decision->symbol_version_name, 0)) {
+        probe.failure = KZT_PATCH_SHADOW_SYMBOL_MISSING;
+        return probe;
+    }
+
+    probe.candidate.valid = 1;
+    probe.candidate.bridge = kzt_patch_target_resolution_bridge(&target, 0);
+    probe.candidate.library = GetNameLib(guest_owner);
+    kzt_patch_fill_owner(my_context->maplib, target.start,
+                         &probe.candidate.owner,
+                         &probe.candidate.owner_base);
+
+    return probe;
+}
+
+/*
+ * Guest-owner data is applied as an optional overlay on top of maplib
+ * resolution.  A successful probe may replace the selected bridge; a failed
+ * probe is still useful because the planner can log why maplib fallback was
+ * kept.
+ */
+static void kzt_patch_decision_set_guest_owner_candidate(
+    KztPatchDecision *decision,
+    const KztPatchGuestOwnerCandidate *candidate,
+    int select_target)
+{
+    KztPatchDecisionSetGuestOwnerTarget(
+        decision, candidate->bridge, candidate->library, candidate->owner,
+        candidate->owner_base, select_target);
+}
+
+static void kzt_patch_target_resolution_set_guest_owner_probe(
+    KztPatchTargetResolution *target,
+    const KztPatchGuestOwnerProbe *probe)
+{
+    target->guest_owner_probe = *probe;
+}
+
+static int kzt_patch_should_plan_guest_owner_target(void)
+{
+    return option_kzt_patch_shadow || option_kzt_patch_guest_owner;
+}
+
+static int kzt_patch_should_select_guest_owner_target(
+    const KztPatchDecision *decision,
+    const char *guest_owner)
+{
+    (void)decision;
+    (void)guest_owner;
+    return option_kzt_patch_guest_owner;
+}
+
+static int kzt_patch_decision_apply_guest_owner_probe(
+    KztPatchDecision *decision,
+    const KztPatchGuestOwnerProbe *probe)
+{
+    if (kzt_patch_guest_owner_probe_has_target(probe)) {
+        kzt_patch_decision_set_guest_owner_candidate(
+            decision, &probe->candidate,
+            kzt_patch_should_select_guest_owner_target(
+                decision, probe->candidate.owner));
+        return 1;
+    }
+
+    if (probe->probed) {
+        KztPatchDecisionSetGuestOwnerFailure(decision, probe->failure);
+        return 1;
+    }
+
+    return 0;
+}
+
+static int kzt_patch_should_try_guest_owner_without_maplib(
+    int bind,
+    int relocation_type)
+{
+    if (bind == STB_LOCAL)
+        return 0;
+    if (!option_kzt_patch_guest_owner)
+        return 0;
+
+    switch (relocation_type) {
+        case R_X86_64_GLOB_DAT:
+        case R_X86_64_JUMP_SLOT:
+            return 1;
+    }
+    return 0;
+}
+
+static void kzt_patch_plan_guest_owner_target(KztPatchDecision *decision)
+{
+    KztPatchGuestOwnerProbe probe;
+
+    if (!kzt_patch_should_plan_guest_owner_target())
+        return;
+
+    probe = kzt_patch_probe_guest_owner_target(decision);
+    kzt_patch_decision_apply_guest_owner_probe(decision, &probe);
+}
+
+static KztPatchTargetResolution kzt_resolve_global_symbol_for_patch(
+    lib_t *maplib, lib_t *local_maplib, const char *symbol,
+    elfheader_t *self, int version, const char *version_name)
+{
+    KztPatchTargetResolution resolution =
+        kzt_patch_target_resolution_init(maplib);
+
+    GetGlobalSymbolStartEnd(maplib, symbol, &resolution.start,
+                            &resolution.end, self, version, version_name);
+    if (kzt_patch_target_resolution_has_target(&resolution) || !local_maplib)
+        return resolution;
+
+    GetGlobalSymbolStartEnd(local_maplib, symbol, &resolution.start,
+                            &resolution.end, self, version, version_name);
+    if (kzt_patch_target_resolution_has_target(&resolution))
+        resolution.owner = local_maplib;
+
+    return resolution;
+}
+
+static KztPatchDecision kzt_make_guest_owner_probe_decision(
+    elfheader_t *head, int relocation_type, const char *symbol, int version,
+    const char *version_name, uintptr_t old_target)
+{
+    KztPatchDecision decision;
+
+    KztPatchDecisionInit(&decision);
+    decision.object = head ? ElfName(head) : NULL;
+    decision.relocation_type = relocation_type;
+    decision.symbol = symbol;
+    decision.symbol_version = version;
+    decision.symbol_version_name = version_name;
+    kzt_patch_fill_guest_object(old_target, &decision.old_guest_object,
+                                &decision.old_guest_object_base);
+
+    return decision;
+}
+
+/*
+ * This is the Phase 4 fast path: use the current GOT value to find the guest
+ * object that the guest loader already selected, then ask that object's wrapper
+ * for the native bridge.  maplib is skipped only when the probe returns a
+ * concrete target.
+ */
+static KztPatchTargetResolution kzt_resolve_relocation_symbol_for_patch(
+    lib_t *maplib, lib_t *local_maplib, elfheader_t *head,
+    const Elf64_Sym *sym, const char *symbol, int bind, int relocation_type,
+    uintptr_t old_target, int version, const char *version_name)
+{
+    KztPatchTargetResolution resolution =
+        kzt_patch_target_resolution_init(maplib);
+    KztPatchTargetResolution maplib_resolution;
+
+    if (bind == STB_LOCAL) {
+        resolution.start = sym->st_value + head->delta;
+        resolution.end = resolution.start + sym->st_size;
+        return resolution;
+    }
+
+    if (kzt_patch_should_try_guest_owner_without_maplib(bind,
+                                                        relocation_type)) {
+        KztPatchDecision decision;
+        KztPatchGuestOwnerProbe guest_probe;
+
+        decision = kzt_make_guest_owner_probe_decision(
+            head, relocation_type, symbol, version, version_name, old_target);
+        guest_probe = kzt_patch_probe_guest_owner_target(&decision);
+        kzt_patch_target_resolution_set_guest_owner_probe(
+            &resolution, &guest_probe);
+        if (kzt_patch_guest_owner_probe_has_target(&guest_probe)) {
+            resolution.unresolved_reason =
+                KZT_PATCH_REASON_GUEST_OWNER_TARGET;
+            return resolution;
+        }
+    }
+
+    maplib_resolution = kzt_resolve_global_symbol_for_patch(
+        maplib, local_maplib, symbol, head, version, version_name);
+
+    if (resolution.guest_owner_probe.probed)
+        kzt_patch_target_resolution_set_guest_owner_probe(
+            &maplib_resolution, &resolution.guest_owner_probe);
+
+    return maplib_resolution;
+}
+
+static KztPatchTargetResolution kzt_resolve_plt_symbol_for_patch(
+    lib_t *maplib, lib_t *local_maplib, elfheader_t *head,
+    const char *symbol, int version, const char *version_name)
+{
+    KztPatchTargetResolution resolution =
+        kzt_resolve_global_symbol_for_patch(
+            maplib, local_maplib, symbol, head, version, version_name);
+
+    if (!kzt_patch_target_resolution_has_target(&resolution) && !version) {
+        resolution = kzt_resolve_global_symbol_for_patch(
+            maplib, NULL, symbol, head, -1, NULL);
+    }
+
+    return resolution;
+}
+
+static KztPatchDecision kzt_make_base_patch_decision(lib_t *old_owner_maplib,
+                                                     elfheader_t *head,
+                                                     const Elf64_Rela *rela,
+                                                     size_t relocation_index,
+                                                     int relocation_type,
+                                                     const char *symbol,
+                                                     int version,
+                                                     const char *version_name,
+                                                     uintptr_t slot,
+                                                     uintptr_t old_target,
+                                                     KztPatchDecisionReason reason)
+{
+    KztPatchDecision decision;
+
+    KztPatchDecisionInit(&decision);
+    decision.object = head ? ElfName(head) : NULL;
+    decision.object_base = head ? head->delta : 0;
+    decision.relocation = rela;
+    decision.relocation_index = relocation_index;
+    decision.relocation_type = relocation_type;
+    decision.symbol = symbol;
+    decision.symbol_version = version;
+    decision.symbol_version_name = version_name;
+    decision.slot = slot;
+    decision.old_target = old_target;
+    decision.reason = reason;
+
+    kzt_patch_fill_owner(old_owner_maplib, old_target, &decision.old_owner,
+                         &decision.old_owner_base);
+    kzt_patch_fill_guest_object(old_target, &decision.old_guest_object,
+                                &decision.old_guest_object_base);
+
+    return decision;
+}
+
+static void kzt_patch_decision_set_maplib_resolution(
+    KztPatchDecision *decision,
+    KztPatchTargetResolution resolution,
+    uintptr_t maplib_bridge)
+{
+    const char *maplib_owner = NULL;
+    uintptr_t maplib_owner_base = 0;
+
+    kzt_patch_fill_owner(resolution.owner, maplib_bridge, &maplib_owner,
+                         &maplib_owner_base);
+    KztPatchDecisionSetMaplibTarget(decision, maplib_bridge, maplib_owner,
+                                    maplib_owner_base);
+    if (!kzt_patch_decision_apply_guest_owner_probe(
+            decision, &resolution.guest_owner_probe))
+        kzt_patch_plan_guest_owner_target(decision);
+}
+
+static KztPatchDecision kzt_make_patch_decision(lib_t *old_owner_maplib,
+                                                lib_t *new_owner_maplib,
+                                                elfheader_t *head,
+                                                const Elf64_Rela *rela,
+                                                size_t relocation_index,
+                                                int relocation_type,
+                                                const char *symbol,
+                                                int version,
+                                                const char *version_name,
+                                                uintptr_t slot,
+                                                uintptr_t old_target,
+                                                uintptr_t new_target,
+                                                KztPatchDecisionReason reason)
+{
+    KztPatchDecision decision = kzt_make_base_patch_decision(
+        old_owner_maplib, head, rela, relocation_index, relocation_type,
+        symbol, version, version_name, slot, old_target, reason);
+    KztPatchTargetResolution resolution =
+        kzt_patch_target_resolution_init(new_owner_maplib);
+
+    kzt_patch_decision_set_maplib_resolution(&decision, resolution,
+                                             new_target);
+
+    return decision;
+}
+
+static KztPatchDecision kzt_make_patch_decision_from_resolution(
+    lib_t *old_owner_maplib,
+    KztPatchTargetResolution resolution,
+    elfheader_t *head,
+    const Elf64_Rela *rela,
+    size_t relocation_index,
+    int relocation_type,
+    const char *symbol,
+    int version,
+    const char *version_name,
+    uintptr_t slot,
+    uintptr_t old_target,
+    uintptr_t maplib_bridge,
+    KztPatchDecisionReason reason)
+{
+    KztPatchDecision decision = kzt_make_base_patch_decision(
+        old_owner_maplib, head, rela, relocation_index, relocation_type,
+        symbol, version, version_name, slot, old_target, reason);
+
+    kzt_patch_decision_set_maplib_resolution(&decision, resolution,
+                                             maplib_bridge);
+
+    return decision;
+}
+
+static void kzt_emit_patch_decision(const KztPatchDecision *decision)
+{
+    char buffer[2048];
+
+    if (!decision)
+        return;
+
+    KztFormatPatchDecision(buffer, sizeof(buffer), decision);
+    printf_log((option_kzt_patch_shadow || option_kzt_patch_guest_owner)
+                   ? LOG_NONE
+                   : LOG_DEBUG,
+               "KZT patch planner: %s\n", buffer);
+}
+
+static void kzt_apply_patch_decision(const KztPatchDecision *decision)
+{
+    kzt_emit_patch_decision(decision);
+    *(uintptr_t *)decision->slot = decision->new_bridge;
+}
+
+static void kzt_apply_or_log_patch_resolution(
+    lib_t *old_owner_maplib,
+    KztPatchTargetResolution resolution,
+    elfheader_t *head,
+    const Elf64_Rela *rela,
+    size_t relocation_index,
+    int relocation_type,
+    const char *symbol,
+    int version,
+    const char *version_name,
+    uintptr_t slot,
+    uintptr_t old_target,
+    uintptr_t maplib_bridge,
+    KztPatchDecisionReason reason)
+{
+    KztPatchDecision decision = kzt_make_patch_decision_from_resolution(
+        old_owner_maplib, resolution, head, rela, relocation_index,
+        relocation_type, symbol, version, version_name, slot, old_target,
+        maplib_bridge, reason);
+
+    if (KztPatchDecisionHasTarget(&decision))
+        kzt_apply_patch_decision(&decision);
+    else
+        kzt_emit_patch_decision(&decision);
+}
+
+/*
+ * Stage 6 keeps lazy binding behind explicit helpers.  The current behavior is
+ * still the old first-call KZT resolver path, but generic relocation code no
+ * longer owns the policy decision directly.
+ */
+static KztLazyResolveResult kzt_lazy_patch_current_target(
+    KztLazyBinding *binding);
+
+static KztPatchDecision kzt_make_lazy_patch_decision(
+    lib_t *old_owner_maplib,
+    lib_t *new_owner_maplib,
+    KztLazyPatchArgs args,
+    uintptr_t new_target,
+    KztPatchDecisionReason reason)
+{
+    return kzt_make_patch_decision(
+        old_owner_maplib, new_owner_maplib, args.head, args.relocation,
+        args.relocation_index, args.relocation_type, args.symbol,
+        args.version, args.version_name, args.slot, args.old_target,
+        new_target, reason);
+}
+
+static KztPatchDecision kzt_make_lazy_patch_decision_from_resolution(
+    lib_t *old_owner_maplib,
+    KztPatchTargetResolution resolution,
+    KztLazyPatchArgs args,
+    uintptr_t maplib_bridge,
+    KztPatchDecisionReason reason)
+{
+    return kzt_make_patch_decision_from_resolution(
+        old_owner_maplib, resolution, args.head, args.relocation,
+        args.relocation_index, args.relocation_type, args.symbol,
+        args.version, args.version_name, args.slot, args.old_target,
+        maplib_bridge, reason);
+}
+
+static void kzt_apply_or_log_lazy_patch_resolution(
+    lib_t *old_owner_maplib,
+    KztPatchTargetResolution resolution,
+    KztLazyPatchArgs args,
+    uintptr_t maplib_bridge,
+    KztPatchDecisionReason reason)
+{
+    kzt_apply_or_log_patch_resolution(
+        old_owner_maplib, resolution, args.head, args.relocation,
+        args.relocation_index, args.relocation_type, args.symbol,
+        args.version, args.version_name, args.slot, args.old_target,
+        maplib_bridge, reason);
+}
+
+static void kzt_defer_jump_slot_binding(
+    lib_t *maplib, const KztLazyBinding *binding)
+{
+    KztLazyTargetPatchPlan patch_plan;
+
+    if (!KztLazyPrepareDeferredPatch(binding, &patch_plan))
+        return;
+    KztLazyLogDeferredRelocation(binding);
+    KztPatchDecision decision = kzt_make_lazy_patch_decision(
+        maplib, maplib, patch_plan.args, patch_plan.target,
+        patch_plan.reason);
+    kzt_apply_patch_decision(&decision);
+}
+
+static void kzt_install_plt_resolver(
+    lib_t *maplib, elfheader_t *head)
+{
+    KztLazyResolverInstallPlan plan;
+
+    if (!KztLazyPrepareResolverInstall(head, &plan))
+        return;
+    KztPatchDecision resolver_decision = kzt_make_lazy_patch_decision(
+        maplib, maplib, plan.resolver_args, plan.resolver_bridge,
+        KZT_PATCH_REASON_PLT_RESOLVER);
+    kzt_apply_patch_decision(&resolver_decision);
+
+    head->self_link_map = plan.link_map;
+    KztPatchDecision link_map_decision = kzt_make_lazy_patch_decision(
+        maplib, maplib, plan.link_map_args, (uintptr_t)head,
+        KZT_PATCH_REASON_PLT_RESOLVER);
+    kzt_apply_patch_decision(&link_map_decision);
+    printf_log(LOG_INFO, "PLT Resolver injected in %s at %p\n",
+               plan.table_name, (void *)plan.resolver_slot);
+}
+
+static void kzt_install_lazy_plt_resolver(lib_t *maplib, elfheader_t *head)
+{
+    KztLazyEnsureResolverBridge(
+        my_context->system, kzt_lazy_patch_current_target);
+
+    kzt_install_plt_resolver(maplib, head);
+}
+
+static void kzt_handle_jump_slot_relocation(
+    lib_t *maplib,
+    KztPatchTargetResolution resolution,
+    const KztLazyBinding *binding,
+    int *need_resolv)
+{
+    if (KztLazyBindingShouldDefer(binding)) {
+        kzt_defer_jump_slot_binding(maplib, binding);
+        *need_resolv = 1;
+        return;
+    }
+
+    if (kzt_patch_target_resolution_has_bridge(&resolution)) {
+        KztLazyRelocationPatchPlan patch_plan;
+
+        if (KztLazyPrepareRelocationPatch(binding, &patch_plan)) {
+            uintptr_t bridge =
+                kzt_patch_target_resolution_bridge(
+                    &resolution, patch_plan.addend);
+            KztLazyLogRelocationPatch(&patch_plan, bridge);
+            KztPatchDecision decision =
+                kzt_make_lazy_patch_decision_from_resolution(
+                    maplib, resolution, patch_plan.args, bridge,
+                    patch_plan.reason);
+            kzt_apply_patch_decision(&decision);
+        } else {
+            KztLazyLogMissingRelocationSlot(binding);
+        }
+    } else {
+        KztLazyTargetPatchPlan patch_plan;
+
+        KztLazyPrepareUnresolvedPatch(
+            binding, resolution.unresolved_reason, &patch_plan);
+        kzt_apply_or_log_lazy_patch_resolution(
+            maplib, resolution, patch_plan.args, patch_plan.target,
+            patch_plan.reason);
+    }
+}
+
+typedef struct KztLazyRelocationContext {
+    lib_t *maplib;
+    KztPatchTargetResolution resolution;
+    int *need_resolv;
+} KztLazyRelocationContext;
+
+static void kzt_handle_jump_slot_relocation_callback(
+    void *opaque, const KztLazyBinding *binding)
+{
+    KztLazyRelocationContext *context = opaque;
+
+    kzt_handle_jump_slot_relocation(
+        context->maplib, context->resolution, binding, context->need_resolv);
+}
+
 int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t* head, int cnt, Elf64_Rela *rela, int* need_resolv)
 {
 //    int ret_ok = 0;
@@ -647,32 +1348,15 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
         int bind = ELF64_ST_BIND(sym->st_info);
         const char* symname = SymName(head, sym);
         uint64_t *p = (uint64_t*)(rela[i].r_offset + head->delta);
-        uintptr_t offs = 0;
-        uintptr_t end = 0;
         int version = head->VerSym?((Elf64_Half*)((uintptr_t)head->VerSym+head->delta))[ELF64_R_SYM(rela[i].r_info)]:-1;
         if(version!=-1) version &=0x7fff;
         const char* vername = GetSymbolVersion(head, version);
-        if(bind==STB_LOCAL) {
-            offs = sym->st_value + head->delta;
-            end = offs + sym->st_size;
-        } else {
-            // this is probably very very wrong. A proprer way to get reloc need to be writen, but this hack seems ok for now
-            // at least it work for half-life, unreal, ut99, zsnes, Undertale, ColinMcRae Remake, FTL, ShovelKnight...
-            /*if(bind==STB_GLOBAL && (ndx==10 || ndx==19) && t!=R_X86_64_GLOB_DAT) {
-                offs = sym->st_value + head->delta;
-                end = offs + sym->st_size;
-            }*/
-            // so weak symbol are the one left
-            if(!offs && !end) {
-                GetGlobalSymbolStartEnd(maplib, symname, &offs, &end, head, version, vername);
-                if(!offs && !end && local_maplib) {
-                    GetGlobalSymbolStartEnd(local_maplib, symname, &offs, &end, head, version, vername);
-                }
-            }
-        }
+        KztPatchTargetResolution resolution =
+            kzt_resolve_relocation_symbol_for_patch(
+                maplib, local_maplib, head, sym, symname, bind, t,
+                p ? *p : 0, version, vername);
 
         //uintptr_t globoffs=0, globend=0;
-        uintptr_t tmp = 0;
         switch(t) {
              case R_X86_64_GLOB_DAT:
                     // Look for same symbol already loaded but not in self (so no need for local_maplib here)
@@ -680,35 +1364,39 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
                    //     offs = globoffs;
                    //     end = globend;
                    // }
-                    if (offs) {
-                        printf_log(LOG_INFO, "Apply %s R_X86_64_GLOB_DAT @%p (%p -> %p) on sym=%s (ver=%d/%s)\n", (bind==STB_LOCAL)?"Local":"Global", p, (void*)(p?(*p):0), (void*)offs, symname, version, vername?vername:"(none)");
-                        *p = offs/* + rela[i].r_addend*/;   // not addend it seems
+                    if (kzt_patch_target_resolution_has_bridge(&resolution)) {
+                        uintptr_t bridge =
+                            kzt_patch_target_resolution_bridge(&resolution, 0);
+                        printf_log(LOG_INFO, "Apply %s R_X86_64_GLOB_DAT @%p (%p -> %p) on sym=%s (ver=%d/%s)\n", (bind==STB_LOCAL)?"Local":"Global", p, (void*)(p?(*p):0), (void*)bridge, symname, version, vername?vername:"(none)");
+                        KztPatchDecision decision =
+                            kzt_make_patch_decision_from_resolution(
+                                maplib, resolution, head, &rela[i], i, t,
+                                symname, version, vername, (uintptr_t)p, *p,
+                                bridge,
+                                bind == STB_LOCAL
+                                    ? KZT_PATCH_REASON_LOCAL_SYMBOL
+                                    : KZT_PATCH_REASON_GLOBAL_SYMBOL);
+                        kzt_apply_patch_decision(&decision);
+                    } else {
+                        kzt_apply_or_log_patch_resolution(
+                            maplib, resolution, head, &rela[i], i, t,
+                            symname, version, vername, (uintptr_t)p,
+                            p ? *p : 0, 0, resolution.unresolved_reason);
                     }
                 break;
             case R_X86_64_JUMP_SLOT:
-                // apply immediatly for gobject closure marshal or for LOCAL binding. Also, apply immediatly if it doesn't jump in the got
-                tmp = (uintptr_t)(*p);
-                if (bind==STB_LOCAL 
-                  || !tmp
-                  || !((tmp>=head->plt && tmp<head->plt_end) || (tmp>=head->gotplt && tmp<head->gotplt_end))
-                  || !need_resolv
-                  || bindnow
-                  ) {
-                    if (offs){
-                        if(p) {
-                            printf_log(LOG_INFO, "RelocateElfRELA : Apply %s R_X86_64_JUMP_SLOT @%p with sym=%s (%p -> %p)\n", (bind==STB_LOCAL)?"Local":"Global", p, symname, *(void**)p, (void*)(offs+rela[i].r_addend));
-                            *p =(uint64_t) (offs + rela[i].r_addend);
-                        } else {
-                            printf_log(LOG_INFO, "Warning, Symbol %s found, but Jump Slot Offset is NULL \n", symname);
-                        }
-                    }
-                } else {
-                    printf_log(LOG_INFO, "Preparing (if needed) %s R_X86_64_JUMP_SLOT @%p (0x%lx->0x%0lx) with sym=%s to be apply later (addend=%ld)\n", 
-                        (bind==STB_LOCAL)?"Local":"Global", p, *p, *p+head->delta, symname, rela[i].r_addend);
-                    *p += head->delta;
-                    *need_resolv = 1;
-                }
+            {
+                KztLazyRelocationContext context = {
+                    .maplib = maplib,
+                    .resolution = resolution,
+                    .need_resolv = need_resolv,
+                };
+                KztLazyHandleRelocation(
+                    head, &rela[i], i, bind, symname, version, vername, p,
+                    bindnow, need_resolv,
+                    kzt_handle_jump_slot_relocation_callback, &context);
                 break;
+            }
             /*
             case R_X86_64_NONE:
                 break;
@@ -749,28 +1437,8 @@ int RelocateElfPlt(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t*
                 //return -1;
                 printf_log(LOG_INFO, "RelocateElfRELA run ERROR!");
         }
-        if(need_resolver) {
-            if(pltResolver==~0LL) {
-                pltResolver = AddBridge(my_context->system, vFE, PltResolver, 0, "PltResolver");
-            }
-            if(head->pltgot) {
-                if(dl_runtime_resolver ==~0LL){
-                    dl_runtime_resolver =  *(uintptr_t*)(head->pltgot+head->delta+16);
-                }
-                *(uintptr_t*)(head->pltgot+head->delta+16) = pltResolver;
-                head->self_link_map = *(uintptr_t*)(head->pltgot+head->delta+8);
-                *(uintptr_t*)(head->pltgot+head->delta+8) = (uintptr_t)head;
-                printf_log(LOG_INFO, "PLT Resolver injected in plt.got at %p\n", (void*)(head->pltgot+head->delta+16));
-            } else if(head->got) {
-                if(dl_runtime_resolver ==~0LL){
-                    dl_runtime_resolver =  *(uintptr_t*)(head->got+head->delta+16);
-                }
-                *(uintptr_t*)(head->got+head->delta+16) = pltResolver;
-                head->self_link_map = *(uintptr_t*)(head->got+head->delta+8);
-                *(uintptr_t*)(head->got+head->delta+8) = (uintptr_t)head;
-                printf_log(LOG_INFO, "PLT Resolver injected in got at %p\n", (void*)(head->got+head->delta+16));
-            }
-        }
+        if(need_resolver)
+            kzt_install_lazy_plt_resolver(maplib, head);
     }
    
     return 0;
@@ -946,112 +1614,6 @@ void AddSymbols(lib_t *maplib, kh_mapsymbols_t* mapsymbols, kh_mapsymbols_t* wea
         }
     }
     
-}
-
-/*
-$ORIGIN – Provides the directory the object was loaded from. This token is typical
-used for locating dependencies in unbundled packages. For more details of this
-token expansion, see “Locating Associated Dependencies”
-$OSNAME – Expands to the name of the operating system (see the uname(1) man
-page description of the -s option). For more details of this token expansion, see
-“System Specific Shared Objects”
-$OSREL – Expands to the operating system release level (see the uname(1) man
-page description of the -r option). For more details of this token expansion, see
-“System Specific Shared Objects”
-$PLATFORM – Expands to the processor type of the current machine (see the
-uname(1) man page description of the -i option). For more details of this token
-expansion, see “System Specific Shared Objects”
-*/
-extern const char *interp_prefix;
-int LoadNeededLibs(elfheader_t* h, lib_t *maplib, needed_libs_t* neededlibs, library_t *deplib, int local, int bindnow, box64context_t *box64)
-{
-    if (!h->latx_hasfix) return 1;
-    if(relocation_dump) DumpDynamicRPath(h);
-    // update RPATH first
-    for (size_t i=0; i<h->numDynamic; ++i)
-        if(h->Dynamic[i].d_tag==DT_RPATH || h->Dynamic[i].d_tag==DT_RUNPATH) {
-            char *rpathref = h->DynStrTab+h->delta+h->Dynamic[i].d_un.d_val;
-            char* rpath = rpathref;
-            while(strstr(rpath, "$ORIGIN")) {
-                char* origin = box_strdup(h->path);
-                char* p = strrchr(origin, '/');
-                if(p) *p = '\0';    // remove file name to have only full path, without last '/'
-                char* tmp = (char*)box_calloc(1, strlen(rpath)-strlen("$ORIGIN")+strlen(origin)+1);
-                p = strstr(rpath, "$ORIGIN");
-                memcpy(tmp, rpath, p-rpath);
-                strcat(tmp, origin);
-                strcat(tmp, p+strlen("$ORIGIN"));
-                if(rpath!=rpathref)
-                    box_free(rpath);
-                rpath = tmp;
-                box_free(origin);
-            }
-            while(strstr(rpath, "${ORIGIN}")) {
-                char* origin = box_strdup(h->path);
-                char* p = strrchr(origin, '/');
-                if(p) *p = '\0';    // remove file name to have only full path, without last '/'
-                char* tmp = (char*)box_calloc(1, strlen(rpath)-strlen("${ORIGIN}")+strlen(origin)+1);
-                p = strstr(rpath, "${ORIGIN}");
-                memcpy(tmp, rpath, p-rpath);
-                strcat(tmp, origin);
-                strcat(tmp, p+strlen("${ORIGIN}"));
-                if(rpath!=rpathref)
-                    box_free(rpath);
-                rpath = tmp;
-                box_free(origin);
-            }
-            while(strstr(rpath, "${PLATFORM}")) {
-                char* platform = box_strdup("x86_64");
-                char* p = strrchr(platform, '/');
-                if(p) *p = '\0';    // remove file name to have only full path, without last '/'
-                char* tmp = (char*)box_calloc(1, strlen(rpath)-strlen("${PLATFORM}")+strlen(platform)+1);
-                p = strstr(rpath, "${PLATFORM}");
-                memcpy(tmp, rpath, p-rpath);
-                strcat(tmp, platform);
-                strcat(tmp, p+strlen("${PLATFORM}"));
-                if(rpath!=rpathref)
-                    box_free(rpath);
-                rpath = tmp;
-                box_free(platform);
-            }
-            if(strchr(rpath, '$')) {
-                printf_log(LOG_INFO, "BOX64: Warning, RPATH with $ variable not supported yet (%s)\n", rpath);
-            } else {
-                char latxpath [PATH_MAX] = {0};
-                snprintf(latxpath , PATH_MAX, "%s%s:%s", strlen(interp_prefix)?interp_prefix:"/usr/gnemul/latx-x86_64", rpath,rpath);
-                printf_log(LOG_INFO, "Prepending path \"%s\" to BOX64_LD_LIBRARY_PATH\n", latxpath);
-                PrependList(&box64->box64_ld_lib, latxpath, 1);
-            }
-            if(rpath!=rpathref)
-                box_free(rpath);
-        }
-
-    if(!h->neededlibs && neededlibs)
-        h->neededlibs = neededlibs;
-
-    DumpDynamicNeeded(h);
-    int cnt = 0;
-    for (int i=0; i<h->numDynamic; ++i)
-        if(h->Dynamic[i].d_tag==DT_NEEDED)
-            ++cnt;
-    const char* nlibs[cnt];
-    int j=0;
-    for (int i=0; i<h->numDynamic; ++i)
-        if(h->Dynamic[i].d_tag==DT_NEEDED) {
-            if (strstr(h->DynStrTab+h->delta+h->Dynamic[i].d_un.d_val, "ld-linux-x86-64.so.2")) {
-                cnt--;
-                continue;
-            }
-            nlibs[j++] = h->DynStrTab+h->delta+h->Dynamic[i].d_un.d_val;
-        }
-
-    // TODO: Add LD_LIBRARY_PATH and RPATH handling
-    if(AddNeededLib(maplib, neededlibs, deplib, local, bindnow, nlibs, cnt, box64)) {
-        printf_log(LOG_INFO, "Error loading one of needed lib\n");
-        if(!allow_missing_libs)
-            return 1;   //error...
-    }
-    return 0;
 }
 
 void RunElfInit(elfheader_t* h)
@@ -1275,68 +1837,88 @@ void* GetNativeSymbolUnversionned(void* lib, const char* name)
     return s.addr;
 }
 
-static int64_t Pop64(CPUX86State *cpu)
+static KztPatchTargetResolution kzt_resolve_lazy_current_target(
+    const KztLazyBinding *binding)
 {
-    uint64_t* st = ((uint64_t*)(cpu->regs[R_ESP]));
-    cpu->regs[R_ESP] += 8;
+    KztLazySymbolLookupPlan lookup =
+        KztLazyPrepareSymbolLookup(binding);
+    KztLazyPltSymbolArgs plt_args = lookup.plt_args;
+    library_t *lib = plt_args.head->lib;
+    lib_t *local_maplib = GetMaplib(lib);
 
-    return *st;
-}
-static void Push64(CPUX86State *cpu, uint64_t v)
-{
-    cpu->regs[R_ESP] -= 8;
-    *((uint64_t*)cpu->regs[R_ESP]) = v;
-
-}
-uintptr_t pltResolver = ~0LL;
-uintptr_t dl_runtime_resolver = ~0LL;
-uintptr_t link_map_obj=0;
-void PltResolver(void)
-{
-    CPUX86State *cpu = (CPUX86State*)lsenv->cpu_state;
-    uintptr_t addr = Pop64(cpu);
-    int slot = (int)Pop64(cpu);
-    elfheader_t *h = (elfheader_t*)addr;
-    printf_log(LOG_INFO, "PltResolver: Addr=%p, Slot=%d Return=%p: elf is %s (VerSym=%p)\n", (void*)addr, slot, *(void**)(cpu->regs[R_ESP]), h->name, h->VerSym);
-
-    Elf64_Rela * rel = (Elf64_Rela *)(h->jmprel + h->delta) + slot;
-    Elf64_Sym *sym = &h->DynSym[ELF64_R_SYM(rel->r_info)];
- #if defined(CONFIG_LATX_KZT) && defined(CONFIG_LATX_DEBUG)
-    int bind = ELF64_ST_BIND(sym->st_info);
- #endif
-    const char* symname = SymName(h, sym);
-    int version = h->VerSym?((Elf64_Half*)((uintptr_t)h->VerSym+h->delta))[ELF64_R_SYM(rel->r_info)]:-1;
-    if(version!=-1) version &= 0x7fff;
-    const char* vername = GetSymbolVersion(h, version);
-    uint64_t *p = (uint64_t*)(rel->r_offset + h->delta);
-    uintptr_t offs = 0;
-    uintptr_t end = 0;
-
-    library_t* lib = h->lib;
-    lib_t* local_maplib = GetMaplib(lib);
-    GetGlobalSymbolStartEnd(my_context->maplib, symname, &offs, &end, h, version, vername);
-    if(!offs && !end && local_maplib) {
-        GetGlobalSymbolStartEnd(local_maplib, symname, &offs, &end, h, version, vername);
+    if (lookup.has_relocation_symbol) {
+        KztLazyRelocationSymbolArgs rela_args = lookup.relocation_args;
+        return kzt_resolve_relocation_symbol_for_patch(
+            my_context->maplib, local_maplib, rela_args.head,
+            rela_args.symbol_entry, rela_args.symbol, rela_args.bind,
+            rela_args.relocation_type, rela_args.current_target,
+            rela_args.version, rela_args.version_name);
     }
-    if(!offs && !end && !version)
-        GetGlobalSymbolStartEnd(my_context->maplib, symname, &offs, &end, h, -1, NULL);
 
-    if (!offs) {
-//        printf_log(LOG_INFO, "Error: PltResolver: Symbol %s(ver %d: %s%s%s) not found, cannot apply R_X86_64_JUMP_SLOT %p (%p) in %s\n", symname, version, symname, vername?"@":"", vername?vername:"", p, *(void**)p, h->name);
-        //return to __dl_runtime_resolver
-        Push64(cpu, slot);
-        Push64(cpu, h->self_link_map);
-        Push64(cpu, dl_runtime_resolver);
-        return;
+    return kzt_resolve_plt_symbol_for_patch(
+        my_context->maplib, local_maplib, plt_args.head,
+        plt_args.symbol, plt_args.version, plt_args.version_name);
+}
+
+static uintptr_t kzt_lazy_binding_bridge_from_resolution(
+    KztPatchTargetResolution resolution)
+{
+    return kzt_patch_target_resolution_bridge(&resolution, 0);
+}
+
+static void kzt_apply_lazy_binding_target(
+    const KztLazyBinding *binding,
+    KztPatchTargetResolution resolution,
+    const KztLazyResolvePlan *plan,
+    const KztLazyTargetPatchPlan *patch_plan)
+{
+    if (patch_plan && patch_plan->has_target_slot) {
+        KztLazyLogResolvePatch(
+            binding, patch_plan->target,
+            ElfName(FindElfAddress(my_context, patch_plan->target)),
+            plan);
+        KztPatchDecision decision =
+            kzt_make_lazy_patch_decision_from_resolution(
+                my_context->maplib, resolution, patch_plan->args,
+                patch_plan->target, patch_plan->reason);
+        kzt_apply_patch_decision(&decision);
     } else {
-        offs = (uintptr_t)getAlternate((void*)offs);
-        if(p) {
-            printf_log(LOG_INFO, "            Apply %s R_X86_64_JUMP_SLOT %p with sym=%s(ver %d: %s%s%s) (%p -> %p / %s)\n", (bind==STB_LOCAL)?"Local":"Global", p, symname, version, symname, vername?"@":"", vername?vername:"",*(void**)p, (void*)offs, ElfName(FindElfAddress(my_context, offs)));
-            *p = offs;
-        } else {
-            printf_log(LOG_INFO, "PltResolver: Warning, Symbol %s(ver %d: %s%s%s) found, but Jump Slot Offset is NULL \n", symname, version, symname, vername?"@":"", vername?vername:"");
-        }
-        //next_tb is the onebridge of the function
-        Push64(cpu, offs);
+        KztLazyLogResolveMissingSlot(binding, plan);
     }
+}
+
+static KztLazyResolveResult kzt_apply_lazy_resolve_plan(
+    const KztLazyBinding *binding,
+    KztPatchTargetResolution resolution,
+    const KztLazyResolvePlan *plan)
+{
+    if (KztLazyResolvePlanUsesGuestFallback(plan)) {
+        KztLazyLogResolveGuestFallback(binding, plan);
+        return KztLazyResolveResultFromPlan(plan);
+    }
+
+    uintptr_t bridge =
+        kzt_lazy_binding_bridge_from_resolution(resolution);
+    KztLazyTargetPatchPlan patch_plan;
+    KztLazyResolveResult result =
+        KztLazyResolveResultFromBridgePatch(
+            binding, plan, bridge, &patch_plan);
+    kzt_apply_lazy_binding_target(
+        binding, resolution, plan, &patch_plan);
+
+    /* The target is the onebridge that the guest should call next. */
+    return result;
+}
+
+static KztLazyResolveResult kzt_lazy_patch_current_target(
+    KztLazyBinding *binding)
+{
+    KztLazyRefreshCurrentBinding(binding);
+
+    KztPatchTargetResolution resolution =
+        kzt_resolve_lazy_current_target(binding);
+    KztLazyResolvePlan plan = KztLazySelectResolvePlan(
+        binding, kzt_patch_target_resolution_has_bridge(&resolution));
+
+    return kzt_apply_lazy_resolve_plan(binding, resolution, &plan);
 }
