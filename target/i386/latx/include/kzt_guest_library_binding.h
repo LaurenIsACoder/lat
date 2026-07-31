@@ -64,12 +64,34 @@ typedef struct kzt_guest_library_handle {
     kzt_guest_library_object_type_t object_type;
 } kzt_guest_library_handle_t;
 
+typedef void (*kzt_guest_library_exact_cleanup_fn)(
+    library_t *library, void *opaque);
+
 typedef struct kzt_guest_library_callback_access {
     kzt_guest_library_bindings_t *bindings;
     uintptr_t link_map_addr;
     void *gate;
     int fallback;
 } kzt_guest_library_callback_access_t;
+
+/* A non-blocking, context-local reader lease proving that no controlled guest
+ * loader scope can change the guest link_map.  Concurrent binding readers may
+ * hold leases together; a waiting loader prevents new readers from entering.
+ * Keep the token at a stable address and release it exactly once. */
+typedef struct kzt_guest_library_loader_quiescence_lease {
+    kzt_guest_library_bindings_t *bindings;
+    unsigned long cookie;
+    struct kzt_guest_library_loader_quiescence_lease *next;
+} kzt_guest_library_loader_quiescence_lease_t;
+
+/* A writer token closes reader admission before waiting for admitted readers
+ * to leave.  The bindings lock is not held after begin returns, so guest
+ * loader and Registry calls remain outside the bindings critical section. */
+typedef struct kzt_guest_library_loader_quiescence_writer {
+    kzt_guest_library_bindings_t *bindings;
+    unsigned long cookie;
+    struct kzt_guest_library_loader_quiescence_writer *next;
+} kzt_guest_library_loader_quiescence_writer_t;
 
 kzt_guest_library_bindings_t *kzt_guest_library_bindings_init(void);
 void kzt_guest_library_bindings_begin_teardown(
@@ -99,6 +121,16 @@ int kzt_guest_library_loader_scope_begin(
     kzt_guest_library_loader_scope_t *scope);
 void kzt_guest_library_loader_scope_end(
     kzt_guest_library_loader_scope_t *scope);
+int kzt_guest_library_loader_quiescence_try_acquire(
+    kzt_guest_library_bindings_t *bindings,
+    kzt_guest_library_loader_quiescence_lease_t *lease);
+void kzt_guest_library_loader_quiescence_release(
+    kzt_guest_library_loader_quiescence_lease_t *lease);
+int kzt_guest_library_loader_quiescence_writer_begin(
+    kzt_guest_library_bindings_t *bindings,
+    kzt_guest_library_loader_quiescence_writer_t *writer);
+void kzt_guest_library_loader_quiescence_writer_end(
+    kzt_guest_library_loader_quiescence_writer_t *writer);
 kzt_guest_library_binding_result_t
 kzt_guest_library_loader_scope_note_pair(
     const kzt_guest_library_loader_scope_t *scope,
@@ -164,12 +196,34 @@ int kzt_guest_library_access_lookup(
     kzt_guest_library_access_t *access,
     const kzt_guest_library_binding_key_t *key,
     kzt_guest_library_handle_t *handle);
+/* Returns one published LIVE binding in the main namespace and pins its
+ * library lifetime in handle.  Ambiguous or unavailable bindings fail with
+ * both outputs cleared; release successful handles with handle_release. */
+int kzt_guest_library_access_lookup_by_library(
+    kzt_guest_library_access_t *access, library_t *library,
+    kzt_guest_library_binding_key_t *key,
+    kzt_guest_library_handle_t *handle);
 #ifdef KZT_GUEST_LIBRARY_BINDING_TEST
 int kzt_guest_library_lookup(kzt_guest_library_bindings_t *bindings,
                              const kzt_guest_library_binding_key_t *key,
                              kzt_guest_library_handle_t *handle);
 #endif
 void kzt_guest_library_handle_release(kzt_guest_library_handle_t *handle);
+int kzt_guest_library_symbol_evidence_lookup(
+    const kzt_guest_library_handle_t *handle, const char *symbol,
+    unsigned long dynamic_revision, uintptr_t *runtime_address,
+    unsigned char *symbol_type);
+void kzt_guest_library_symbol_evidence_store(
+    const kzt_guest_library_handle_t *handle, const char *symbol,
+    unsigned long dynamic_revision, uintptr_t runtime_address,
+    unsigned char symbol_type);
+/* Consumes one pinned exact handle, closes only that binding, and invokes a
+ * non-blocking library cleanup callback before concurrent unbind can free the
+ * library.  The callback must not enter bindings or Registry APIs. */
+int kzt_guest_library_cleanup_exact_handle(
+    kzt_guest_library_handle_t *handle,
+    kzt_guest_library_exact_cleanup_fn cleanup,
+    void *opaque);
 
 /* Closes attachment under the bindings lock, retires exact registry
  * generations without that lock, then waits for acquired lookup handles.
@@ -209,6 +263,10 @@ int kzt_guest_library_binding_test_get_diagnostics(
     kzt_guest_library_bindings_t *bindings,
     unsigned long *registry_missing,
     unsigned long *retire_unprovable);
+int kzt_guest_library_binding_test_loader_state(
+    kzt_guest_library_bindings_t *bindings,
+    unsigned int *lease_readers, unsigned int *lease_waiters,
+    unsigned int *active_scopes, int *shutting_down);
 #endif
 
 #endif

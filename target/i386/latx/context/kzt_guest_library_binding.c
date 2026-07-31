@@ -7,6 +7,19 @@
 #include <string.h>
 
 #include "kzt_guest_registry.h"
+#include "kzt_lifecycle_diagnostics.h"
+
+#define KZT_GUEST_LIBRARY_SYMBOL_CACHE_SLOTS 16
+#define KZT_GUEST_LIBRARY_SYMBOL_NAME_LIMIT 128
+
+typedef struct kzt_guest_library_symbol_evidence {
+    char symbol[KZT_GUEST_LIBRARY_SYMBOL_NAME_LIMIT];
+    uintptr_t runtime_address;
+    unsigned long age;
+    unsigned long dynamic_revision;
+    unsigned char symbol_type;
+    int valid;
+} kzt_guest_library_symbol_evidence_t;
 
 typedef struct kzt_guest_library_binding_entry {
     kzt_guest_library_binding_key_t key;
@@ -15,6 +28,9 @@ typedef struct kzt_guest_library_binding_entry {
     kzt_guest_library_binding_state_t state;
     unsigned int references;
     int retire_started;
+    unsigned long symbol_cache_age;
+    kzt_guest_library_symbol_evidence_t symbol_cache[
+        KZT_GUEST_LIBRARY_SYMBOL_CACHE_SLOTS];
 } kzt_guest_library_binding_entry_t;
 
 typedef struct kzt_guest_library_lifecycle {
@@ -104,6 +120,11 @@ struct kzt_guest_library_bindings {
     kzt_guest_library_callback_gate_t *callback_gates;
     unsigned int fallback_callback_readers;
     kzt_guest_library_loader_state_t *loader_state;
+    unsigned long loader_quiescence_epoch;
+    kzt_guest_library_loader_quiescence_lease_t *loader_quiescence_leases;
+    kzt_guest_library_loader_quiescence_writer_t *loader_quiescence_writers;
+    unsigned int loader_quiescence_readers;
+    unsigned int loader_quiescence_waiters;
     struct {
         unsigned long registry_missing;
         unsigned long retire_unprovable;
@@ -306,6 +327,16 @@ static kzt_guest_library_loader_attempt_t *find_loader_attempt_locked(
     return NULL;
 }
 
+static int loader_scope_active_locked(
+    const kzt_guest_library_bindings_t *bindings)
+{
+    if (!bindings->loader_state) return 0;
+    for (size_t i = 0; i < KZT_LOADER_ATTEMPT_SLOTS; ++i)
+        if (bindings->loader_state->attempts[i].active)
+            return 1;
+    return 0;
+}
+
 static kzt_guest_library_loader_attempt_t *loader_scope_valid_locked(
     kzt_guest_library_bindings_t *bindings,
     const kzt_guest_library_loader_scope_t *scope)
@@ -481,6 +512,16 @@ static kzt_guest_library_binding_result_t bind_locked(
                    ? KZT_GUEST_LIBRARY_BINDING_UNCHANGED
                    : KZT_GUEST_LIBRARY_BINDING_CONFLICT;
     }
+    if (object_type == KZT_GUEST_LIBRARY_OBJECT_WRAPPED) {
+        for (size_t i = 0; i < bindings->count; ++i) {
+            kzt_guest_library_binding_entry_t *entry = &bindings->entries[i];
+
+            if (entry->state == KZT_GUEST_LIBRARY_BINDING_LIVE &&
+                entry->library == library && !same_key(&entry->key, key)) {
+                return KZT_GUEST_LIBRARY_BINDING_CONFLICT;
+            }
+        }
+    }
     if (bindings->count == bindings->capacity &&
         grow_array((void **)&bindings->entries, &bindings->capacity,
                    sizeof(*bindings->entries)) != 0)
@@ -518,6 +559,7 @@ void kzt_guest_library_bindings_begin_teardown(
     if (!bindings) return;
     pthread_mutex_lock(&bindings->lock);
     __atomic_store_n(&bindings->shutting_down, 1, __ATOMIC_RELEASE);
+    pthread_cond_broadcast(&bindings->idle);
     for (size_t i = 0; i < bindings->pending_count; ++i)
         bindings->pending[i].active = 0;
     for (size_t i = 0; i < bindings->count; ++i)
@@ -535,6 +577,9 @@ void kzt_guest_library_bindings_begin_teardown(
              gate; gate = gate->next)
             busy |= (__atomic_load_n(&gate->state, __ATOMIC_ACQUIRE) &
                      KZT_CALLBACK_GATE_READERS) != 0;
+        busy |= bindings->loader_quiescence_readers != 0;
+        busy |= bindings->loader_quiescence_waiters != 0;
+        busy |= loader_scope_active_locked(bindings);
         if (!busy) break;
         pthread_cond_wait(&bindings->idle, &bindings->lock);
     }
@@ -665,6 +710,15 @@ int kzt_guest_library_loader_scope_begin(
     if (!bindings || !scope) return -1;
     pthread_mutex_lock(&bindings->lock);
     if (!shutting_down(bindings) &&
+        bindings->loader_quiescence_readers) {
+        ++bindings->loader_quiescence_waiters;
+        while (!shutting_down(bindings) &&
+               bindings->loader_quiescence_readers)
+            pthread_cond_wait(&bindings->idle, &bindings->lock);
+        --bindings->loader_quiescence_waiters;
+        pthread_cond_broadcast(&bindings->idle);
+    }
+    if (!shutting_down(bindings) &&
         (!bindings->loader_state || bindings->loader_state->epoch != ULONG_MAX)) {
         kzt_guest_library_loader_attempt_t *slot = NULL;
         if (!bindings->loader_state)
@@ -715,9 +769,133 @@ void kzt_guest_library_loader_scope_end(
             attempt->active = 0;
         else
             memset(attempt, 0, sizeof(*attempt));
+        pthread_cond_broadcast(&bindings->idle);
     }
     pthread_mutex_unlock(&bindings->lock);
     memset(scope, 0, sizeof(*scope));
+}
+
+int kzt_guest_library_loader_quiescence_try_acquire(
+    kzt_guest_library_bindings_t *bindings,
+    kzt_guest_library_loader_quiescence_lease_t *lease)
+{
+    int result = -1;
+
+    if (lease) memset(lease, 0, sizeof(*lease));
+    if (!bindings || !lease) return -1;
+    pthread_mutex_lock(&bindings->lock);
+    if (!shutting_down(bindings) &&
+        !bindings->loader_quiescence_waiters &&
+        !loader_scope_active_locked(bindings) &&
+        bindings->loader_quiescence_epoch != ULONG_MAX &&
+        bindings->loader_quiescence_readers != UINT_MAX) {
+        unsigned long identity = ++bindings->loader_quiescence_epoch;
+        unsigned long cookie =
+            identity ^ (unsigned long)(uintptr_t)bindings;
+
+        if (!cookie) cookie = ~identity;
+        ++bindings->loader_quiescence_readers;
+        lease->bindings = bindings;
+        lease->cookie = cookie;
+        lease->next = bindings->loader_quiescence_leases;
+        bindings->loader_quiescence_leases = lease;
+        result = 0;
+    }
+    pthread_mutex_unlock(&bindings->lock);
+    return result;
+}
+
+void kzt_guest_library_loader_quiescence_release(
+    kzt_guest_library_loader_quiescence_lease_t *lease)
+{
+    kzt_guest_library_bindings_t *bindings;
+    kzt_guest_library_loader_quiescence_lease_t **cursor;
+
+    if (!lease || !(bindings = lease->bindings)) return;
+    pthread_mutex_lock(&bindings->lock);
+    cursor = &bindings->loader_quiescence_leases;
+    while (*cursor && *cursor != lease)
+        cursor = &(*cursor)->next;
+    if (*cursor == lease && lease->cookie &&
+        bindings->loader_quiescence_readers) {
+        *cursor = lease->next;
+        if (--bindings->loader_quiescence_readers == 0)
+            pthread_cond_broadcast(&bindings->idle);
+    }
+    pthread_mutex_unlock(&bindings->lock);
+    memset(lease, 0, sizeof(*lease));
+}
+
+int kzt_guest_library_loader_quiescence_writer_begin(
+    kzt_guest_library_bindings_t *bindings,
+    kzt_guest_library_loader_quiescence_writer_t *writer)
+{
+    kzt_guest_library_loader_quiescence_writer_t **cursor;
+    unsigned long identity;
+    unsigned long cookie;
+    int result = -1;
+
+    if (writer) memset(writer, 0, sizeof(*writer));
+    if (!bindings || !writer) return -1;
+    pthread_mutex_lock(&bindings->lock);
+    if (shutting_down(bindings) ||
+        bindings->loader_quiescence_epoch == ULONG_MAX ||
+        bindings->loader_quiescence_waiters == UINT_MAX) {
+        goto out;
+    }
+    identity = ++bindings->loader_quiescence_epoch;
+    cookie =
+        identity ^ (unsigned long)(uintptr_t)bindings ^
+        (unsigned long)(uintptr_t)writer;
+
+    if (!cookie) cookie = ~identity;
+    if (!cookie) cookie = 1;
+    writer->bindings = bindings;
+    writer->cookie = cookie;
+    writer->next = bindings->loader_quiescence_writers;
+    bindings->loader_quiescence_writers = writer;
+    ++bindings->loader_quiescence_waiters;
+    while (!shutting_down(bindings) &&
+           bindings->loader_quiescence_readers) {
+        pthread_cond_wait(&bindings->idle, &bindings->lock);
+    }
+    if (!shutting_down(bindings)) {
+        result = 0;
+    } else {
+        cursor = &bindings->loader_quiescence_writers;
+        while (*cursor && *cursor != writer)
+            cursor = &(*cursor)->next;
+        if (*cursor == writer && bindings->loader_quiescence_waiters) {
+            *cursor = writer->next;
+            --bindings->loader_quiescence_waiters;
+            pthread_cond_broadcast(&bindings->idle);
+        }
+        memset(writer, 0, sizeof(*writer));
+    }
+out:
+    pthread_mutex_unlock(&bindings->lock);
+    return result;
+}
+
+void kzt_guest_library_loader_quiescence_writer_end(
+    kzt_guest_library_loader_quiescence_writer_t *writer)
+{
+    kzt_guest_library_bindings_t *bindings;
+    kzt_guest_library_loader_quiescence_writer_t **cursor;
+
+    if (!writer || !(bindings = writer->bindings)) return;
+    pthread_mutex_lock(&bindings->lock);
+    cursor = &bindings->loader_quiescence_writers;
+    while (*cursor && *cursor != writer)
+        cursor = &(*cursor)->next;
+    if (*cursor == writer && writer->cookie &&
+        bindings->loader_quiescence_waiters) {
+        *cursor = writer->next;
+        --bindings->loader_quiescence_waiters;
+        pthread_cond_broadcast(&bindings->idle);
+    }
+    pthread_mutex_unlock(&bindings->lock);
+    memset(writer, 0, sizeof(*writer));
 }
 
 static int callback_access_begin(
@@ -1328,6 +1506,175 @@ int kzt_guest_library_access_lookup(
     return result;
 }
 
+static int lookup_bindings_by_library(
+    kzt_guest_library_bindings_t *bindings, library_t *library,
+    kzt_guest_library_binding_key_t *key,
+    kzt_guest_library_handle_t *handle)
+{
+    kzt_guest_library_binding_entry_t *match = NULL;
+    size_t match_index = 0;
+    int result = -1;
+
+    if (key) memset(key, 0, sizeof(*key));
+    if (handle) memset(handle, 0, sizeof(*handle));
+    if (!bindings || !library || !key || !handle) return -1;
+
+    pthread_mutex_lock(&bindings->lock);
+    if (shutting_down(bindings)) goto out;
+
+    kzt_guest_library_lifecycle_t *lifecycle =
+        find_lifecycle_locked(bindings, library);
+    if (!lifecycle || lifecycle->state != KZT_GUEST_LIBRARY_BINDING_LIVE)
+        goto out;
+
+    for (size_t i = 0; i < bindings->count; ++i) {
+        kzt_guest_library_binding_entry_t *entry = &bindings->entries[i];
+        if (entry->library != library ||
+            entry->state != KZT_GUEST_LIBRARY_BINDING_LIVE)
+            continue;
+        if (!supported_key(&entry->key) || match)
+            goto out;
+        match = entry;
+        match_index = i;
+    }
+    if (!match) goto out;
+
+    ++match->references;
+    *key = match->key;
+    handle->bindings = bindings;
+    handle->entry = (void *)(uintptr_t)(match_index + 1);
+    handle->library = match->library;
+    handle->object_type = match->object_type;
+    result = 0;
+out:
+    pthread_mutex_unlock(&bindings->lock);
+    return result;
+}
+
+int kzt_guest_library_access_lookup_by_library(
+    kzt_guest_library_access_t *access, library_t *library,
+    kzt_guest_library_binding_key_t *key,
+    kzt_guest_library_handle_t *handle)
+{
+    int result = -1;
+    if (key) memset(key, 0, sizeof(*key));
+    if (handle) memset(handle, 0, sizeof(*handle));
+    if (!access || !access->initialized || !library || !key || !handle)
+        return -1;
+    pthread_mutex_lock(&access->lock);
+    if (access->accepting && access->bindings)
+        result = lookup_bindings_by_library(
+            access->bindings, library, key, handle);
+    pthread_mutex_unlock(&access->lock);
+    return result;
+}
+
+static kzt_guest_library_binding_entry_t *
+kzt_guest_library_handle_entry_locked(
+    kzt_guest_library_bindings_t *bindings,
+    const kzt_guest_library_handle_t *handle)
+{
+    size_t index;
+    kzt_guest_library_binding_entry_t *entry;
+
+    if (!bindings || !handle || handle->bindings != bindings ||
+        !handle->entry || !handle->library) {
+        return NULL;
+    }
+    index = (size_t)(uintptr_t)handle->entry - 1;
+    if (index >= bindings->count) return NULL;
+    entry = &bindings->entries[index];
+    if (!entry->references || entry->library != handle->library ||
+        entry->object_type != handle->object_type ||
+        entry->state != KZT_GUEST_LIBRARY_BINDING_LIVE) {
+        return NULL;
+    }
+    return entry;
+}
+
+int kzt_guest_library_symbol_evidence_lookup(
+    const kzt_guest_library_handle_t *handle, const char *symbol,
+    unsigned long dynamic_revision, uintptr_t *runtime_address,
+    unsigned char *symbol_type)
+{
+    kzt_guest_library_bindings_t *bindings;
+    kzt_guest_library_binding_entry_t *entry;
+    size_t i;
+    int result = -1;
+
+    if (runtime_address) *runtime_address = 0;
+    if (symbol_type) *symbol_type = 0;
+    if (!handle || !(bindings = handle->bindings) || !symbol || !symbol[0] ||
+        !dynamic_revision || !runtime_address || !symbol_type) {
+        return -1;
+    }
+    pthread_mutex_lock(&bindings->lock);
+    entry = kzt_guest_library_handle_entry_locked(bindings, handle);
+    if (!entry || shutting_down(bindings)) goto out;
+    for (i = 0; i < KZT_GUEST_LIBRARY_SYMBOL_CACHE_SLOTS; ++i) {
+        kzt_guest_library_symbol_evidence_t *cached =
+            &entry->symbol_cache[i];
+
+        if (cached->valid &&
+            cached->dynamic_revision == dynamic_revision &&
+            strcmp(cached->symbol, symbol) == 0) {
+            cached->age = ++entry->symbol_cache_age;
+            *runtime_address = cached->runtime_address;
+            *symbol_type = cached->symbol_type;
+            result = 0;
+            break;
+        }
+    }
+out:
+    pthread_mutex_unlock(&bindings->lock);
+    return result;
+}
+
+void kzt_guest_library_symbol_evidence_store(
+    const kzt_guest_library_handle_t *handle, const char *symbol,
+    unsigned long dynamic_revision, uintptr_t runtime_address,
+    unsigned char symbol_type)
+{
+    kzt_guest_library_bindings_t *bindings;
+    kzt_guest_library_binding_entry_t *entry;
+    kzt_guest_library_symbol_evidence_t *selected = NULL;
+    size_t symbol_length;
+    size_t i;
+
+    if (!handle || !(bindings = handle->bindings) || !symbol ||
+        !(symbol_length = strlen(symbol)) ||
+        symbol_length >= KZT_GUEST_LIBRARY_SYMBOL_NAME_LIMIT ||
+        !dynamic_revision ||
+        !runtime_address) {
+        return;
+    }
+    pthread_mutex_lock(&bindings->lock);
+    entry = kzt_guest_library_handle_entry_locked(bindings, handle);
+    if (!entry || shutting_down(bindings)) goto out;
+    for (i = 0; i < KZT_GUEST_LIBRARY_SYMBOL_CACHE_SLOTS; ++i) {
+        kzt_guest_library_symbol_evidence_t *cached =
+            &entry->symbol_cache[i];
+
+        if (cached->valid && strcmp(cached->symbol, symbol) == 0) {
+            selected = cached;
+            break;
+        }
+        if (!selected || !cached->valid || cached->age < selected->age) {
+            selected = cached;
+        }
+    }
+    if (selected) {
+        memcpy(selected->symbol, symbol, symbol_length + 1);
+        selected->runtime_address = runtime_address;
+        selected->symbol_type = symbol_type;
+        selected->dynamic_revision = dynamic_revision;
+        selected->age = ++entry->symbol_cache_age;
+        selected->valid = 1;
+    }
+out:
+    pthread_mutex_unlock(&bindings->lock);
+}
+
 void kzt_guest_library_handle_release(kzt_guest_library_handle_t *handle)
 {
     kzt_guest_library_bindings_t *bindings;
@@ -1344,6 +1691,79 @@ void kzt_guest_library_handle_release(kzt_guest_library_handle_t *handle)
     memset(handle, 0, sizeof(*handle));
 }
 
+int kzt_guest_library_cleanup_exact_handle(
+    kzt_guest_library_handle_t *handle,
+    kzt_guest_library_exact_cleanup_fn cleanup,
+    void *opaque)
+{
+    kzt_guest_library_bindings_t *bindings;
+    kzt_guest_library_binding_entry_t *entry;
+    kzt_guest_library_lifecycle_t *lifecycle;
+    library_t *library;
+    size_t index;
+    size_t i;
+
+    if (!handle || !(bindings = handle->bindings) || !handle->entry ||
+        !handle->library) {
+        return -1;
+    }
+    pthread_mutex_lock(&bindings->lock);
+    index = (size_t)(uintptr_t)handle->entry - 1;
+    if (index >= bindings->count) {
+        pthread_mutex_unlock(&bindings->lock);
+        return -1;
+    }
+    entry = &bindings->entries[index];
+    library = handle->library;
+    lifecycle = find_lifecycle_locked(bindings, library);
+    if (entry->library != library || !entry->references ||
+        entry->state != KZT_GUEST_LIBRARY_BINDING_LIVE || !lifecycle ||
+        lifecycle->state != KZT_GUEST_LIBRARY_BINDING_LIVE) {
+        pthread_mutex_unlock(&bindings->lock);
+        return -1;
+    }
+    for (i = 0; i < bindings->count; ++i) {
+        if (i != index && bindings->entries[i].library == library &&
+            bindings->entries[i].state == KZT_GUEST_LIBRARY_BINDING_LIVE &&
+            !same_key(&bindings->entries[i].key, &entry->key)) {
+            pthread_mutex_unlock(&bindings->lock);
+            return -1;
+        }
+    }
+
+    lifecycle->state = KZT_GUEST_LIBRARY_BINDING_UNLOADING;
+    entry->state = KZT_GUEST_LIBRARY_BINDING_UNLOADING;
+    close_callback_addr_locked(bindings, lifecycle, library,
+                               entry->key.link_map_addr);
+    for (i = 0; i < bindings->pending_count; ++i) {
+        if (bindings->pending[i].library == library &&
+            bindings->pending[i].link_map_addr ==
+                entry->key.link_map_addr) {
+            bindings->pending[i].active = 0;
+        }
+    }
+    for (i = 0; i < bindings->observed_count; ++i) {
+        if (same_key(&bindings->observed[i].key, &entry->key)) {
+            memset(&bindings->observed[i], 0,
+                   sizeof(bindings->observed[i]));
+        }
+    }
+
+    --entry->references;
+    memset(handle, 0, sizeof(*handle));
+    while (entry->references) {
+        pthread_cond_wait(&bindings->idle, &bindings->lock);
+    }
+    if (cleanup) {
+        cleanup(library, opaque);
+    }
+    entry->state = KZT_GUEST_LIBRARY_BINDING_DEAD;
+    lifecycle->state = KZT_GUEST_LIBRARY_BINDING_DEAD;
+    pthread_cond_broadcast(&bindings->idle);
+    pthread_mutex_unlock(&bindings->lock);
+    return 0;
+}
+
 static void unload_library(kzt_guest_library_bindings_t *bindings,
                            kzt_guest_registry_t *registry,
                            library_t *library,
@@ -1352,7 +1772,12 @@ static void unload_library(kzt_guest_library_bindings_t *bindings,
     kzt_guest_library_lifecycle_t *lifecycle;
     int owns_lifecycle = 0;
     int waits_for_lifecycle = 0;
+    uint64_t timing_start = 0;
+    uint64_t retire_ns = 0;
     if (!bindings || !library) return;
+    if (kzt_lifecycle_diagnostics_enabled()) {
+        timing_start = kzt_lifecycle_diagnostics_now();
+    }
     pthread_mutex_lock(&bindings->lock);
 
     /* Phase 1 closes every binding-side path without allocation.  Only the
@@ -1462,22 +1887,35 @@ static void unload_library(kzt_guest_library_bindings_t *bindings,
             pthread_mutex_lock(&bindings->lock);
             ++bindings->diagnostics.registry_missing;
             pthread_mutex_unlock(&bindings->lock);
-        } else if (kzt_guest_registry_retire(
-                       registry, retire_key.link_map_addr,
-                       retire_key.generation) != 0 &&
-                   kzt_guest_registry_wait_retired(
-                       registry, retire_key.link_map_addr,
-                       retire_key.generation) != 0) {
-            /* An exact generation already in UNLOADING is waited to DEAD by
-             * wait_retired().  Disabled/missing/replaced/unprovable state is
-             * a new-KZT failure and must leave the legacy process alive. */
-            fprintf(stderr,
-                    "KZT binding retire state unprovable: link_map=%p generation=%lu; continuing legacy flow\n",
-                    (void *)retire_key.link_map_addr,
-                    retire_key.generation);
-            pthread_mutex_lock(&bindings->lock);
-            ++bindings->diagnostics.retire_unprovable;
-            pthread_mutex_unlock(&bindings->lock);
+        } else {
+            uint64_t retire_start = timing_start
+                                        ? kzt_lifecycle_diagnostics_now()
+                                        : 0;
+            int retire_result = kzt_guest_registry_retire(
+                registry, retire_key.link_map_addr, retire_key.generation);
+
+            if (retire_start) {
+                uint64_t duration =
+                    kzt_lifecycle_diagnostics_now() - retire_start;
+                retire_ns += duration;
+                kzt_lifecycle_diagnostics_add(
+                    KZT_LIFECYCLE_REGISTRY_RETIRE, duration);
+            }
+            if (retire_result != 0 &&
+                kzt_guest_registry_wait_retired(
+                    registry, retire_key.link_map_addr,
+                    retire_key.generation) != 0) {
+                /* An exact generation already in UNLOADING is waited to DEAD
+                 * by wait_retired(). Disabled/missing/replaced/unprovable
+                 * state is a new-KZT failure and keeps legacy flow alive. */
+                fprintf(stderr,
+                        "KZT binding retire state unprovable: link_map=%p generation=%lu; continuing legacy flow\n",
+                        (void *)retire_key.link_map_addr,
+                        retire_key.generation);
+                pthread_mutex_lock(&bindings->lock);
+                ++bindings->diagnostics.retire_unprovable;
+                pthread_mutex_unlock(&bindings->lock);
+            }
         }
         pthread_mutex_lock(&bindings->lock);
 
@@ -1532,6 +1970,13 @@ wait_or_out:
     pthread_cond_broadcast(&bindings->idle);
 out:
     pthread_mutex_unlock(&bindings->lock);
+    if (timing_start) {
+        uint64_t duration = kzt_lifecycle_diagnostics_now() - timing_start;
+
+        kzt_lifecycle_diagnostics_add(
+            KZT_LIFECYCLE_BINDING_CLEANUP,
+            duration >= retire_ns ? duration - retire_ns : duration);
+    }
 }
 
 #ifdef KZT_GUEST_LIBRARY_BINDING_TEST
@@ -1578,6 +2023,32 @@ int kzt_guest_library_binding_test_snapshot(
             ++*live_entries;
     pthread_mutex_unlock(&bindings->lock);
     return lifecycle ? 0 : -1;
+}
+
+int kzt_guest_library_binding_test_loader_state(
+    kzt_guest_library_bindings_t *bindings,
+    unsigned int *lease_readers, unsigned int *lease_waiters,
+    unsigned int *active_scopes, int *is_shutting_down)
+{
+    if (lease_readers) *lease_readers = 0;
+    if (lease_waiters) *lease_waiters = 0;
+    if (active_scopes) *active_scopes = 0;
+    if (is_shutting_down) *is_shutting_down = 0;
+    if (!bindings) return -1;
+    pthread_mutex_lock(&bindings->lock);
+    if (lease_readers)
+        *lease_readers = bindings->loader_quiescence_readers;
+    if (lease_waiters)
+        *lease_waiters = bindings->loader_quiescence_waiters;
+    if (active_scopes && bindings->loader_state) {
+        for (size_t i = 0; i < KZT_LOADER_ATTEMPT_SLOTS; ++i)
+            if (bindings->loader_state->attempts[i].active)
+                ++*active_scopes;
+    }
+    if (is_shutting_down)
+        *is_shutting_down = shutting_down(bindings);
+    pthread_mutex_unlock(&bindings->lock);
+    return 0;
 }
 #endif
 
