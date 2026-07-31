@@ -316,6 +316,30 @@ static void test_dead_objects_do_not_resolve_owner(void)
     kzt_guest_registry_destroy(&registry);
 }
 
+static void test_unique_owner_resolution_does_not_need_snapshot_allocation(void)
+{
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_guest_object_observation_t object = observation(
+        0xd000, 0x7c000000, 0x7c001000, "libcompact-owner.so");
+    kzt_owner_resolution_t resolution;
+
+    check_int("compact-owner.observe",
+              kzt_guest_registry_observe(registry, &object),
+              KZT_GUEST_REGISTRY_ADDED);
+    kzt_guest_registry_test_set_alloc_failure_after(0);
+    check_int("compact-owner.resolve",
+              kzt_owner_resolver_resolve_current(
+                  registry, 0x7c000010, 0x7c000020, &resolution), 0);
+    kzt_guest_registry_test_set_alloc_failure_after(-1);
+    check_int("compact-owner.status", resolution.status,
+              KZT_OWNER_RESOLVER_RESOLVED);
+    check_int("compact-owner.match", resolution.owner_match,
+              KZT_PATCH_OWNER_MATCH);
+    check_ulong("compact-owner.link-map",
+                resolution.current_owner.link_map_addr, 0xd000);
+    kzt_guest_registry_destroy(&registry);
+}
+
 int main(void)
 {
     test_same_soname_different_ranges_resolves_by_address();
@@ -327,6 +351,7 @@ int main(void)
     test_native_bridge_address_is_not_expected_owner_input();
     test_ambiguous_range_keeps_owner_unknown();
     test_dead_objects_do_not_resolve_owner();
+    test_unique_owner_resolution_does_not_need_snapshot_allocation();
 
     if (failures) {
         fprintf(stderr, "kzt-owner-resolver: %d failure(s)\n", failures);

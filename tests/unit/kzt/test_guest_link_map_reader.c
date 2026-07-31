@@ -327,9 +327,9 @@ static void test_name_snapshot_status_matrix(void)
                                                     4,
                                                     &name),
               0);
-    check_int("name.truncated.status", name.status,
-              KZT_GUEST_FIELD_TRUNCATED);
-    check_string("name.truncated.value", name.value, "abcd");
+    check_int("name.over-limit.status", name.status,
+              KZT_GUEST_FIELD_UNKNOWN);
+    check_string("name.over-limit.value", name.value, NULL);
     kzt_guest_link_map_string_clear(&name);
 
     check_int("name.read-error",
@@ -506,6 +506,221 @@ static void test_predecessor_is_read_from_public_prefix(void)
     check_uintptr("predecessor.failure-clears", predecessor, 0);
 }
 
+static void test_successor_is_read_from_public_prefix(void)
+{
+    test_guest_link_map_t maps[2] = { 0 };
+    fake_read_failure_t failure = {
+        .addr = (uintptr_t)&maps[0] +
+                offsetof(test_guest_link_map_t, l_next),
+        .size = sizeof(maps[0].l_next),
+    };
+    fake_reader_memory_t memory = fake_memory_for(maps, sizeof(maps), NULL, 0);
+    kzt_guest_link_map_reader_ops_t ops = fake_ops(&memory);
+    uintptr_t successor = 0;
+
+    maps[0].l_next = (uintptr_t)&maps[1];
+    check_int("successor.read",
+              kzt_guest_link_map_read_successor(
+                  (uintptr_t)&maps[0], &ops, &successor),
+              0);
+    check_uintptr("successor.value", successor, (uintptr_t)&maps[1]);
+
+    memory.failures = &failure;
+    memory.failure_count = 1;
+    successor = 1;
+    check_int("successor.read-failure",
+              kzt_guest_link_map_read_successor(
+                  (uintptr_t)&maps[0], &ops, &successor),
+              -1);
+    check_uintptr("successor.failure-clears", successor, 0);
+}
+
+static void test_fingerprint_is_stable_and_covers_public_chain_identity(void)
+{
+    test_guest_link_map_t maps[3] = { 0 };
+    test_guest_link_map_t copies[3] = { 0 };
+    fake_reader_memory_t memory = fake_memory_for(maps, sizeof(maps), NULL, 0);
+    kzt_guest_link_map_reader_ops_t ops = fake_ops(&memory);
+    kzt_guest_link_map_fingerprint_t initial = { 0 };
+    kzt_guest_link_map_fingerprint_t repeated = { 0 };
+    kzt_guest_link_map_fingerprint_t changed = { 0 };
+    uint64_t initial_value;
+    size_t i;
+
+    for (i = 0; i < 3; ++i) {
+        maps[i].l_addr = 0x100000 + i * 0x10000;
+        maps[i].l_ld = 0x101000 + i * 0x10000;
+        if (i + 1 < 3) {
+            maps[i].l_next = (uintptr_t)&maps[i + 1];
+        }
+    }
+
+    check_int("fingerprint.read",
+              kzt_guest_link_map_read_fingerprint(
+                  (uintptr_t)&maps[0], &ops, &initial),
+              0);
+    check_uintptr("fingerprint.head", initial.namespace_head,
+                  (uintptr_t)&maps[0]);
+    check_uintptr("fingerprint.count", initial.link_map_count, 3);
+    check_true("fingerprint.nonzero", initial.value != 0);
+    check_int("fingerprint.repeat",
+              kzt_guest_link_map_read_fingerprint(
+                  (uintptr_t)&maps[0], &ops, &repeated),
+              0);
+    check_true("fingerprint.stable",
+               repeated.value == initial.value &&
+               repeated.link_map_count == initial.link_map_count);
+    initial_value = initial.value;
+
+    maps[1].l_addr += 0x1000;
+    check_int("fingerprint.changed-load-bias",
+              kzt_guest_link_map_read_fingerprint(
+                  (uintptr_t)&maps[0], &ops, &changed),
+              0);
+    check_true("fingerprint.mixes-load-bias",
+               changed.value != initial_value);
+    maps[1].l_addr -= 0x1000;
+
+    maps[1].l_ld += 0x1000;
+    check_int("fingerprint.changed-dynamic",
+              kzt_guest_link_map_read_fingerprint(
+                  (uintptr_t)&maps[0], &ops, &changed),
+              0);
+    check_true("fingerprint.mixes-dynamic",
+               changed.value != initial_value);
+    maps[1].l_ld -= 0x1000;
+
+    maps[0].l_next = (uintptr_t)&maps[2];
+    maps[2].l_next = (uintptr_t)&maps[1];
+    maps[1].l_next = 0;
+    check_int("fingerprint.changed-order",
+              kzt_guest_link_map_read_fingerprint(
+                  (uintptr_t)&maps[0], &ops, &changed),
+              0);
+    check_true("fingerprint.mixes-order", changed.value != initial_value);
+
+    for (i = 0; i < 3; ++i) {
+        copies[i].l_addr = 0x100000 + i * 0x10000;
+        copies[i].l_ld = 0x101000 + i * 0x10000;
+        if (i + 1 < 3) {
+            copies[i].l_next = (uintptr_t)&copies[i + 1];
+        }
+    }
+    memory = fake_memory_for(copies, sizeof(copies), NULL, 0);
+    ops = fake_ops(&memory);
+    check_int("fingerprint.changed-link-map-address",
+              kzt_guest_link_map_read_fingerprint(
+                  (uintptr_t)&copies[0], &ops, &changed),
+              0);
+    check_true("fingerprint.mixes-link-map-address",
+               changed.value != initial_value);
+}
+
+static void test_fingerprint_requires_complete_bounded_acyclic_chain(void)
+{
+    test_guest_link_map_t maps[257] = { 0 };
+    fake_read_failure_t failure = {
+        .addr = (uintptr_t)&maps[1] +
+                offsetof(test_guest_link_map_t, l_ld),
+        .size = sizeof(maps[1].l_ld),
+    };
+    fake_reader_memory_t memory = fake_memory_for(maps, sizeof(maps), NULL, 0);
+    kzt_guest_link_map_reader_ops_t ops = fake_ops(&memory);
+    kzt_guest_link_map_fingerprint_t fingerprint = { 0 };
+    size_t i;
+
+    maps[0].l_next = (uintptr_t)&maps[1];
+    maps[1].l_next = (uintptr_t)&maps[0];
+    check_int("fingerprint.cycle",
+              kzt_guest_link_map_read_fingerprint(
+                  (uintptr_t)&maps[0], &ops, &fingerprint),
+              -1);
+    check_uintptr("fingerprint.cycle-clears-head",
+                  fingerprint.namespace_head, 0);
+    check_uintptr("fingerprint.cycle-clears-count",
+                  fingerprint.link_map_count, 0);
+    check_true("fingerprint.cycle-clears-value", fingerprint.value == 0);
+
+    maps[1].l_next = 0;
+    memory.failures = &failure;
+    memory.failure_count = 1;
+    check_int("fingerprint.read-failure",
+              kzt_guest_link_map_read_fingerprint(
+                  (uintptr_t)&maps[0], &ops, &fingerprint),
+              -1);
+    check_uintptr("fingerprint.read-failure-clears-count",
+                  fingerprint.link_map_count, 0);
+
+    memory.failures = NULL;
+    memory.failure_count = 0;
+    for (i = 0; i < 257; ++i) {
+        maps[i].l_addr = 0x100000 + i * 0x1000;
+        maps[i].l_ld = 0x101000 + i * 0x1000;
+        maps[i].l_next = i + 1 < 257 ? (uintptr_t)&maps[i + 1] : 0;
+    }
+    check_int("fingerprint.unterminated-at-limit",
+              kzt_guest_link_map_read_fingerprint(
+                  (uintptr_t)&maps[0], &ops, &fingerprint),
+              -1);
+    check_uintptr("fingerprint.limit-clears-count",
+                  fingerprint.link_map_count, 0);
+
+    maps[255].l_next = 0;
+    check_int("fingerprint.exact-limit",
+              kzt_guest_link_map_read_fingerprint(
+                  (uintptr_t)&maps[0], &ops, &fingerprint),
+              0);
+    check_uintptr("fingerprint.exact-limit-count",
+                  fingerprint.link_map_count, 256);
+}
+
+static void test_fingerprint_revalidation_distinguishes_change_from_unknown(void)
+{
+    test_guest_link_map_t maps[2] = { 0 };
+    fake_read_failure_t failure = {
+        .addr = (uintptr_t)&maps[1] +
+                offsetof(test_guest_link_map_t, l_next),
+        .size = sizeof(maps[1].l_next),
+    };
+    fake_reader_memory_t memory = fake_memory_for(maps, sizeof(maps), NULL, 0);
+    kzt_guest_link_map_reader_ops_t ops = fake_ops(&memory);
+    kzt_guest_link_map_fingerprint_t fingerprint = { 0 };
+
+    maps[0].l_addr = 0x100000;
+    maps[0].l_ld = 0x101000;
+    maps[0].l_next = (uintptr_t)&maps[1];
+    maps[1].l_addr = 0x200000;
+    maps[1].l_ld = 0x201000;
+
+    check_int("revalidate.snapshot",
+              kzt_guest_link_map_read_fingerprint(
+                  (uintptr_t)&maps[0], &ops, &fingerprint),
+              0);
+    check_int("revalidate.unchanged",
+              kzt_guest_link_map_revalidate_fingerprint(
+                  &fingerprint, &ops),
+              1);
+
+    maps[1].l_ld += 0x1000;
+    check_int("revalidate.changed",
+              kzt_guest_link_map_revalidate_fingerprint(
+                  &fingerprint, &ops),
+              0);
+    maps[1].l_ld -= 0x1000;
+
+    memory.failures = &failure;
+    memory.failure_count = 1;
+    check_int("revalidate.unknown",
+              kzt_guest_link_map_revalidate_fingerprint(
+                  &fingerprint, &ops),
+              -1);
+
+    check_int("revalidate.invalid-fingerprint",
+              kzt_guest_link_map_revalidate_fingerprint(
+                  &(kzt_guest_link_map_fingerprint_t) { 0 }, &ops),
+              -1);
+}
+
 static void test_main_namespace_walk_fails_open_on_bad_chain(void)
 {
     test_guest_link_map_t maps[2] = { 0 };
@@ -578,6 +793,10 @@ int main(void)
     test_cached_main_head_uses_identity_not_load_bias();
     test_link_map_identity_rejects_wrong_dynamic_address();
     test_predecessor_is_read_from_public_prefix();
+    test_successor_is_read_from_public_prefix();
+    test_fingerprint_is_stable_and_covers_public_chain_identity();
+    test_fingerprint_requires_complete_bounded_acyclic_chain();
+    test_fingerprint_revalidation_distinguishes_change_from_unknown();
     test_main_namespace_walk_fails_open_on_bad_chain();
     test_main_namespace_walk_is_bounded();
 

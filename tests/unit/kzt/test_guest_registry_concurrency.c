@@ -512,11 +512,157 @@ static void test_concurrent_query_and_dump_return_owned_snapshots(void)
     check_true("registry.destroy.snapshot", registry == NULL);
 }
 
+typedef struct loader_lifecycle_worker {
+    kzt_guest_registry_t *registry;
+    pthread_barrier_t *barrier;
+    kzt_guest_loader_identity_t identity;
+    int publish;
+    int publish_result;
+    kzt_guest_loader_close_result_t close_result;
+} loader_lifecycle_worker_t;
+
+static void *loader_lifecycle_worker_main(void *opaque)
+{
+    loader_lifecycle_worker_t *worker = opaque;
+
+    if (wait_for_barrier(worker->barrier) != 0) {
+        worker->publish_result = -1;
+        worker->close_result = KZT_GUEST_LOADER_CLOSE_STALE;
+        return NULL;
+    }
+    if (worker->publish) {
+        worker->publish_result = kzt_guest_registry_publish_loader_identity(
+            worker->registry, worker->identity.handle,
+            worker->identity.link_map_addr, worker->identity.namespace_id,
+            &worker->identity);
+    } else {
+        worker->close_result = kzt_guest_registry_complete_loader_close(
+            worker->registry, &worker->identity);
+    }
+    return NULL;
+}
+
+static void test_concurrent_close_reopen_has_no_retire_or_aba(void)
+{
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_guest_object_observation_t observation = make_observation(
+        0x760000, 1, "/guest/libclose-reopen.so");
+    kzt_guest_loader_identity_t old_identity = { 0 };
+    kzt_guest_loader_identity_t found = { 0 };
+    kzt_guest_loader_identity_t new_identity = { 0 };
+    loader_lifecycle_worker_t workers[3];
+    pthread_t threads[3];
+    pthread_barrier_t barrier;
+    kzt_guest_object_snapshot_t *snapshot = NULL;
+    int referenced = 0;
+    int unproven = 0;
+    int stale = 0;
+    size_t i;
+
+    check_true("loader-race.registry", registry != NULL);
+    if (!registry) {
+        return;
+    }
+    check_int("loader-race.observe-old",
+              kzt_guest_registry_observe(registry, &observation),
+              KZT_GUEST_REGISTRY_ADDED);
+    check_int("loader-race.publish-first",
+              kzt_guest_registry_publish_loader_identity(
+                  registry, 0x930000, observation.link_map_addr, 0,
+                  &old_identity),
+              0);
+    check_int("loader-race.publish-second",
+              kzt_guest_registry_publish_loader_identity(
+                  registry, 0x930000, observation.link_map_addr, 0,
+                  &old_identity),
+              0);
+    check_int("loader-race.barrier-init",
+              pthread_barrier_init(&barrier, NULL, 3), 0);
+    for (i = 0; i < 3; ++i) {
+        workers[i] = (loader_lifecycle_worker_t) {
+            .registry = registry,
+            .barrier = &barrier,
+            .identity = old_identity,
+            .publish = i == 2,
+            .publish_result = -1,
+            .close_result = KZT_GUEST_LOADER_CLOSE_STALE,
+        };
+        check_int("loader-race.thread-create",
+                  pthread_create(&threads[i], NULL,
+                                 loader_lifecycle_worker_main, &workers[i]),
+                  0);
+    }
+    for (i = 0; i < 3; ++i) {
+        check_int("loader-race.thread-join",
+                  pthread_join(threads[i], NULL), 0);
+    }
+    check_int("loader-race.barrier-destroy",
+              pthread_barrier_destroy(&barrier), 0);
+    check_int("loader-race.reopen-publish", workers[2].publish_result, 0);
+    for (i = 0; i < 2; ++i) {
+        if (workers[i].close_result == KZT_GUEST_LOADER_CLOSE_REFERENCED) {
+            ++referenced;
+        } else if (workers[i].close_result ==
+                   KZT_GUEST_LOADER_CLOSE_UNLOAD_UNPROVEN) {
+            ++unproven;
+        } else if (workers[i].close_result ==
+                   KZT_GUEST_LOADER_CLOSE_STALE) {
+            ++stale;
+        } else {
+            ++failures;
+        }
+    }
+    check_int("loader-race.two-closes-accounted",
+              referenced + unproven + stale, 2);
+    check_int("loader-race.reopen-handle-live",
+              kzt_guest_registry_find_loader_identity(
+                  registry, old_identity.handle, &found),
+              0);
+    check_ulong("loader-race.same-generation-after-reopen",
+                found.generation, old_identity.generation);
+    check_int("loader-race.final-close-unproven",
+              kzt_guest_registry_complete_loader_close(
+                  registry, &found),
+              KZT_GUEST_LOADER_CLOSE_UNLOAD_UNPROVEN);
+    check_int("loader-race.exact-unload-old",
+              kzt_guest_registry_retire_loader_identity(
+                  registry, &old_identity),
+              0);
+    observation.load_bias.value += 0x200000;
+    observation.dynamic_addr.value += 0x200000;
+    observation.path.value = "/guest/libclose-reopen-new.so";
+    check_int("loader-race.observe-new",
+              kzt_guest_registry_observe(registry, &observation),
+              KZT_GUEST_REGISTRY_ADDED);
+    check_int("loader-race.publish-new",
+              kzt_guest_registry_publish_loader_identity(
+                  registry, old_identity.handle, observation.link_map_addr, 0,
+                  &new_identity),
+              0);
+    check_true("loader-race.generation-advanced",
+               new_identity.generation != old_identity.generation);
+    check_true("loader-race.old-generation-cannot-retire-new",
+               kzt_guest_registry_retire_loader_identity(
+                   registry, &old_identity) != 0);
+    check_int("loader-race.new-object-live",
+              kzt_guest_registry_find_by_link_map(
+                  registry, observation.link_map_addr, &snapshot),
+              0);
+    check_true("loader-race.new-snapshot", snapshot != NULL);
+    if (snapshot) {
+        check_ulong("loader-race.new-generation-live", snapshot->generation,
+                    new_identity.generation);
+        kzt_guest_object_snapshot_free(snapshot);
+    }
+    kzt_guest_registry_destroy(&registry);
+}
+
 int main(void)
 {
     test_concurrent_same_link_map_converges_to_one_generation();
     test_concurrent_different_link_maps_create_distinct_objects();
     test_concurrent_query_and_dump_return_owned_snapshots();
+    test_concurrent_close_reopen_has_no_retire_or_aba();
 
     if (failures) {
         fprintf(stderr, "kzt-guest-registry-concurrency: %d failure(s)\n",

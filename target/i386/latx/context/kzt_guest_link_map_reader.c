@@ -200,6 +200,114 @@ int kzt_guest_link_map_read_predecessor(
         ops, predecessor);
 }
 
+int kzt_guest_link_map_read_successor(
+    uintptr_t link_map_addr,
+    const kzt_guest_link_map_reader_ops_t *ops,
+    uintptr_t *successor)
+{
+    if (!successor) {
+        return -1;
+    }
+    *successor = 0;
+    if (!link_map_addr || !ops || !ops->read_memory) {
+        return -1;
+    }
+    return kzt_guest_read_uintptr_field(
+        link_map_addr,
+        offsetof(kzt_guest_link_map_public_prefix_t, l_next),
+        sizeof(((kzt_guest_link_map_public_prefix_t *)0)->l_next),
+        ops, successor);
+}
+
+static uint64_t kzt_guest_link_map_fingerprint_mix(uint64_t value,
+                                                   uint64_t component)
+{
+    size_t i;
+
+    for (i = 0; i < sizeof(component); ++i) {
+        value ^= component & UINT64_C(0xff);
+        value *= UINT64_C(1099511628211);
+        component >>= 8;
+    }
+    return value;
+}
+
+int kzt_guest_link_map_read_fingerprint(
+    uintptr_t namespace_head,
+    const kzt_guest_link_map_reader_ops_t *ops,
+    kzt_guest_link_map_fingerprint_t *fingerprint)
+{
+    uintptr_t visited[KZT_GUEST_LINK_MAP_WALK_LIMIT];
+    uintptr_t current = namespace_head;
+    uint64_t value = UINT64_C(14695981039346656037);
+    size_t count = 0;
+
+    if (!fingerprint) {
+        return -1;
+    }
+    memset(fingerprint, 0, sizeof(*fingerprint));
+    if (!current || !ops || !ops->read_memory) {
+        return -1;
+    }
+
+    while (count < KZT_GUEST_LINK_MAP_WALK_LIMIT) {
+        kzt_guest_link_map_identity_t identity;
+        uintptr_t successor = 0;
+        size_t i;
+
+        for (i = 0; i < count; ++i) {
+            if (visited[i] == current) {
+                return -1;
+            }
+        }
+        visited[count] = current;
+
+        if (kzt_guest_link_map_read_identity(current, ops, &identity) != 0 ||
+            kzt_guest_link_map_read_successor(current, ops, &successor) != 0) {
+            return -1;
+        }
+
+        value = kzt_guest_link_map_fingerprint_mix(value, count);
+        value = kzt_guest_link_map_fingerprint_mix(value, current);
+        value = kzt_guest_link_map_fingerprint_mix(value,
+                                                   identity.load_bias);
+        value = kzt_guest_link_map_fingerprint_mix(value,
+                                                   identity.dynamic_addr);
+        ++count;
+
+        if (!successor) {
+            value = kzt_guest_link_map_fingerprint_mix(value, count);
+            fingerprint->namespace_head = namespace_head;
+            fingerprint->link_map_count = count;
+            fingerprint->value = value;
+            return 0;
+        }
+        current = successor;
+    }
+
+    return -1;
+}
+
+int kzt_guest_link_map_revalidate_fingerprint(
+    const kzt_guest_link_map_fingerprint_t *expected,
+    const kzt_guest_link_map_reader_ops_t *ops)
+{
+    kzt_guest_link_map_fingerprint_t current;
+
+    if (!expected || !expected->namespace_head ||
+        expected->link_map_count == 0 ||
+        expected->link_map_count > KZT_GUEST_LINK_MAP_WALK_LIMIT) {
+        return -1;
+    }
+    if (kzt_guest_link_map_read_fingerprint(
+            expected->namespace_head, ops, &current) != 0) {
+        return -1;
+    }
+    return current.namespace_head == expected->namespace_head &&
+           current.link_map_count == expected->link_map_count &&
+           current.value == expected->value;
+}
+
 int kzt_guest_link_map_classify_namespace(
     uintptr_t link_map_addr,
     const kzt_guest_link_map_identity_t *main_identity,
@@ -284,7 +392,6 @@ int kzt_guest_link_map_read_name_snapshot(
     }
 
     if (max_len == 0) {
-        name->status = KZT_GUEST_FIELD_TRUNCATED;
         return 0;
     }
 
@@ -295,7 +402,8 @@ int kzt_guest_link_map_read_name_snapshot(
     }
 
     for (i = 0; i < max_len; ++i) {
-        if (kzt_guest_read_memory(guest_name_addr + i, &snapshot[i], 1, ops) != 0) {
+        if (kzt_guest_read_memory(guest_name_addr + i, &snapshot[i], 1,
+                                  ops) != 0) {
             kzt_link_map_reader_free(snapshot);
             name->status = KZT_GUEST_FIELD_READ_ERROR;
             return 0;
@@ -308,9 +416,7 @@ int kzt_guest_link_map_read_name_snapshot(
         }
     }
 
-    snapshot[max_len] = '\0';
-    name->value = snapshot;
-    name->status = KZT_GUEST_FIELD_TRUNCATED;
+    kzt_link_map_reader_free(snapshot);
     return 0;
 }
 

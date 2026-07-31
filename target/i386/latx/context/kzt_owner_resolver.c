@@ -20,25 +20,10 @@ void kzt_owner_resolver_init(kzt_owner_resolution_t *resolution)
     resolution->owner_match = KZT_PATCH_OWNER_UNKNOWN;
 }
 
-static int kzt_owner_field_ok(kzt_guest_field_status_t status)
-{
-    return status == KZT_GUEST_FIELD_OK;
-}
-
 static int kzt_owner_string_has_value(kzt_guest_field_status_t status)
 {
     return status == KZT_GUEST_FIELD_OK ||
            status == KZT_GUEST_FIELD_TRUNCATED;
-}
-
-static const char *kzt_owner_snapshot_string(
-    const kzt_guest_string_field_t *field)
-{
-    if (!field || !kzt_owner_string_has_value(field->status)) {
-        return NULL;
-    }
-
-    return field->value;
 }
 
 static void kzt_owner_copy_text(char *dst, size_t dst_size,
@@ -56,70 +41,43 @@ static void kzt_owner_copy_text(char *dst, size_t dst_size,
     snprintf(dst, dst_size, "%s", src);
 }
 
-static int kzt_owner_snapshot_has_valid_range(
-    const kzt_guest_object_snapshot_t *snapshot)
-{
-    if (!snapshot) {
-        return 0;
-    }
-    if (!kzt_owner_field_ok(snapshot->map_start.status) ||
-        !kzt_owner_field_ok(snapshot->map_end.status)) {
-        return 0;
-    }
-
-    return snapshot->map_start.value < snapshot->map_end.value;
-}
-
-static int kzt_owner_snapshot_contains(
-    const kzt_guest_object_snapshot_t *snapshot,
-    uintptr_t address)
-{
-    if (!kzt_owner_snapshot_has_valid_range(snapshot)) {
-        return 0;
-    }
-
-    return address >= snapshot->map_start.value &&
-           address < snapshot->map_end.value;
-}
-
-static void kzt_owner_ref_from_snapshot(
-    const kzt_guest_object_snapshot_t *snapshot,
+static void kzt_owner_ref_from_match(
+    const kzt_guest_registry_address_match_t *match,
     kzt_owner_resolver_text_t *text,
     kzt_patch_object_ref_t *ref)
 {
-    const char *soname;
-    const char *path;
+    const char *soname = NULL;
+    const char *path = NULL;
 
     memset(ref, 0, sizeof(*ref));
-    if (!snapshot || !text) {
+    if (!match || !text) {
         return;
     }
 
-    soname = kzt_owner_snapshot_string(&snapshot->soname);
-    path = kzt_owner_snapshot_string(&snapshot->path);
+    if (kzt_owner_string_has_value(match->soname_status)) {
+        soname = match->soname;
+    }
+    if (kzt_owner_string_has_value(match->path_status)) {
+        path = match->path;
+    }
     kzt_owner_copy_text(text->soname, sizeof(text->soname), soname);
     kzt_owner_copy_text(text->path, sizeof(text->path), path);
 
     ref->known = 1;
-    ref->link_map_addr = snapshot->link_map_addr;
-    ref->map_start = snapshot->map_start.value;
-    ref->map_end = snapshot->map_end.value;
-    ref->generation = snapshot->generation;
+    ref->link_map_addr = match->link_map_addr;
+    ref->map_start = match->map_start;
+    ref->map_end = match->map_end;
+    ref->generation = match->generation;
     ref->soname = text->soname[0] ? text->soname : NULL;
     ref->path = text->path[0] ? text->path : NULL;
 }
 
 static kzt_owner_lookup_status_t kzt_owner_find_by_address(
-    const kzt_guest_registry_dump_t *dump,
-    uintptr_t address,
+    const kzt_guest_registry_address_match_t *match,
     kzt_owner_resolver_text_t *text,
     kzt_patch_object_ref_t *ref,
     size_t *match_count)
 {
-    const kzt_guest_object_snapshot_t *match = NULL;
-    size_t i;
-    size_t count = 0;
-
     memset(ref, 0, sizeof(*ref));
     if (text) {
         memset(text, 0, sizeof(*text));
@@ -128,36 +86,21 @@ static kzt_owner_lookup_status_t kzt_owner_find_by_address(
         *match_count = 0;
     }
 
-    if (!dump || !ref || address == 0) {
+    if (!match || !ref) {
         return KZT_OWNER_LOOKUP_NOT_FOUND;
-    }
-
-    for (i = 0; i < dump->count; ++i) {
-        if (dump->objects[i].state == KZT_GUEST_OBJECT_UNLOADING ||
-            dump->objects[i].state == KZT_GUEST_OBJECT_DEAD) {
-            continue;
-        }
-        if (!kzt_owner_snapshot_contains(&dump->objects[i], address)) {
-            continue;
-        }
-
-        ++count;
-        if (!match) {
-            match = &dump->objects[i];
-        }
     }
 
     if (match_count) {
-        *match_count = count;
+        *match_count = match->match_count;
     }
-    if (count == 0) {
+    if (match->match_count == 0) {
         return KZT_OWNER_LOOKUP_NOT_FOUND;
     }
-    if (count > 1) {
+    if (match->match_count > 1) {
         return KZT_OWNER_LOOKUP_AMBIGUOUS;
     }
 
-    kzt_owner_ref_from_snapshot(match, text, ref);
+    kzt_owner_ref_from_match(match, text, ref);
     return KZT_OWNER_LOOKUP_RESOLVED;
 }
 
@@ -217,7 +160,7 @@ int kzt_owner_resolver_resolve_current(
     uintptr_t expected_address,
     kzt_owner_resolution_t *resolution)
 {
-    kzt_guest_registry_dump_t dump = { 0 };
+    kzt_guest_registry_address_pair_t pair;
     kzt_owner_lookup_status_t current_status;
     kzt_owner_lookup_status_t expected_status;
 
@@ -240,16 +183,17 @@ int kzt_owner_resolver_resolve_current(
         resolution->status = KZT_OWNER_RESOLVER_EXPECTED_ADDRESS_MISSING;
         return 0;
     }
-    if (kzt_guest_registry_dump_snapshot(registry, &dump) != 0) {
+    if (kzt_guest_registry_resolve_address_pair(
+            registry, current_address, expected_address, &pair) != 0) {
         resolution->status = KZT_OWNER_RESOLVER_REGISTRY_UNAVAILABLE;
         return 0;
     }
 
     current_status = kzt_owner_find_by_address(
-        &dump, current_address, &resolution->current_text,
+        &pair.current, &resolution->current_text,
         &resolution->current_owner, &resolution->current_match_count);
     expected_status = kzt_owner_find_by_address(
-        &dump, expected_address, &resolution->expected_text,
+        &pair.expected, &resolution->expected_text,
         &resolution->expected_owner, &resolution->expected_match_count);
 
     if (current_status != KZT_OWNER_LOOKUP_RESOLVED) {
@@ -270,7 +214,6 @@ int kzt_owner_resolver_resolve_current(
     }
 
 out:
-    kzt_guest_registry_dump_free(&dump);
     return 0;
 }
 

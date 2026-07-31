@@ -123,25 +123,13 @@ int kzt_guest_registry_context_has_main_namespace_evidence(
     uintptr_t load_bias,
     uintptr_t dynamic_addr)
 {
-    kzt_guest_object_snapshot_t *snapshot = NULL;
     uintptr_t main_head = 0;
-    int matches = 0;
 
     if (!registry || !link_map_addr || !dynamic_addr ||
         kzt_guest_registry_context_get_main_namespace_head(
             context, &main_head) != 0 || !main_head) {
         return 0;
     }
-    if (kzt_guest_registry_find_by_link_map(
-            registry, link_map_addr, &snapshot) == 0 && snapshot &&
-        snapshot->load_bias.status == KZT_GUEST_FIELD_OK &&
-        snapshot->load_bias.value == load_bias &&
-        snapshot->dynamic_addr.status == KZT_GUEST_FIELD_OK &&
-        snapshot->dynamic_addr.value == dynamic_addr &&
-        snapshot->namespace_id.status == KZT_GUEST_FIELD_OK &&
-        snapshot->namespace_id.value == 0) {
-        matches = 1;
-    }
-    kzt_guest_object_snapshot_free(snapshot);
-    return matches;
+    return kzt_guest_registry_matches_live_identity(
+               registry, link_map_addr, load_bias, dynamic_addr, 0) == 1;
 }

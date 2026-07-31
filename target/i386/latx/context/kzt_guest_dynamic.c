@@ -65,7 +65,8 @@ static void kzt_guest_dynamic_record_unknown_tag(
 
 static int kzt_guest_dynamic_record_entry(kzt_guest_dynamic_view_t *view,
                                           const Elf64_Dyn *entry,
-                                          size_t index)
+                                          size_t index,
+                                          uintptr_t load_bias)
 {
     uint64_t value = entry->d_un.d_val;
     uint64_t ptr = entry->d_un.d_ptr;
@@ -102,7 +103,11 @@ static int kzt_guest_dynamic_record_entry(kzt_guest_dynamic_view_t *view,
                                     KZT_GUEST_DYNAMIC_RUNTIME_ADDRESS);
         break;
     case DT_VERNEED:
-        kzt_guest_dynamic_field_set(&view->verneed, ptr,
+        /* glibc retains these two version-table pointers relative to l_addr. */
+        if (ptr > UINTPTR_MAX - load_bias) {
+            return -2;
+        }
+        kzt_guest_dynamic_field_set(&view->verneed, load_bias + ptr,
                                     KZT_GUEST_DYNAMIC_RUNTIME_ADDRESS);
         break;
     case DT_VERNEEDNUM:
@@ -110,7 +115,10 @@ static int kzt_guest_dynamic_record_entry(kzt_guest_dynamic_view_t *view,
                                     KZT_GUEST_DYNAMIC_SCALAR);
         break;
     case DT_VERDEF:
-        kzt_guest_dynamic_field_set(&view->verdef, ptr,
+        if (ptr > UINTPTR_MAX - load_bias) {
+            return -2;
+        }
+        kzt_guest_dynamic_field_set(&view->verdef, load_bias + ptr,
                                     KZT_GUEST_DYNAMIC_RUNTIME_ADDRESS);
         break;
     case DT_VERDEFNUM:
@@ -227,13 +235,20 @@ int kzt_guest_dynamic_parse(
             return 0;
         }
 
-        if (kzt_guest_dynamic_record_entry(&view, &entry, i) != 0) {
-            view.status = KZT_GUEST_DYNAMIC_ERROR;
-            view.entry_count = i;
-            result->status = KZT_GUEST_DYNAMIC_ERROR;
-            result->error = KZT_GUEST_DYNAMIC_ERROR_TOO_MANY_NEEDED;
-            kzt_guest_dynamic_publish_view(result, &view);
-            return 0;
+        {
+            int record_status = kzt_guest_dynamic_record_entry(
+                &view, &entry, i, load_bias);
+
+            if (record_status != 0) {
+                view.status = KZT_GUEST_DYNAMIC_ERROR;
+                view.entry_count = i;
+                result->status = KZT_GUEST_DYNAMIC_ERROR;
+                result->error = record_status == -2 ?
+                    KZT_GUEST_DYNAMIC_ERROR_ADDRESS_OVERFLOW :
+                    KZT_GUEST_DYNAMIC_ERROR_TOO_MANY_NEEDED;
+                kzt_guest_dynamic_publish_view(result, &view);
+                return 0;
+            }
         }
     }
 

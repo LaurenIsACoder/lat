@@ -351,10 +351,10 @@ static void test_partial_observation_and_invalid_identity(void)
               KZT_GUEST_FIELD_READ_ERROR);
     check_int("snapshot.dynamic_addr.unknown", snapshot->dynamic_addr.status,
               KZT_GUEST_FIELD_UNKNOWN);
-    check_int("snapshot.path.truncated", snapshot->path.status,
-              KZT_GUEST_FIELD_TRUNCATED);
-    check_string("snapshot.path.truncated-value", snapshot->path.value,
-                 "/guest/path-truncated");
+    check_int("snapshot.path.over-limit-unknown", snapshot->path.status,
+              KZT_GUEST_FIELD_UNKNOWN);
+    check_string("snapshot.path.over-limit-no-prefix", snapshot->path.value,
+                 NULL);
     kzt_guest_object_snapshot_free(snapshot);
 
     kzt_guest_registry_destroy(&registry);
@@ -542,6 +542,12 @@ static void test_diagnostics_are_opt_in_and_throttled(void)
     check_true("dump.text-called", sink.calls > 0);
     check_contains("dump.text-summary", sink.text,
                    "enabled=1 throttle_limit=2");
+    check_contains("dump.text-loader-lifecycle", sink.text,
+                   "loader_identity_publications=0 "
+                   "loader_close_referenced=0 "
+                   "loader_close_unload_unproven=0 "
+                   "loader_close_retired=0 loader_close_stale=0 "
+                   "loader_close_identity_missing=0");
     check_contains("dump.text-event", sink.text,
                    "result=unchanged observed=3 emitted=2 suppressed=1");
     check_contains("dump.text-object", sink.text,
@@ -1182,6 +1188,7 @@ static void test_lazy_resolver_publish_find_lifecycle(void)
         .guest_resolver = 0x7300,
     };
     kzt_guest_lazy_resolver_t found;
+    kzt_guest_registry_lazy_source_t source;
     unsigned long generation;
 
     observation.namespace_id = (kzt_guest_scalar_field_t) {
@@ -1203,6 +1210,16 @@ static void test_lazy_resolver_publish_find_lifecycle(void)
     check_uintptr("lazy.find-link-map", found.guest_link_map,
                   resolver.guest_link_map);
     check_uintptr("lazy.find-resolver", found.guest_resolver,
+                  resolver.guest_resolver);
+    memset(&source, 0xa5, sizeof(source));
+    kzt_guest_registry_test_set_alloc_failure_after(0);
+    check_int("lazy.find-source-no-allocation",
+              kzt_guest_registry_find_lazy_source(
+                  registry, observation.link_map_addr, &source), 0);
+    kzt_guest_registry_test_set_alloc_failure_after(-1);
+    check_ulong("lazy.find-source-generation", source.generation, generation);
+    check_uintptr("lazy.find-source-namespace", source.namespace_id, 0);
+    check_uintptr("lazy.find-source-resolver", source.guest_resolver,
                   resolver.guest_resolver);
 
     resolver.guest_link_map = 0x7201;
@@ -1229,6 +1246,494 @@ static void test_lazy_resolver_publish_find_lifecycle(void)
                   kzt_guest_registry_find_lazy_resolver(
                       registry, observation.link_map_addr, generation, 0,
                       &found), 0);
+    memset(&source, 0xa5, sizeof(source));
+    check_not_int("lazy.retired-source-invalid",
+                  kzt_guest_registry_find_lazy_source(
+                      registry, observation.link_map_addr, &source), 0);
+    check_ulong("lazy.retired-source-zero-generation", source.generation, 0);
+    check_uintptr("lazy.retired-source-zero-namespace", source.namespace_id, 0);
+    check_uintptr("lazy.retired-source-zero-resolver", source.guest_resolver, 0);
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_map_range_supplement_is_exact_and_allocation_free(void)
+{
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_guest_object_observation_t observation = make_observation(0x7300);
+    kzt_guest_object_snapshot_t *snapshot;
+    kzt_guest_registry_observation_diagnostic_t diagnostic = { 0 };
+    unsigned long generation;
+
+    check_true("range.registry", registry != NULL);
+    if (!registry) {
+        return;
+    }
+    check_int("range.observe",
+              kzt_guest_registry_observe(registry, &observation),
+              KZT_GUEST_REGISTRY_ADDED);
+    snapshot = find_snapshot(registry, observation.link_map_addr);
+    generation = snapshot->generation;
+    kzt_guest_object_snapshot_free(snapshot);
+
+    kzt_guest_registry_test_set_alloc_failure_after(0);
+    check_int("range.supplement-no-allocation",
+              kzt_guest_registry_supplement_map_range(
+                  registry, observation.link_map_addr, generation,
+                  0x100000, 0x120000, &diagnostic),
+              KZT_GUEST_REGISTRY_UPDATED);
+    kzt_guest_registry_test_set_alloc_failure_after(-1);
+    check_ulong("range.diagnostic-generation", diagnostic.generation,
+                generation);
+
+    snapshot = find_snapshot(registry, observation.link_map_addr);
+    check_ulong("range.generation-stable", snapshot->generation, generation);
+    check_int("range.start-status", snapshot->map_start.status,
+              KZT_GUEST_FIELD_OK);
+    check_uintptr("range.start", snapshot->map_start.value, 0x100000);
+    check_int("range.end-status", snapshot->map_end.status,
+              KZT_GUEST_FIELD_OK);
+    check_uintptr("range.end", snapshot->map_end.value, 0x120000);
+    kzt_guest_object_snapshot_free(snapshot);
+
+    check_int("range.repeat",
+              kzt_guest_registry_supplement_map_range(
+                  registry, observation.link_map_addr, generation,
+                  0x100000, 0x120000, NULL),
+              KZT_GUEST_REGISTRY_UNCHANGED);
+    check_int("range.conflict",
+              kzt_guest_registry_supplement_map_range(
+                  registry, observation.link_map_addr, generation,
+                  0x101000, 0x120000, NULL),
+              KZT_GUEST_REGISTRY_CONFLICT);
+    check_int("range.stale-generation",
+              kzt_guest_registry_supplement_map_range(
+                  registry, observation.link_map_addr, generation + 1,
+                  0x100000, 0x120000, NULL),
+              KZT_GUEST_REGISTRY_CONFLICT);
+    check_int("range.retire", kzt_guest_registry_retire(
+                  registry, observation.link_map_addr, generation), 0);
+    check_int("range.dead-generation",
+              kzt_guest_registry_supplement_map_range(
+                  registry, observation.link_map_addr, generation,
+                  0x100000, 0x120000, NULL),
+              KZT_GUEST_REGISTRY_CONFLICT);
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_loader_handle_binds_exact_link_map_generation_and_namespace(void)
+{
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_guest_object_observation_t observation = make_observation(0x7400);
+    kzt_guest_loader_identity_t published = { 0 };
+    kzt_guest_loader_identity_t found = { 0 };
+    kzt_guest_object_snapshot_t *snapshot;
+
+    check_true("loader-identity.registry", registry != NULL);
+    if (!registry) {
+        return;
+    }
+    check_int("loader-identity.observe",
+              kzt_guest_registry_observe(registry, &observation),
+              KZT_GUEST_REGISTRY_ADDED);
+    check_int("loader-identity.publish",
+              kzt_guest_registry_publish_loader_identity(
+                  registry, 0x9100, observation.link_map_addr, 7,
+                  &published),
+              0);
+    check_uintptr("loader-identity.published-handle", published.handle,
+                  0x9100);
+    check_uintptr("loader-identity.published-link-map",
+                  published.link_map_addr, observation.link_map_addr);
+    check_ulong("loader-identity.published-generation",
+                published.generation, 1);
+    check_uintptr("loader-identity.published-namespace",
+                  published.namespace_id, 7);
+    check_true("loader-identity.handle-generation",
+               published.handle_generation != 0);
+    check_int("loader-identity.mark-resident",
+              kzt_guest_registry_mark_loader_resident(
+                  registry, &published),
+              0);
+
+    check_int("loader-identity.find",
+              kzt_guest_registry_find_loader_identity(
+                  registry, 0x9100, &found),
+              0);
+    check_uintptr("loader-identity.found-link-map", found.link_map_addr,
+                  observation.link_map_addr);
+    check_ulong("loader-identity.found-generation", found.generation, 1);
+    check_uintptr("loader-identity.found-namespace", found.namespace_id, 7);
+
+    check_int("loader-identity.reuse-live-handle",
+              kzt_guest_registry_reuse_loader_identity(
+                  registry, 0x9100, &published),
+              0);
+    check_int("loader-identity.first-close-keeps-reference",
+              kzt_guest_registry_complete_loader_close(
+                  registry, &published),
+              KZT_GUEST_LOADER_CLOSE_REFERENCED);
+    check_int("loader-identity.still-findable",
+              kzt_guest_registry_find_loader_identity(
+                  registry, 0x9100, &found),
+              0);
+    check_int("loader-identity.last-close-unproven",
+              kzt_guest_registry_complete_loader_close(
+                  registry, &published),
+              KZT_GUEST_LOADER_CLOSE_UNLOAD_UNPROVEN);
+    check_not_int("loader-identity.closed-handle-not-findable",
+                  kzt_guest_registry_find_loader_identity(
+                      registry, 0x9100, &found),
+                  0);
+    check_int("loader-identity.exact-resident-handle-rebound",
+              kzt_guest_registry_reuse_loader_identity(
+                  registry, 0x9100, &found),
+              0);
+    check_true("loader-identity.rebind-new-handle-generation",
+               found.handle_generation != published.handle_generation);
+    check_int("loader-identity.old-close-cannot-touch-rebind",
+              kzt_guest_registry_complete_loader_close(
+                  registry, &published),
+              KZT_GUEST_LOADER_CLOSE_STALE);
+    check_int("loader-identity.rebind-remains-findable",
+              kzt_guest_registry_find_loader_identity(
+                  registry, 0x9100, &found),
+              0);
+    check_int("loader-identity.rebind-close-unproven",
+              kzt_guest_registry_complete_loader_close(registry, &found),
+              KZT_GUEST_LOADER_CLOSE_UNLOAD_UNPROVEN);
+
+    snapshot = find_snapshot(registry, observation.link_map_addr);
+    check_int("loader-identity.namespace-status",
+              snapshot->namespace_id.status, KZT_GUEST_FIELD_OK);
+    check_uintptr("loader-identity.namespace-value",
+                  snapshot->namespace_id.value, 7);
+    kzt_guest_object_snapshot_free(snapshot);
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_unproven_unload_is_not_reused_without_resident_proof(void)
+{
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_guest_object_observation_t observation = make_observation(0x7440);
+    kzt_guest_loader_identity_t identity = { 0 };
+    kzt_guest_loader_identity_t reused = { 0 };
+
+    check_true("loader-unproven.registry", registry != NULL);
+    if (!registry) {
+        return;
+    }
+    check_int("loader-unproven.observe",
+              kzt_guest_registry_observe(registry, &observation),
+              KZT_GUEST_REGISTRY_ADDED);
+    check_int("loader-unproven.publish",
+              kzt_guest_registry_publish_loader_identity(
+                  registry, 0x9140, observation.link_map_addr, 7,
+                  &identity),
+              0);
+    check_int("loader-unproven.close",
+              kzt_guest_registry_complete_loader_close(
+                  registry, &identity),
+              KZT_GUEST_LOADER_CLOSE_UNLOAD_UNPROVEN);
+    check_not_int("loader-unproven.reuse-rejected",
+                  kzt_guest_registry_reuse_loader_identity(
+                      registry, 0x9140, &reused),
+                  0);
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_loader_symbol_source_is_exact_main_generation(void)
+{
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_guest_object_observation_t main_object = make_observation(0x7480);
+    kzt_guest_object_observation_t other_object = make_observation(0x7490);
+    kzt_guest_loader_identity_t published = { 0 };
+    kzt_guest_loader_identity_t source = { 0 };
+    kzt_guest_dynamic_view_t view = {
+        .dynamic_addr = 0x101000,
+        .load_bias = 0x100000,
+        .status = KZT_GUEST_DYNAMIC_COMPLETE,
+        .has_null = 1,
+    };
+    kzt_guest_dynamic_view_t found_view = { 0 };
+    kzt_guest_field_status_t dynamic_status = KZT_GUEST_FIELD_UNKNOWN;
+    unsigned long dynamic_revision = 0;
+    kzt_guest_registry_source_lease_t lease = { 0 };
+
+    other_object.load_bias.value += 0x200000;
+    other_object.dynamic_addr.value += 0x200000;
+    check_true("symbol-source.registry", registry != NULL);
+    if (!registry) return;
+    check_int("symbol-source.observe-main",
+              kzt_guest_registry_observe(registry, &main_object),
+              KZT_GUEST_REGISTRY_ADDED);
+    check_int("symbol-source.publish-main",
+              kzt_guest_registry_publish_loader_identity(
+                  registry, 0x9180, main_object.link_map_addr, 0, &published),
+              0);
+    check_int("symbol-source.dynamic-main",
+              kzt_guest_registry_commit_dynamic_view(
+                  registry, main_object.link_map_addr, published.generation,
+                  &view),
+              KZT_GUEST_REGISTRY_UPDATED);
+    check_int("symbol-source.acquire-main",
+              kzt_guest_registry_loader_symbol_source_acquire(
+                  registry, 0x9180, &source, &found_view, &dynamic_status,
+                  &dynamic_revision, &lease),
+              0);
+    check_uintptr("symbol-source.link-map", source.link_map_addr,
+                  main_object.link_map_addr);
+    check_ulong("symbol-source.generation", source.generation,
+                published.generation);
+    check_uintptr("symbol-source.namespace", source.namespace_id, 0);
+    check_int("symbol-source.dynamic-status", dynamic_status,
+              KZT_GUEST_FIELD_OK);
+    check_uintptr("symbol-source.dynamic-address", found_view.dynamic_addr,
+                  view.dynamic_addr);
+    check_ulong("symbol-source.dynamic-revision", dynamic_revision, 1);
+    check_true("symbol-source.lease", lease.active);
+    kzt_guest_registry_source_lease_release(&lease);
+
+    view.strsz.present = 1;
+    view.strsz.value = 0x80;
+    view.strsz.address_semantics = KZT_GUEST_DYNAMIC_SCALAR;
+    check_int("symbol-source.dynamic-main-update",
+              kzt_guest_registry_commit_dynamic_view(
+                  registry, main_object.link_map_addr, source.generation,
+                  &view),
+              KZT_GUEST_REGISTRY_UPDATED);
+    check_int("symbol-source.acquire-main-update",
+              kzt_guest_registry_loader_symbol_source_acquire(
+                  registry, 0x9180, &source, &found_view, &dynamic_status,
+                  &dynamic_revision, &lease),
+              0);
+    check_ulong("symbol-source.dynamic-revision-update",
+                dynamic_revision, 2);
+    kzt_guest_registry_source_lease_release(&lease);
+
+    check_int("symbol-source.observe-other",
+              kzt_guest_registry_observe(registry, &other_object),
+              KZT_GUEST_REGISTRY_ADDED);
+    check_int("symbol-source.publish-other",
+              kzt_guest_registry_publish_loader_identity(
+                  registry, 0x9190, other_object.link_map_addr, 7, &published),
+              0);
+    view.dynamic_addr = other_object.dynamic_addr.value;
+    view.load_bias = other_object.load_bias.value;
+    check_int("symbol-source.dynamic-other",
+              kzt_guest_registry_commit_dynamic_view(
+                  registry, other_object.link_map_addr, published.generation,
+                  &view),
+              KZT_GUEST_REGISTRY_UPDATED);
+    check_not_int("symbol-source.non-main-rejected",
+                  kzt_guest_registry_loader_symbol_source_acquire(
+                      registry, 0x9190, &source, &found_view, &dynamic_status,
+                      &dynamic_revision, &lease),
+                  0);
+    check_true("symbol-source.non-main-no-lease", !lease.active);
+
+    check_int("symbol-source.retire-main",
+              kzt_guest_registry_retire(
+                  registry, main_object.link_map_addr, 1),
+              0);
+    check_not_int("symbol-source.retired-rejected",
+                  kzt_guest_registry_loader_symbol_source_acquire(
+                      registry, 0x9180, &source, &found_view, &dynamic_status,
+                      &dynamic_revision, &lease),
+                  0);
+    check_true("symbol-source.retired-no-lease", !lease.active);
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_loader_unload_retires_only_exact_namespace_and_generation(void)
+{
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_guest_object_observation_t observation = make_observation(0x7500);
+    kzt_guest_loader_identity_t old_identity = { 0 };
+    kzt_guest_loader_identity_t new_identity = { 0 };
+    kzt_guest_loader_identity_t wrong_identity;
+    kzt_guest_object_snapshot_t *snapshot;
+
+    check_true("loader-retire.registry", registry != NULL);
+    if (!registry) {
+        return;
+    }
+    check_int("loader-retire.observe-old",
+              kzt_guest_registry_observe(registry, &observation),
+              KZT_GUEST_REGISTRY_ADDED);
+    check_int("loader-retire.publish-old",
+              kzt_guest_registry_publish_loader_identity(
+                  registry, 0x9200, observation.link_map_addr, 7,
+                  &old_identity),
+              0);
+
+    wrong_identity = old_identity;
+    wrong_identity.namespace_id = 8;
+    check_not_int("loader-retire.reject-wrong-namespace",
+                  kzt_guest_registry_retire_loader_identity(
+                      registry, &wrong_identity),
+                  0);
+    snapshot = find_snapshot(registry, observation.link_map_addr);
+    check_ulong("loader-retire.wrong-namespace-generation-live",
+                snapshot->generation, old_identity.generation);
+    kzt_guest_object_snapshot_free(snapshot);
+
+    check_int("loader-retire.exact-old",
+              kzt_guest_registry_retire_loader_identity(
+                  registry, &old_identity),
+              0);
+    observation.load_bias.value += 0x100000;
+    observation.dynamic_addr.value += 0x100000;
+    observation.path.value = "/guest/libreopened.so";
+    observation.namespace_id.status = KZT_GUEST_FIELD_UNKNOWN;
+    check_int("loader-retire.observe-reopen",
+              kzt_guest_registry_observe(registry, &observation),
+              KZT_GUEST_REGISTRY_ADDED);
+    check_int("loader-retire.publish-reopen",
+              kzt_guest_registry_publish_loader_identity(
+                  registry, 0x9200, observation.link_map_addr, 9,
+                  &new_identity),
+              0);
+    check_true("loader-retire.new-generation",
+               new_identity.generation != old_identity.generation);
+    check_not_int("loader-retire.reject-old-generation",
+                  kzt_guest_registry_retire_loader_identity(
+                      registry, &old_identity),
+                  0);
+    snapshot = find_snapshot(registry, observation.link_map_addr);
+    check_ulong("loader-retire.reopen-generation-live",
+                snapshot->generation, new_identity.generation);
+    check_uintptr("loader-retire.reopen-namespace-live",
+                  snapshot->namespace_id.value, 9);
+    kzt_guest_object_snapshot_free(snapshot);
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_loader_unload_prepares_before_unmap_and_can_cancel(void)
+{
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_guest_object_observation_t observation = make_observation(0x7580);
+    kzt_guest_loader_identity_t identity = { 0 };
+    kzt_guest_loader_identity_t found = { 0 };
+    kzt_guest_registry_address_match_t match = { 0 };
+
+    check_true("loader-prepare.registry", registry != NULL);
+    if (!registry) {
+        return;
+    }
+    check_int("loader-prepare.observe",
+              kzt_guest_registry_observe(registry, &observation),
+              KZT_GUEST_REGISTRY_ADDED);
+    check_int("loader-prepare.publish",
+              kzt_guest_registry_publish_loader_identity(
+                  registry, 0x9280, observation.link_map_addr, 7,
+                  &identity),
+              0);
+    check_int("loader-prepare.begin",
+              kzt_guest_registry_begin_loader_unload(registry, &identity),
+              0);
+    check_not_int("loader-prepare.blocks-live-lookup",
+                  kzt_guest_registry_find_live_object(
+                      registry, observation.link_map_addr, &match),
+                  0);
+    check_int("loader-prepare.identity-remains-resolvable",
+              kzt_guest_registry_find_loader_object_identity(
+                  registry, observation.link_map_addr, &found),
+              0);
+    check_ulong("loader-prepare.identity-generation", found.generation,
+                identity.generation);
+    check_int("loader-prepare.cancel",
+              kzt_guest_registry_cancel_loader_unload(registry, &identity),
+              0);
+    check_int("loader-prepare.live-after-cancel",
+              kzt_guest_registry_find_live_object(
+                  registry, observation.link_map_addr, &match),
+              0);
+    check_int("loader-prepare.begin-again",
+              kzt_guest_registry_begin_loader_unload(registry, &identity),
+              0);
+    check_int("loader-prepare.finish",
+              kzt_guest_registry_finish_loader_unload(registry, &identity),
+              0);
+    check_not_int("loader-prepare.dead-after-finish",
+                  kzt_guest_registry_find_loader_object_identity(
+                      registry, observation.link_map_addr, &found),
+                  0);
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_namespace_evidence_supplements_exact_dependency(void)
+{
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_guest_object_observation_t root = make_observation(0x7590);
+    kzt_guest_object_observation_t dependency = make_observation(0x75a0);
+    kzt_guest_loader_identity_t root_identity = { 0 };
+    kzt_guest_object_snapshot_t *snapshot;
+
+    root.namespace_id.status = KZT_GUEST_FIELD_UNKNOWN;
+    dependency.namespace_id.status = KZT_GUEST_FIELD_UNKNOWN;
+    dependency.load_bias.value += 0x200000;
+    dependency.dynamic_addr.value += 0x200000;
+    dependency.path.value = "/guest/libnamespace-dependency.so";
+    check_true("namespace-supplement.registry", registry != NULL);
+    if (!registry) {
+        return;
+    }
+    check_int("namespace-supplement.observe-root",
+              kzt_guest_registry_observe(registry, &root),
+              KZT_GUEST_REGISTRY_ADDED);
+    check_int("namespace-supplement.observe-dependency",
+              kzt_guest_registry_observe(registry, &dependency),
+              KZT_GUEST_REGISTRY_ADDED);
+    check_int("namespace-supplement.publish-root",
+              kzt_guest_registry_publish_loader_identity(
+                  registry, 0x9290, root.link_map_addr, 7,
+                  &root_identity),
+              0);
+    check_int("namespace-supplement.dependency",
+              kzt_guest_registry_supplement_namespace(
+                  registry, dependency.link_map_addr, 2, 7),
+              KZT_GUEST_REGISTRY_UPDATED);
+    snapshot = find_snapshot(registry, dependency.link_map_addr);
+    check_int("namespace-supplement.status", snapshot->namespace_id.status,
+              KZT_GUEST_FIELD_OK);
+    check_uintptr("namespace-supplement.value", snapshot->namespace_id.value,
+                  7);
+    kzt_guest_object_snapshot_free(snapshot);
+    check_int("namespace-supplement.conflict",
+              kzt_guest_registry_supplement_namespace(
+                  registry, dependency.link_map_addr, 2, 8),
+              KZT_GUEST_REGISTRY_CONFLICT);
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_address_match_overlong_path_is_unknown(void)
+{
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_guest_object_observation_t observation = make_observation(0x7600);
+    kzt_guest_registry_address_match_t match = { 0 };
+    char path[KZT_GUEST_REGISTRY_ADDRESS_TEXT_LIMIT + 32];
+
+    memset(path, 'x', sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    observation.path.value = path;
+    observation.namespace_id = (kzt_guest_scalar_field_t) {
+        .value = 0,
+        .status = KZT_GUEST_FIELD_OK,
+    };
+    check_true("long-match.registry", registry != NULL);
+    if (!registry) {
+        return;
+    }
+    check_int("long-match.observe",
+              kzt_guest_registry_observe(registry, &observation),
+              KZT_GUEST_REGISTRY_ADDED);
+    check_int("long-match.find-live",
+              kzt_guest_registry_find_live_object(
+                  registry, observation.link_map_addr, &match),
+              0);
+    check_int("long-match.path-status", match.path_status,
+              KZT_GUEST_FIELD_UNKNOWN);
+    check_string("long-match.path-empty", match.path, "");
     kzt_guest_registry_destroy(&registry);
 }
 
@@ -1250,6 +1755,14 @@ int main(void)
     test_destroyed_registry_rejects_new_observation();
     test_retired_address_gets_new_generation();
     test_lazy_resolver_publish_find_lifecycle();
+    test_map_range_supplement_is_exact_and_allocation_free();
+    test_loader_handle_binds_exact_link_map_generation_and_namespace();
+    test_unproven_unload_is_not_reused_without_resident_proof();
+    test_loader_symbol_source_is_exact_main_generation();
+    test_loader_unload_retires_only_exact_namespace_and_generation();
+    test_loader_unload_prepares_before_unmap_and_can_cancel();
+    test_namespace_evidence_supplements_exact_dependency();
+    test_address_match_overlong_path_is_unknown();
 
     if (failures) {
         fprintf(stderr, "kzt-guest-registry: %d failure(s)\n", failures);

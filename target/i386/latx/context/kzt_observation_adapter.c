@@ -1,8 +1,27 @@
 #include "kzt_observation_adapter.h"
 
+#include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "kzt_guest_library_binding.h"
+
+static uint64_t kzt_observation_timing_now(void)
+{
+    struct timespec value;
+
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &value) != 0) {
+        return 0;
+    }
+    return (uint64_t)value.tv_sec * 1000000000ULL +
+           (uint64_t)value.tv_nsec;
+}
+
+static uint64_t kzt_observation_timing_delta(uint64_t start, uint64_t end)
+{
+    return start && end >= start ? end - start : 0;
+}
 
 static kzt_observation_adapter_result_t kzt_adapter_result_from_registry(
     kzt_guest_registry_result_t registry_result)
@@ -103,9 +122,12 @@ static int kzt_adapter_reuse_complete_dynamic_view(
     kzt_guest_field_status_t status = KZT_GUEST_FIELD_NOT_PARSED;
     unsigned long existing_generation = 0;
 
-    if (!request || !observation || request->library_bindings ||
+    if (!request || !observation ||
+        (request->library_bindings && !request->reuse_complete_dynamic_view) ||
         request->dynamic_diagnostics_force_compare ||
-        registry_result != KZT_GUEST_REGISTRY_UNCHANGED ||
+        (registry_result != KZT_GUEST_REGISTRY_UNCHANGED &&
+         (!request->reuse_complete_dynamic_view ||
+          registry_result != KZT_GUEST_REGISTRY_UPDATED)) ||
         generation == 0 ||
         kzt_guest_registry_find_dynamic_view(
             request->registry, observation->link_map_addr, &view, &status,
@@ -338,8 +360,18 @@ int kzt_observe_guest_object_from_callback(
         .commit_result = KZT_GUEST_REGISTRY_RESULT_COUNT,
     };
     kzt_guest_library_callback_access_t callback_access = { 0 };
+    uint64_t timing_start = 0;
+    uint64_t timing_access = 0;
+    uint64_t timing_observe = 0;
+    uint64_t timing_legacy = 0;
+    uint64_t timing_supplement = 0;
+    uint64_t timing_done = 0;
+    int timing_enabled = request && request->diagnostics_enabled;
     int legacy_ret = 0;
 
+    if (timing_enabled) {
+        timing_start = kzt_observation_timing_now();
+    }
     if (request && request->library_bindings &&
         kzt_guest_library_callback_access_begin_scoped(
             request->library_bindings, request->link_map_addr,
@@ -347,25 +379,98 @@ int kzt_observe_guest_object_from_callback(
             &callback_access) != 0) {
         /* Unload won the address gate.  No reader, parser, diagnostic, or
          * legacy loader flow may touch this guest object after this point. */
-        if (result) *result = KZT_OBSERVATION_ADAPTER_DISABLED;
-        return 0;
+        observation_result = KZT_OBSERVATION_ADAPTER_DISABLED;
+        goto out;
+    }
+    if (timing_enabled) {
+        timing_access = kzt_observation_timing_now();
     }
 
     observation_result = kzt_observe_guest_object(request,
                                                  &registry_diagnostic,
                                                  &dynamic_diagnostic);
-    if (result) {
-        *result = observation_result;
+    if (request && request->lazy_prebind_scope &&
+        request->namespace_id_present && request->namespace_id == 0 &&
+        (observation_result == KZT_OBSERVATION_ADAPTER_ADDED ||
+         observation_result == KZT_OBSERVATION_ADAPTER_UPDATED)) {
+        if (request->prebind_invalidate) {
+            (void)request->prebind_invalidate(
+                KZT_LAZY_PREBIND_MUTATION_LOADER_EVENT,
+                request->prebind_invalidate_opaque);
+        } else {
+            (void)kzt_lazy_prebind_scope_mutate(
+                request->lazy_prebind_scope,
+                KZT_LAZY_PREBIND_MUTATION_LOADER_EVENT);
+        }
+    }
+    if (timing_enabled) {
+        timing_observe = kzt_observation_timing_now();
+    }
+
+    if (request && request->per_object_flow &&
+        (observation_result == KZT_OBSERVATION_ADAPTER_ADDED ||
+         observation_result == KZT_OBSERVATION_ADAPTER_UPDATED)) {
+        (void)request->per_object_flow(request->link_map_addr,
+                                       request->per_object_opaque);
     }
 
     if (request && request->legacy_flow) {
+        if (request->legacy_result) {
+            memset(request->legacy_result, 0, sizeof(*request->legacy_result));
+        }
         legacy_ret = request->legacy_flow(request->link_map_addr,
                                           request->legacy_opaque);
-    }
+        if (timing_enabled) {
+            timing_legacy = kzt_observation_timing_now();
+        }
+        if (request->legacy_result &&
+            request->legacy_result->map_range_present &&
+            request->legacy_result->map_start <
+                request->legacy_result->map_end &&
+            (observation_result == KZT_OBSERVATION_ADAPTER_ADDED ||
+             observation_result == KZT_OBSERVATION_ADAPTER_UNCHANGED ||
+             observation_result == KZT_OBSERVATION_ADAPTER_UPDATED)) {
+            kzt_guest_registry_result_t range_result =
+                kzt_guest_registry_supplement_map_range(
+                    request->registry, request->link_map_addr,
+                    registry_diagnostic.generation,
+                    request->legacy_result->map_start,
+                    request->legacy_result->map_end,
+                    &registry_diagnostic);
 
+            observation_result =
+                kzt_adapter_result_from_registry(range_result);
+        }
+    }
+    if (timing_enabled) {
+        if (!timing_legacy) timing_legacy = timing_observe;
+        timing_supplement = kzt_observation_timing_now();
+    }
     kzt_observation_adapter_emit_diagnostic(request, observation_result,
                                             &registry_diagnostic,
                                             &dynamic_diagnostic);
     kzt_guest_library_callback_access_end(&callback_access);
+out:
+    if (result) *result = observation_result;
+    if (timing_enabled) {
+        timing_done = kzt_observation_timing_now();
+        if (!timing_access) timing_access = timing_done;
+        if (!timing_observe) timing_observe = timing_access;
+        if (!timing_legacy) timing_legacy = timing_observe;
+        if (!timing_supplement) timing_supplement = timing_legacy;
+        fprintf(
+            stderr,
+            "kzt_observation_timing schema=1 link_map=0x%" PRIxPTR " "
+            "access_ns=%" PRIu64 " observe_ns=%" PRIu64 " "
+            "legacy_ns=%" PRIu64 " supplement_ns=%" PRIu64 " "
+            "total_ns=%" PRIu64 " result=%d\n",
+            request ? request->link_map_addr : 0,
+            kzt_observation_timing_delta(timing_start, timing_access),
+            kzt_observation_timing_delta(timing_access, timing_observe),
+            kzt_observation_timing_delta(timing_observe, timing_legacy),
+            kzt_observation_timing_delta(timing_legacy, timing_supplement),
+            kzt_observation_timing_delta(timing_start, timing_done),
+            observation_result);
+    }
     return legacy_ret;
 }

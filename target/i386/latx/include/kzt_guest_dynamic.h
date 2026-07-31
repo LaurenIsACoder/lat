@@ -20,6 +20,7 @@ typedef enum kzt_guest_dynamic_error {
     KZT_GUEST_DYNAMIC_ERROR_READ_FAILURE,
     KZT_GUEST_DYNAMIC_ERROR_SCAN_LIMIT_EXCEEDED,
     KZT_GUEST_DYNAMIC_ERROR_TOO_MANY_NEEDED,
+    KZT_GUEST_DYNAMIC_ERROR_ADDRESS_OVERFLOW,
 } kzt_guest_dynamic_error_t;
 
 typedef struct kzt_guest_dynamic_parse_result {

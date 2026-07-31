@@ -8,6 +8,7 @@
 #include "kzt_guest_dynamic.h"
 #include "kzt_guest_dynamic_diagnostics.h"
 #include "kzt_guest_registry.h"
+#include "kzt_lazy_prebind_scope.h"
 #include "kzt_loader_callback_scope.h"
 
 typedef struct kzt_guest_library_bindings kzt_guest_library_bindings_t;
@@ -24,6 +25,20 @@ typedef enum kzt_observation_adapter_result {
 
 typedef int (*kzt_observation_legacy_flow_fn)(uintptr_t link_map_addr,
                                              void *opaque);
+
+typedef int (*kzt_observation_per_object_flow_fn)(uintptr_t link_map_addr,
+                                                  void *opaque);
+
+typedef int (*kzt_observation_prebind_invalidate_fn)(
+    kzt_lazy_prebind_mutation_t mutation, void *opaque);
+
+/* Optional evidence produced by the legacy flow while the callback gate is
+ * still held.  The adapter accepts it only when both bounds are valid. */
+typedef struct kzt_observation_legacy_result {
+    int map_range_present;
+    uintptr_t map_start;
+    uintptr_t map_end;
+} kzt_observation_legacy_result_t;
 
 typedef struct kzt_observation_adapter_dynamic_diagnostic {
     int attempted;
@@ -58,9 +73,11 @@ typedef struct kzt_observation_adapter_request {
     int enabled;
     int diagnostics_enabled;
     int dynamic_diagnostics_force_compare;
+    int reuse_complete_dynamic_view;
     uintptr_t link_map_addr;
     kzt_guest_registry_t *registry;
     kzt_guest_library_bindings_t *library_bindings;
+    kzt_lazy_prebind_scope_t *lazy_prebind_scope;
     const kzt_guest_library_loader_scope_t *loader_scope;
     const kzt_guest_link_map_reader_ops_t *reader_ops;
     /* Caller-verified evidence.  Invalid or absent hints are ignored. */
@@ -69,8 +86,13 @@ typedef struct kzt_observation_adapter_request {
     int map_range_present;
     uintptr_t map_start;
     uintptr_t map_end;
+    kzt_observation_prebind_invalidate_fn prebind_invalidate;
+    void *prebind_invalidate_opaque;
+    kzt_observation_per_object_flow_fn per_object_flow;
+    void *per_object_opaque;
     kzt_observation_legacy_flow_fn legacy_flow;
     void *legacy_opaque;
+    kzt_observation_legacy_result_t *legacy_result;
     kzt_observation_adapter_diagnostic_fn diagnostic;
     void *diagnostic_opaque;
 } kzt_observation_adapter_request_t;

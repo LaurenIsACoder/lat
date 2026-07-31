@@ -115,9 +115,9 @@ static void test_complete_runtime_dynamic_view(void)
         { .d_tag = DT_HASH, .d_un.d_ptr = 0x7000030000 },
         { .d_tag = DT_GNU_HASH, .d_un.d_ptr = 0x7000040000 },
         { .d_tag = DT_VERSYM, .d_un.d_ptr = 0x7000050000 },
-        { .d_tag = DT_VERNEED, .d_un.d_ptr = 0x7000060000 },
+        { .d_tag = DT_VERNEED, .d_un.d_ptr = 0x6fffc60000 },
         { .d_tag = DT_VERNEEDNUM, .d_un.d_val = 2 },
-        { .d_tag = DT_VERDEF, .d_un.d_ptr = 0x7000070000 },
+        { .d_tag = DT_VERDEF, .d_un.d_ptr = 0x6fffc70000 },
         { .d_tag = DT_VERDEFNUM, .d_un.d_val = 1 },
         { .d_tag = DT_RELA, .d_un.d_ptr = 0x7000080000 },
         { .d_tag = DT_RELASZ, .d_un.d_val = 0x60 },
@@ -246,6 +246,75 @@ static void test_dynamic_address_semantics(void)
               0x84);
     check_u64("semantics.load-bias-preserved", result.view.load_bias,
               0x100000);
+
+    kzt_guest_dynamic_parse_result_clear(&result);
+}
+
+static void test_version_tables_are_load_bias_relative_only(void)
+{
+    const uintptr_t load_bias = 0x71000000;
+    Elf64_Dyn dynamic[] = {
+        { .d_tag = DT_SYMTAB, .d_un.d_ptr = 0x71001000 },
+        { .d_tag = DT_STRTAB, .d_un.d_ptr = 0x71002000 },
+        { .d_tag = DT_JMPREL, .d_un.d_ptr = 0x71003000 },
+        { .d_tag = DT_VERSYM, .d_un.d_ptr = 0x71004000 },
+        { .d_tag = DT_VERNEED, .d_un.d_ptr = 0x2b0 },
+        { .d_tag = DT_VERDEF, .d_un.d_ptr = 0x390 },
+        { .d_tag = DT_NULL, .d_un.d_val = 0 },
+    };
+    fake_dynamic_memory_t memory = {
+        .base = (uintptr_t)dynamic,
+        .size = sizeof(dynamic),
+    };
+    kzt_guest_link_map_reader_ops_t ops = fake_ops(&memory);
+    kzt_guest_dynamic_parse_result_t result = { 0 };
+
+    check_int("version-relative.parse",
+              kzt_guest_dynamic_parse((uintptr_t)dynamic, load_bias,
+                                      &ops, &result),
+              0);
+    check_int("version-relative.status", result.status,
+              KZT_GUEST_DYNAMIC_COMPLETE);
+    check_field("version-relative.symtab", &result.view.symtab, 0x71001000,
+                KZT_GUEST_DYNAMIC_RUNTIME_ADDRESS);
+    check_field("version-relative.strtab", &result.view.strtab, 0x71002000,
+                KZT_GUEST_DYNAMIC_RUNTIME_ADDRESS);
+    check_field("version-relative.jmprel", &result.view.jmprel, 0x71003000,
+                KZT_GUEST_DYNAMIC_RUNTIME_ADDRESS);
+    check_field("version-relative.versym", &result.view.versym, 0x71004000,
+                KZT_GUEST_DYNAMIC_RUNTIME_ADDRESS);
+    check_field("version-relative.verneed", &result.view.verneed,
+                load_bias + 0x2b0, KZT_GUEST_DYNAMIC_RUNTIME_ADDRESS);
+    check_field("version-relative.verdef", &result.view.verdef,
+                load_bias + 0x390, KZT_GUEST_DYNAMIC_RUNTIME_ADDRESS);
+
+    kzt_guest_dynamic_parse_result_clear(&result);
+}
+
+static void test_version_table_load_bias_overflow_is_fail_open(void)
+{
+    Elf64_Dyn dynamic[] = {
+        { .d_tag = DT_VERNEED, .d_un.d_ptr = 1 },
+        { .d_tag = DT_NULL, .d_un.d_val = 0 },
+    };
+    fake_dynamic_memory_t memory = {
+        .base = (uintptr_t)dynamic,
+        .size = sizeof(dynamic),
+    };
+    kzt_guest_link_map_reader_ops_t ops = fake_ops(&memory);
+    kzt_guest_dynamic_parse_result_t result = { 0 };
+
+    check_int("version-overflow.parse",
+              kzt_guest_dynamic_parse((uintptr_t)dynamic, UINTPTR_MAX,
+                                      &ops, &result),
+              0);
+    check_int("version-overflow.status", result.status,
+              KZT_GUEST_DYNAMIC_ERROR);
+    check_int("version-overflow.view-status", result.view.status,
+              KZT_GUEST_DYNAMIC_ERROR);
+    check_int("version-overflow.error", result.error,
+              KZT_GUEST_DYNAMIC_ERROR_ADDRESS_OVERFLOW);
+    check_true("version-overflow.no-verneed", !result.view.verneed.present);
 
     kzt_guest_dynamic_parse_result_clear(&result);
 }
@@ -423,6 +492,14 @@ int main(int argc, char **argv)
     }
     if (test_matches_filter("dynamic_address_semantics", argc, argv)) {
         test_dynamic_address_semantics();
+    }
+    if (test_matches_filter("version_tables_are_load_bias_relative_only",
+                            argc, argv)) {
+        test_version_tables_are_load_bias_relative_only();
+    }
+    if (test_matches_filter("version_table_load_bias_overflow_is_fail_open",
+                            argc, argv)) {
+        test_version_table_load_bias_overflow_is_fail_open();
     }
     if (test_matches_filter("read_failure_reports_parser_state",
                             argc, argv)) {

@@ -314,6 +314,13 @@ static void test_registry_evidence_cache_requires_exact_object_identity(void)
                    &fixture.context, registry, observation.link_map_addr,
                    observation.load_bias.value,
                    observation.dynamic_addr.value));
+    kzt_guest_registry_test_set_alloc_failure_after(0);
+    check_true("evidence.exact-reuse-no-allocation",
+               kzt_guest_registry_context_has_main_namespace_evidence(
+                   &fixture.context, registry, observation.link_map_addr,
+                   observation.load_bias.value,
+                   observation.dynamic_addr.value));
+    kzt_guest_registry_test_set_alloc_failure_after(-1);
     check_true("evidence.wrong-load-bias",
                !kzt_guest_registry_context_has_main_namespace_evidence(
                    &fixture.context, registry, observation.link_map_addr,

@@ -54,6 +54,8 @@ typedef struct observation_trace {
     int dynamic_comparison_attempted;
     int dynamic_comparison_blocking;
     int dynamic_comparison_matched;
+    int reader_calls_at_legacy;
+    int dynamic_reader_calls_at_legacy;
 } observation_trace_t;
 
 typedef struct fake_callback_event {
@@ -72,6 +74,10 @@ typedef struct fake_callback_event {
     int map_range_present;
     uintptr_t map_start;
     uintptr_t map_end;
+    int legacy_range_present;
+    uintptr_t legacy_map_start;
+    uintptr_t legacy_map_end;
+    kzt_observation_legacy_result_t *legacy_result;
 } fake_callback_event_t;
 
 typedef enum callback_pause_point {
@@ -207,6 +213,8 @@ static int fake_legacy_flow(uintptr_t link_map_addr, void *opaque)
 
     ++trace->legacy_calls;
     trace->legacy_link_map_addr = link_map_addr;
+    trace->reader_calls_at_legacy = trace->reader_calls;
+    trace->dynamic_reader_calls_at_legacy = trace->dynamic_reader_calls;
     record_event(trace, EVENT_LEGACY_FLOW);
     if (event->loader_scope && event->loader_library) {
         event->pending_pair_result =
@@ -214,6 +222,11 @@ static int fake_legacy_flow(uintptr_t link_map_addr, void *opaque)
                 event->loader_scope, link_map_addr,
                 event->loader_library,
                 KZT_GUEST_LIBRARY_OBJECT_WRAPPED);
+    }
+    if (event->legacy_result) {
+        event->legacy_result->map_range_present = event->legacy_range_present;
+        event->legacy_result->map_start = event->legacy_map_start;
+        event->legacy_result->map_end = event->legacy_map_end;
     }
     if (event->barrier) {
         pthread_mutex_lock(&event->barrier->lock);
@@ -435,6 +448,71 @@ static int run_adapter_with_loader_scope(
         .legacy_opaque = event,
     };
     return kzt_observe_guest_object_from_callback(&request, result);
+}
+
+static int run_adapter_with_legacy_range(
+    fake_callback_event_t *event, kzt_guest_registry_t *registry,
+    int diagnostics_enabled, kzt_observation_adapter_result_t *result)
+{
+    kzt_observation_legacy_result_t legacy_result = { 0 };
+    kzt_observation_adapter_request_t request = {
+        .enabled = 1,
+        .diagnostics_enabled = diagnostics_enabled,
+        .link_map_addr = (uintptr_t)&event->link_map,
+        .registry = registry,
+        .reader_ops = &event->ops,
+        .namespace_id_present = event->namespace_id_present,
+        .namespace_id = event->namespace_id,
+        .map_range_present = event->map_range_present,
+        .map_start = event->map_start,
+        .map_end = event->map_end,
+        .legacy_flow = fake_legacy_flow,
+        .legacy_opaque = event,
+        .legacy_result = &legacy_result,
+        .diagnostic = fake_diagnostic,
+        .diagnostic_opaque = &event->trace,
+    };
+    int ret;
+
+    event->legacy_result = &legacy_result;
+    ret = kzt_observe_guest_object_from_callback(&request, result);
+    event->legacy_result = NULL;
+    return ret;
+}
+
+static int run_adapter_with_legacy_range_scoped(
+    fake_callback_event_t *event, kzt_guest_registry_t *registry,
+    kzt_guest_library_bindings_t *bindings,
+    const kzt_guest_library_loader_scope_t *loader_scope,
+    int diagnostics_enabled, kzt_observation_adapter_result_t *result)
+{
+    kzt_observation_legacy_result_t legacy_result = { 0 };
+    kzt_observation_adapter_request_t request = {
+        .enabled = 1,
+        .diagnostics_enabled = diagnostics_enabled,
+        .link_map_addr = (uintptr_t)&event->link_map,
+        .registry = registry,
+        .library_bindings = bindings,
+        .loader_scope = loader_scope,
+        .reader_ops = &event->ops,
+        .namespace_id_present = event->namespace_id_present,
+        .namespace_id = event->namespace_id,
+        .map_range_present = event->map_range_present,
+        .map_start = event->map_start,
+        .map_end = event->map_end,
+        .reuse_complete_dynamic_view = 1,
+        .legacy_flow = fake_legacy_flow,
+        .legacy_opaque = event,
+        .legacy_result = &legacy_result,
+        .diagnostic = fake_diagnostic,
+        .diagnostic_opaque = &event->trace,
+    };
+    int ret;
+
+    event->legacy_result = &legacy_result;
+    ret = kzt_observe_guest_object_from_callback(&request, result);
+    event->legacy_result = NULL;
+    return ret;
 }
 
 static unsigned long registry_object_count(kzt_guest_registry_t *registry)
@@ -2026,6 +2104,174 @@ static void test_invalid_or_absent_hints_remain_unknown_and_fail_open(void)
     kzt_guest_registry_destroy(&registry);
 }
 
+static void test_legacy_range_observation_updates_same_generation(void)
+{
+    struct fake_library { int value; } library = { 21 };
+    fake_callback_event_t event;
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_guest_library_bindings_t *bindings =
+        kzt_guest_library_bindings_init();
+    kzt_guest_library_loader_scope_t scope = { 0 };
+    kzt_guest_object_snapshot_t *snapshot = NULL;
+    kzt_observation_adapter_result_t result = KZT_OBSERVATION_ADAPTER_DISABLED;
+    kzt_guest_registry_diagnostic_config_t config = {
+        .enabled = 1,
+        .throttle_limit = 4,
+    };
+    unsigned long before_generation = 0;
+    unsigned long after_generation = 0;
+
+    check_true("legacy-range.registry", registry != NULL && bindings != NULL);
+    if (!registry || !bindings) {
+        kzt_guest_library_bindings_destroy(&bindings);
+        kzt_guest_registry_destroy(&registry);
+        return;
+    }
+    init_fake_callback_event(&event, "/guest/liblegacy-range.so", 0x3a0000);
+    event.namespace_id = 0;
+    event.map_range_present = 0;
+    check_int("legacy-range.configure",
+              kzt_guest_registry_configure_diagnostics(registry, &config),
+              0);
+    check_int("legacy-range.track", kzt_guest_library_track(
+                  bindings, (library_t *)&library), 0);
+    check_int("legacy-range.pair", kzt_guest_library_note_exact_pair(
+                  bindings, (uintptr_t)&event.link_map,
+                  (library_t *)&library,
+                  KZT_GUEST_LIBRARY_OBJECT_WRAPPED),
+              KZT_GUEST_LIBRARY_BINDING_PENDING);
+    check_int("legacy-range.seed", run_adapter_with_bindings(
+                  &event, registry, bindings, &result), 77);
+    check_int("legacy-range.seed-generation", registry_object_state(
+                  registry, (uintptr_t)&event.link_map, &before_generation,
+                  NULL), 0);
+    memset(&event.trace, 0, sizeof(event.trace));
+    event.trace.legacy_return = 77;
+    event.legacy_range_present = 1;
+    event.legacy_map_start = 0x3a0000;
+    event.legacy_map_end = 0x3c0000;
+    check_int("legacy-range.scope", kzt_guest_library_loader_scope_begin(
+                  bindings, &scope), 0);
+
+    check_int("legacy-range.return",
+              run_adapter_with_legacy_range_scoped(
+                  &event, registry, bindings, &scope, 1, &result), 77);
+    check_int("legacy-range.result", result, KZT_OBSERVATION_ADAPTER_UPDATED);
+    check_int("legacy-range.after-generation", registry_object_state(
+                  registry, (uintptr_t)&event.link_map, &after_generation,
+                  NULL), 0);
+    check_ulong("legacy-range.generation-stable", after_generation,
+                before_generation);
+    check_int("legacy-range.cache-hit", event.trace.dynamic_cache_hit, 1);
+    check_int("legacy-range.not-attempted", event.trace.dynamic_attempted, 0);
+    check_int("legacy-range.no-supplemental-dynamic-reader",
+              event.trace.dynamic_reader_calls,
+              event.trace.dynamic_reader_calls_at_legacy);
+    check_int("legacy-range.no-supplemental-reader",
+              event.trace.reader_calls,
+              event.trace.reader_calls_at_legacy);
+    check_int("legacy-range.find", kzt_guest_registry_find_by_link_map(
+                  registry, (uintptr_t)&event.link_map, &snapshot), 0);
+    check_true("legacy-range.snapshot", snapshot != NULL);
+    if (snapshot) {
+        check_int("legacy-range.start-status", snapshot->map_start.status,
+                  KZT_GUEST_FIELD_OK);
+        check_uintptr("legacy-range.start", snapshot->map_start.value,
+                      event.legacy_map_start);
+        check_int("legacy-range.end-status", snapshot->map_end.status,
+                  KZT_GUEST_FIELD_OK);
+        check_uintptr("legacy-range.end", snapshot->map_end.value,
+                      event.legacy_map_end);
+        kzt_guest_object_snapshot_free(snapshot);
+    }
+    assert_old_flow_exactly_once("legacy-range.old-flow", &event, 77);
+    kzt_guest_library_loader_scope_end(&scope);
+    kzt_guest_library_unbind(bindings, registry, (library_t *)&library,
+                             (uintptr_t)&event.link_map);
+    kzt_guest_library_bindings_destroy(&bindings);
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_invalid_legacy_range_is_ignored(void)
+{
+    fake_callback_event_t event;
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_guest_object_snapshot_t *snapshot = NULL;
+    kzt_observation_adapter_result_t result = KZT_OBSERVATION_ADAPTER_DISABLED;
+
+    check_true("invalid-legacy-range.registry", registry != NULL);
+    if (!registry) {
+        return;
+    }
+    init_fake_callback_event(&event, "/guest/libinvalid-legacy-range.so",
+                             0x3d0000);
+    event.map_range_present = 0;
+    event.legacy_range_present = 1;
+    event.legacy_map_start = 0x3f0000;
+    event.legacy_map_end = 0x3e0000;
+
+    check_int("invalid-legacy-range.return",
+              run_adapter_with_legacy_range(&event, registry, 0, &result), 77);
+    check_int("invalid-legacy-range.result", result,
+              KZT_OBSERVATION_ADAPTER_ADDED);
+    check_int("invalid-legacy-range.find", kzt_guest_registry_find_by_link_map(
+                  registry, (uintptr_t)&event.link_map, &snapshot), 0);
+    check_true("invalid-legacy-range.snapshot", snapshot != NULL);
+    if (snapshot) {
+        check_int("invalid-legacy-range.start", snapshot->map_start.status,
+                  KZT_GUEST_FIELD_UNKNOWN);
+        check_int("invalid-legacy-range.end", snapshot->map_end.status,
+                  KZT_GUEST_FIELD_UNKNOWN);
+        kzt_guest_object_snapshot_free(snapshot);
+    }
+    assert_old_flow_exactly_once("invalid-legacy-range.old-flow", &event, 77);
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_conflicting_legacy_range_is_fail_open(void)
+{
+    fake_callback_event_t event;
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_guest_object_observation_t original;
+    kzt_guest_object_snapshot_t *snapshot = NULL;
+    kzt_observation_adapter_result_t result = KZT_OBSERVATION_ADAPTER_DISABLED;
+
+    check_true("legacy-range-conflict.registry", registry != NULL);
+    if (!registry) {
+        return;
+    }
+    init_fake_callback_event(&event, "/guest/liblegacy-range-conflict.so",
+                             0x410000);
+    event.map_range_present = 0;
+    event.legacy_range_present = 1;
+    event.legacy_map_start = 0x430000;
+    event.legacy_map_end = 0x450000;
+    original = make_observation((uintptr_t)&event.link_map, 0x410000,
+                                "/guest/liblegacy-range-conflict.so");
+    original.map_start.value = 0x410000;
+    original.map_end.value = 0x420000;
+    check_int("legacy-range-conflict.prepopulate",
+              kzt_guest_registry_observe(registry, &original),
+              KZT_GUEST_REGISTRY_ADDED);
+
+    check_int("legacy-range-conflict.return",
+              run_adapter_with_legacy_range(&event, registry, 0, &result), 77);
+    check_int("legacy-range-conflict.result", result,
+              KZT_OBSERVATION_ADAPTER_CONFLICT);
+    check_int("legacy-range-conflict.find", kzt_guest_registry_find_by_link_map(
+                  registry, (uintptr_t)&event.link_map, &snapshot), 0);
+    check_true("legacy-range-conflict.snapshot", snapshot != NULL);
+    if (snapshot) {
+        check_uintptr("legacy-range-conflict.start", snapshot->map_start.value,
+                      original.map_start.value);
+        check_uintptr("legacy-range-conflict.end", snapshot->map_end.value,
+                      original.map_end.value);
+        kzt_guest_object_snapshot_free(snapshot);
+    }
+    assert_old_flow_exactly_once("legacy-range-conflict.old-flow", &event, 77);
+    kzt_guest_registry_destroy(&registry);
+}
+
 static void test_registry_failure_is_fail_open_for_old_flow(void)
 {
     fake_callback_event_t event;
@@ -2309,6 +2555,9 @@ int main(void)
     test_partial_link_map_fields_are_registered();
     test_verified_hints_fill_private_link_map_evidence();
     test_invalid_or_absent_hints_remain_unknown_and_fail_open();
+    test_legacy_range_observation_updates_same_generation();
+    test_invalid_legacy_range_is_ignored();
+    test_conflicting_legacy_range_is_fail_open();
     test_registry_failure_is_fail_open_for_old_flow();
     test_conflict_result_does_not_change_old_flow();
     test_no_callback_event_does_not_create_registry_objects();

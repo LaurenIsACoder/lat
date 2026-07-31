@@ -23,6 +23,12 @@ typedef struct kzt_guest_link_map_identity {
     uintptr_t dynamic_addr;
 } kzt_guest_link_map_identity_t;
 
+typedef struct kzt_guest_link_map_fingerprint {
+    uintptr_t namespace_head;
+    size_t link_map_count;
+    uint64_t value;
+} kzt_guest_link_map_fingerprint_t;
+
 int kzt_guest_link_map_read_identity(
     uintptr_t link_map_addr,
     const kzt_guest_link_map_reader_ops_t *ops,
@@ -37,6 +43,26 @@ int kzt_guest_link_map_read_predecessor(
     uintptr_t link_map_addr,
     const kzt_guest_link_map_reader_ops_t *ops,
     uintptr_t *predecessor);
+
+int kzt_guest_link_map_read_successor(
+    uintptr_t link_map_addr,
+    const kzt_guest_link_map_reader_ops_t *ops,
+    uintptr_t *successor);
+
+/* Walk at most 256 l_next entries from a known namespace head using only the
+ * public link_map prefix and fixed stack storage.  Returns 0 only for a
+ * complete, acyclic chain ending at NULL. */
+int kzt_guest_link_map_read_fingerprint(
+    uintptr_t namespace_head,
+    const kzt_guest_link_map_reader_ops_t *ops,
+    kzt_guest_link_map_fingerprint_t *fingerprint);
+
+/* Re-read a fingerprint immediately before a write.  Returns 1 when the
+ * public chain is unchanged, 0 when it changed, and -1 when evidence is
+ * insufficient. */
+int kzt_guest_link_map_revalidate_fingerprint(
+    const kzt_guest_link_map_fingerprint_t *expected,
+    const kzt_guest_link_map_reader_ops_t *ops);
 
 /* Walk the public x86_64 link_map l_prev chain to its exact head.  With a
  * previously confirmed main head, classification is based only on head
