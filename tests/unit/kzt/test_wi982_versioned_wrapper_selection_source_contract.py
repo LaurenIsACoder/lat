@@ -32,22 +32,43 @@ adapter = (
 common = (
     root / "target/i386/latx/context/kzt_guest_dl_api.c"
 ).read_text(encoding="utf-8")
+wrappedlibc = (
+    root / "target/i386/latx/context/wrappedlibc.c"
+).read_text(encoding="utf-8")
+wrappedlibdl = (
+    root / "target/i386/latx/context/wrappedlibdl.c"
+).read_text(encoding="utf-8")
 
 selector = function_body(
     adapter, "uintptr_t kzt_guest_library_select_symbol_result(")
-version_guard = selector.find("version && version[0]")
-owner_lookup = selector.find("kzt_guest_registry_resolve_address_pair")
-if version_guard < 0:
-    raise AssertionError("versioned selection is not explicitly fail-open")
-if owner_lookup >= 0 and version_guard >= owner_lookup:
-    raise AssertionError("versioned lookup reaches unversioned owner selection")
+required_selector_tokens = (
+    "KZT_SYMBOL_VERSION_VERSIONED, version",
+    "kzt_rela_runtime_wrapper_provider_discover_retained_with_version_evidence(",
+    "kzt_wrapper_probe_minimal_manifest(",
+    "KZT_PATCH_WRAPPER_VERSION_MATCH",
+    "kzt_symbol_version_evidence_matches(",
+)
+for token in required_selector_tokens:
+    if token not in selector:
+        raise AssertionError(f"versioned selector misses exact evidence: {token}")
+if "(version && version[0]) ||" in selector:
+    raise AssertionError("versioned selection still returns before owner proof")
+if "versioned = version != NULL" not in selector or \
+        "versioned && !version[0]" not in selector:
+    raise AssertionError("NULL and empty versions are not distinguished")
 
 dlsym = function_body(common, "kzt_guest_dl_symbol_result_t kzt_guest_dl_api_dlsym(")
 dlvsym = function_body(
     common, "kzt_guest_dl_symbol_result_t kzt_guest_dl_api_dlvsym(")
-if "context, (uintptr_t)handle, guest_result" not in dlsym:
-    raise AssertionError("dlsym does not declare its unversioned selection")
-if "context, (uintptr_t)handle, guest_result" not in dlvsym:
+if "(const char *)symbol, NULL" not in dlsym:
+    raise AssertionError("dlsym does not explicitly request unversioned selection")
+if "(const char *)symbol, version" not in dlvsym:
     raise AssertionError("dlvsym does not pass the requested version")
+
+for name, source in (("libc", wrappedlibc), ("libdl", wrappedlibdl)):
+    if "kzt_guest_dl_api_dlsym(" not in source:
+        raise AssertionError(f"{name} dlsym does not use the shared API")
+    if "kzt_guest_dl_api_dlvsym(" not in source:
+        raise AssertionError(f"{name} dlvsym does not use the shared API")
 
 print("WI-982 versioned wrapper selection source contract: PASS")

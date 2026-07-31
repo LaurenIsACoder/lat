@@ -8,6 +8,7 @@
 #include "target/i386/latx/include/kzt_guest_library_binding.h"
 #include "target/i386/latx/include/kzt_guest_dynsym_lookup.h"
 #include "target/i386/latx/include/kzt_guest_registry.h"
+#include "target/i386/latx/include/kzt_rela_runtime_bridge.h"
 #include "target/i386/latx/include/callback.h"
 #include "target/i386/latx/include/library.h"
 #include "target/i386/latx/include/library_private.h"
@@ -87,6 +88,15 @@ static int evidence_valid;
 static unsigned long evidence_dynamic_revision;
 static uintptr_t evidence_runtime_address;
 static unsigned char evidence_symbol_type;
+static kzt_symbol_version_evidence_t expected_dynsym_version_evidence;
+static const char *expected_dynsym_version;
+static int provider_discover_result;
+static int provider_discover_count;
+static int wrapper_probe_count;
+static kzt_patch_wrapper_match_t wrapper_probe_match;
+static kzt_symbol_version_evidence_t wrapper_probe_version_evidence;
+static const char *wrapper_probe_version;
+static uintptr_t wrapper_probe_bridge_target;
 
 #define CHECK(label, condition)                                              \
     do {                                                                     \
@@ -275,9 +285,12 @@ kzt_guest_dynsym_lookup_status_t kzt_guest_dynsym_lookup(
     CHECK("dynsym complete view", view->status == KZT_GUEST_DYNAMIC_COMPLETE);
     CHECK("dynsym reader", reader_ops && reader_ops->read_memory);
     CHECK("dynsym symbol", strcmp(symbol, "wi963_symbol") == 0);
-    CHECK("dynsym unversioned",
-          version_evidence == KZT_SYMBOL_VERSION_CONFIRMED_UNVERSIONED &&
-          version == NULL);
+    CHECK("dynsym version evidence",
+          version_evidence == expected_dynsym_version_evidence);
+    CHECK("dynsym version",
+          expected_dynsym_version
+              ? version && strcmp(version, expected_dynsym_version) == 0
+              : version == NULL);
     memset(result, 0, sizeof(*result));
     result->status = dynsym_status;
     result->binding = STB_GLOBAL;
@@ -285,6 +298,54 @@ kzt_guest_dynsym_lookup_status_t kzt_guest_dynsym_lookup(
     result->visibility = STV_DEFAULT;
     result->runtime_address = dynsym_runtime_address;
     return result->status;
+}
+
+int kzt_rela_runtime_wrapper_provider_discover_retained_with_version_evidence(
+    box64context_t *context,
+    const kzt_guest_library_handle_t *retained_provider_handle,
+    const char *symbol_name,
+    kzt_symbol_version_evidence_t version_evidence,
+    const char *symbol_version,
+    kzt_wrapper_bridge_provider_t *provider)
+{
+    CHECK("provider context", context != NULL);
+    CHECK("provider retained binding",
+          retained_provider_handle && retained_provider_handle->entry &&
+          retained_provider_handle->library == lookup_library);
+    CHECK("provider symbol", strcmp(symbol_name, "wi963_symbol") == 0);
+    CHECK("provider version evidence",
+          version_evidence == expected_dynsym_version_evidence);
+    CHECK("provider version",
+          expected_dynsym_version && symbol_version &&
+          strcmp(symbol_version, expected_dynsym_version) == 0);
+    ++provider_discover_count;
+    memset(provider, 0, sizeof(*provider));
+    provider->manifest.available = provider_discover_result > 0;
+    return provider_discover_result;
+}
+
+int kzt_wrapper_probe_minimal_manifest(
+    const kzt_wrapper_probe_manifest_t *manifest,
+    const kzt_wrapper_probe_request_t *request,
+    const kzt_wrapper_probe_bridge_ops_t *bridge_ops,
+    kzt_wrapper_probe_result_t *result)
+{
+    CHECK("probe manifest", manifest && manifest->available);
+    CHECK("probe request", request != NULL);
+    CHECK("probe symbol", strcmp(request->symbol_name, "wi963_symbol") == 0);
+    CHECK("probe version evidence",
+          request->symbol_version_evidence == expected_dynsym_version_evidence);
+    CHECK("probe version",
+          expected_dynsym_version && request->symbol_version &&
+          strcmp(request->symbol_version, expected_dynsym_version) == 0);
+    CHECK("probe bridge ops", bridge_ops != NULL);
+    ++wrapper_probe_count;
+    memset(result, 0, sizeof(*result));
+    result->wrapper_match = wrapper_probe_match;
+    result->wrapper_version_evidence = wrapper_probe_version_evidence;
+    result->wrapper_symbol_version = wrapper_probe_version;
+    result->bridge_target = wrapper_probe_bridge_target;
+    return 0;
 }
 
 int kzt_guest_library_symbol_evidence_lookup(
@@ -784,6 +845,16 @@ static void prepare_symbol_selection(library_t *library)
     evidence_store_count = 0;
     evidence_valid = 0;
     evidence_dynamic_revision = 0;
+    expected_dynsym_version_evidence =
+        KZT_SYMBOL_VERSION_CONFIRMED_UNVERSIONED;
+    expected_dynsym_version = NULL;
+    provider_discover_result = 0;
+    provider_discover_count = 0;
+    wrapper_probe_count = 0;
+    wrapper_probe_match = KZT_PATCH_WRAPPER_NO_MANIFEST;
+    wrapper_probe_version_evidence = KZT_SYMBOL_VERSION_UNKNOWN;
+    wrapper_probe_version = NULL;
+    wrapper_probe_bridge_target = 0;
 }
 
 static void prepare_trusted_source(library_t *library)
@@ -1064,13 +1135,67 @@ static void test_symbol_selection_requires_exact_wrapped_owner(void)
 
     reset_counters();
     prepare_symbol_selection(&library);
+    expected_dynsym_version_evidence = KZT_SYMBOL_VERSION_VERSIONED;
+    expected_dynsym_version = "WI982_1.0";
+    provider_discover_result = 1;
+    wrapper_probe_match = KZT_PATCH_WRAPPER_VERSION_MATCH;
+    wrapper_probe_version_evidence = KZT_SYMBOL_VERSION_VERSIONED;
+    wrapper_probe_version = expected_dynsym_version;
+    wrapper_probe_bridge_target = wrapper_result;
     selected = kzt_guest_library_select_symbol_result(
         &context, lookup_guest_handle, resolved_guest_address,
         "wi963_symbol", "WI982_1.0");
-    CHECK("versioned lookup keeps guest",
+    CHECK("exact versioned wrapper selects bridge",
+          selected == wrapper_result);
+    CHECK("versioned selection proves exact owner",
+          symbol_source_acquire_count == 1 && lookup_count == 1 &&
+          dynsym_lookup_count == 1 && provider_discover_count == 1 &&
+          wrapper_probe_count == 1 && release_count == 1);
+    CHECK("versioned selection bypasses unversioned evidence cache",
+          evidence_lookup_count == 0 && evidence_store_count == 0);
+
+    reset_counters();
+    prepare_symbol_selection(&library);
+    expected_dynsym_version_evidence = KZT_SYMBOL_VERSION_VERSIONED;
+    expected_dynsym_version = "WI982_1.0";
+    provider_discover_result = 1;
+    wrapper_probe_match = KZT_PATCH_WRAPPER_VERSION_MATCH;
+    wrapper_probe_version_evidence = KZT_SYMBOL_VERSION_VERSIONED;
+    wrapper_probe_version = "WI982_2.0";
+    wrapper_probe_bridge_target = wrapper_result;
+    selected = kzt_guest_library_select_symbol_result(
+        &context, lookup_guest_handle, resolved_guest_address,
+        "wi963_symbol", "WI982_1.0");
+    CHECK("wrapper version mismatch keeps guest",
           selected == resolved_guest_address);
-    CHECK("versioned lookup skips unversioned owner selection",
-          resolve_count == 0 && lookup_count == 0 && release_count == 0);
+    CHECK("wrapper version mismatch releases exact binding",
+          provider_discover_count == 1 && wrapper_probe_count == 1 &&
+          release_count == 1);
+
+    reset_counters();
+    prepare_symbol_selection(&library);
+    expected_dynsym_version_evidence = KZT_SYMBOL_VERSION_VERSIONED;
+    expected_dynsym_version = "WI982_1.0";
+    provider_discover_result = 0;
+    selected = kzt_guest_library_select_symbol_result(
+        &context, lookup_guest_handle, resolved_guest_address,
+        "wi963_symbol", "WI982_1.0");
+    CHECK("missing versioned wrapper evidence keeps guest",
+          selected == resolved_guest_address);
+    CHECK("missing versioned wrapper evidence releases exact binding",
+          provider_discover_count == 1 && wrapper_probe_count == 0 &&
+          release_count == 1);
+
+    reset_counters();
+    prepare_symbol_selection(&library);
+    selected = kzt_guest_library_select_symbol_result(
+        &context, lookup_guest_handle, resolved_guest_address,
+        "wi963_symbol", "");
+    CHECK("empty dlvsym version keeps guest",
+          selected == resolved_guest_address);
+    CHECK("empty dlvsym version skips unversioned selection",
+          symbol_source_acquire_count == 0 && lookup_count == 0 &&
+          dynsym_lookup_count == 0 && release_count == 0);
 }
 
 int main(void)

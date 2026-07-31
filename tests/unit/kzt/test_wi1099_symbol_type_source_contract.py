@@ -30,29 +30,48 @@ selector = function_body(
     adapter, "uintptr_t kzt_guest_library_select_symbol_result("
 )
 
-ordered = (
-    "kzt_guest_registry_loader_symbol_source_acquire",
-    "kzt_guest_library_access_lookup",
-    "kzt_guest_library_symbol_evidence_lookup",
-    "kzt_guest_dynsym_lookup(",
-    "kzt_guest_library_symbol_evidence_store",
-    "proven_symbol_type == STT_FUNC",
-    "GetLibFunctionSymbolStartEnd",
-)
-positions = [selector.find(token) for token in ordered]
-if min(positions) < 0 or positions != sorted(positions):
-    raise AssertionError(f"symbol evidence order is incomplete: {positions}")
+evidence = {
+    token: selector.find(token)
+    for token in (
+        "kzt_guest_registry_loader_symbol_source_acquire",
+        "kzt_guest_library_access_lookup",
+        "kzt_guest_library_symbol_evidence_lookup",
+        "kzt_guest_dynsym_lookup(",
+        "kzt_guest_library_symbol_evidence_store",
+        "proven_runtime_address == guest_result",
+        "proven_symbol_type == STT_FUNC",
+        "kzt_rela_runtime_wrapper_provider_discover_retained_with_version_evidence",
+        "GetLibFunctionSymbolStartEnd",
+    )
+}
+if min(evidence.values()) < 0:
+    raise AssertionError(f"symbol evidence is incomplete: {evidence}")
+owner = evidence["kzt_guest_registry_loader_symbol_source_acquire"]
+binding = evidence["kzt_guest_library_access_lookup"]
+address = evidence["proven_runtime_address == guest_result"]
+symbol_type = evidence["proven_symbol_type == STT_FUNC"]
+versioned_bridge = evidence[
+    "kzt_rela_runtime_wrapper_provider_discover_retained_with_version_evidence"
+]
+unversioned_bridge = evidence["GetLibFunctionSymbolStartEnd"]
+if not (owner < binding < address <= symbol_type < versioned_bridge and
+        symbol_type < unversioned_bridge):
+    raise AssertionError(f"symbol proof does not guard both bridges: {evidence}")
 cleanup = (
     selector.rfind("kzt_guest_registry_source_lease_release"),
     selector.rfind("kzt_guest_library_handle_release"),
 )
 if (min(cleanup) < 0 or cleanup != tuple(sorted(cleanup)) or
-        cleanup[0] < positions[-1]):
+        cleanup[0] < max(versioned_bridge, unversioned_bridge)):
     raise AssertionError(f"symbol evidence cleanup is incomplete: {cleanup}")
 
-version_guard = selector.find("version && version[0]")
-if version_guard < 0 or version_guard > positions[0]:
-    raise AssertionError("versioned lookup reaches unversioned wrapper selection")
+for token in (
+    "KZT_SYMBOL_VERSION_VERSIONED, version",
+    "KZT_PATCH_WRAPPER_VERSION_MATCH",
+    "kzt_symbol_version_evidence_matches(",
+):
+    if token not in selector:
+        raise AssertionError(f"versioned symbol proof is incomplete: {token}")
 
 for forbidden in (
     "GetGlobalSymbolStartEnd",

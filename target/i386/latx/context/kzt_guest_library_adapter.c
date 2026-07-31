@@ -8,6 +8,8 @@
 #include "kzt_guest_dynsym_lookup.h"
 #include "kzt_guest_library_binding.h"
 #include "kzt_guest_registry.h"
+#include "kzt_rela_runtime_bridge.h"
+#include "kzt_wrapper_probe.h"
 #include "library.h"
 #include "library_private.h"
 #ifndef KZT_GUEST_LIBRARY_ADAPTER_TEST
@@ -357,6 +359,9 @@ uintptr_t kzt_guest_library_select_symbol_result(
     kzt_guest_library_handle_t handle = { 0 };
     kzt_guest_dynamic_view_t dynamic_view;
     kzt_guest_dynsym_lookup_result_t dynsym_result = { 0 };
+    kzt_wrapper_bridge_provider_t wrapper_provider = { 0 };
+    kzt_wrapper_probe_request_t wrapper_request;
+    kzt_wrapper_probe_result_t wrapper_probe = { 0 };
     kzt_guest_field_status_t dynamic_status;
     unsigned long dynamic_revision = 0;
     kzt_guest_link_map_reader_ops_t reader_ops = {
@@ -368,10 +373,11 @@ uintptr_t kzt_guest_library_select_symbol_result(
     uintptr_t end = 0;
     uintptr_t selected = guest_result;
     const char *diagnostic_reason = "source_generation_stale";
+    int versioned = version != NULL;
 
     if ((!option_kzt && !wine_option_kzt) ||
         !context || !guest_result || !symbol || !symbol[0] ||
-        (version && version[0]) ||
+        (versioned && !version[0]) ||
         !(registry = KztGuestRegistryForContext(context)) ||
         kzt_guest_registry_loader_symbol_source_acquire(
             registry, guest_handle, &lookup_identity, &dynamic_view,
@@ -398,9 +404,20 @@ uintptr_t kzt_guest_library_select_symbol_result(
     if (handle.object_type == KZT_GUEST_LIBRARY_OBJECT_WRAPPED &&
         handle.library) {
         diagnostic_reason = "dynsym_unproven";
-        if (kzt_guest_library_symbol_evidence_lookup(
-                &handle, symbol, dynamic_revision, &proven_runtime_address,
-                &proven_symbol_type) != 0) {
+        if (versioned) {
+            kzt_guest_dynsym_lookup_status_t dynsym_status =
+                kzt_guest_dynsym_lookup(
+                    &dynamic_view, &reader_ops, symbol,
+                    KZT_SYMBOL_VERSION_VERSIONED, version,
+                    &dynsym_result);
+
+            if (dynsym_status == KZT_GUEST_DYNSYM_LOOKUP_FOUND) {
+                proven_runtime_address = dynsym_result.runtime_address;
+                proven_symbol_type = dynsym_result.type;
+            }
+        } else if (kzt_guest_library_symbol_evidence_lookup(
+                       &handle, symbol, dynamic_revision,
+                       &proven_runtime_address, &proven_symbol_type) != 0) {
             kzt_guest_dynsym_lookup_status_t dynsym_status =
                 kzt_guest_dynsym_lookup(
                     &dynamic_view, &reader_ops, symbol,
@@ -411,8 +428,7 @@ uintptr_t kzt_guest_library_select_symbol_result(
                 proven_runtime_address = dynsym_result.runtime_address;
                 proven_symbol_type = dynsym_result.type;
                 kzt_guest_library_symbol_evidence_store(
-                    &handle, symbol, dynamic_revision,
-                    proven_runtime_address,
+                    &handle, symbol, dynamic_revision, proven_runtime_address,
                     proven_symbol_type);
             }
         }
@@ -423,11 +439,35 @@ uintptr_t kzt_guest_library_select_symbol_result(
                       ? "unsupported_symbol_type"
                       : "bridge_missing";
         if (proven_runtime_address == guest_result &&
-            proven_symbol_type == STT_FUNC &&
-            GetLibFunctionSymbolStartEnd(
-                handle.library, symbol, 0, &start, &end)) {
-            selected = start;
-            diagnostic_reason = NULL;
+            proven_symbol_type == STT_FUNC) {
+            if (versioned &&
+                kzt_rela_runtime_wrapper_provider_discover_retained_with_version_evidence(
+                    context, &handle, symbol, KZT_SYMBOL_VERSION_VERSIONED,
+                    version, &wrapper_provider) > 0) {
+                wrapper_request = (kzt_wrapper_probe_request_t) {
+                    .symbol_name = symbol,
+                    .symbol_version_evidence = KZT_SYMBOL_VERSION_VERSIONED,
+                    .symbol_version = version,
+                };
+                if (kzt_wrapper_probe_minimal_manifest(
+                        &wrapper_provider.manifest, &wrapper_request,
+                        &wrapper_provider.bridge_ops, &wrapper_probe) == 0 &&
+                    wrapper_probe.wrapper_match ==
+                        KZT_PATCH_WRAPPER_VERSION_MATCH &&
+                    wrapper_probe.bridge_target &&
+                    kzt_symbol_version_evidence_matches(
+                        KZT_SYMBOL_VERSION_VERSIONED, version,
+                        wrapper_probe.wrapper_version_evidence,
+                        wrapper_probe.wrapper_symbol_version)) {
+                    selected = wrapper_probe.bridge_target;
+                    diagnostic_reason = NULL;
+                }
+            } else if (!versioned &&
+                       GetLibFunctionSymbolStartEnd(
+                           handle.library, symbol, 0, &start, &end)) {
+                selected = start;
+                diagnostic_reason = NULL;
+            }
         }
         if (diagnostic_reason) {
             kzt_guest_library_note_wrapper_diagnostic(
