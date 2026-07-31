@@ -56,6 +56,12 @@ enum fixture_setup_status {
 };
 
 uintptr_t CheckBridged(bridge_t *bridge, void *fnc);
+int BridgeForkProtectionAvailable(void);
+
+int BridgeForkProtectionAvailable(void)
+{
+    return 1;
+}
 
 uintptr_t CheckBridged(bridge_t *bridge, void *fnc)
 {

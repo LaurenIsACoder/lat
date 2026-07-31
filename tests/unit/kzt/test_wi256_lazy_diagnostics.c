@@ -283,6 +283,56 @@ static void test_cas_mismatch_uses_final_competitor_target(void)
                    "selected_second_target=0x75000050");
 }
 
+static void test_transaction_failure_statuses_are_explicit(void)
+{
+    const struct {
+        kzt_lazy_binding_status_t status;
+        kzt_lazy_binding_reason_t reason;
+        const char *name;
+    } cases[] = {
+        {
+            KZT_LAZY_BINDING_WRITE_ROLLED_BACK,
+            KZT_LAZY_BINDING_REASON_WRITE_ROLLED_BACK,
+            "WRITE_ROLLED_BACK",
+        },
+        {
+            KZT_LAZY_BINDING_UNRECOVERABLE,
+            KZT_LAZY_BINDING_REASON_UNRECOVERABLE,
+            "UNRECOVERABLE",
+        },
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        kzt_lazy_binding_pending_t pending = base_pending();
+        kzt_lazy_binding_result_t binding_result = base_result();
+        capture_sink_t capture = { 0 };
+        char buffer[KZT_LAZY_DIAGNOSTIC_LINE_LIMIT];
+        kzt_lazy_diagnostic_input_t input = {
+            .enabled = 1,
+            .pending = &pending,
+            .binding_result = &binding_result,
+            .buffer = buffer,
+            .buffer_size = sizeof(buffer),
+            .sink = capture_line,
+            .sink_opaque = &capture,
+        };
+        kzt_lazy_diagnostic_emit_result_t emit_result;
+
+        binding_result.status = cases[i].status;
+        binding_result.reason = cases[i].reason;
+        check_int("transaction-diagnostic.emit",
+                  kzt_lazy_diagnostics_emit(&input, &emit_result), 0);
+        check_string("transaction-diagnostic.status",
+                     emit_result.record.completion_route_status,
+                     cases[i].name);
+        check_string("transaction-diagnostic.reason",
+                     emit_result.record.reason, cases[i].name);
+        check_contains("transaction-diagnostic.line", capture.line,
+                       cases[i].name);
+    }
+}
+
 static void test_production_emit_writes_stderr(void)
 {
     kzt_lazy_binding_pending_t pending = base_pending();
@@ -328,6 +378,7 @@ int main(void)
     test_slot_unchanged_uses_stable_status_name();
     test_missing_version_uses_stable_status_name();
     test_cas_mismatch_uses_final_competitor_target();
+    test_transaction_failure_statuses_are_explicit();
     test_production_emit_writes_stderr();
 
     if (failures) {

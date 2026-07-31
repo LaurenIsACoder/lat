@@ -158,6 +158,12 @@ typedef struct kzt_patch_decision {
 int kzt_patch_planner_decide(const kzt_patch_candidate_t *candidate,
                              kzt_patch_decision_t *decision);
 
+static inline int kzt_patch_symbol_must_stay_guest(
+    const char *symbol_name)
+{
+    return symbol_name && strcmp(symbol_name, "dlclose") == 0;
+}
+
 const char *kzt_patch_decision_kind_name(kzt_patch_decision_kind_t kind);
 const char *kzt_patch_reason_name(kzt_patch_reason_t reason);
 const char *kzt_patch_table_kind_name(kzt_patch_table_kind_t table_kind);

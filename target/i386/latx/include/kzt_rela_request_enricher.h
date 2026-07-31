@@ -33,7 +33,19 @@ typedef struct kzt_rela_request_enricher_result {
     kzt_wrapper_probe_result_t wrapper_probe;
 } kzt_rela_request_enricher_result_t;
 
+typedef struct kzt_rela_request_wrapper_only_input {
+    const kzt_wrapper_probe_manifest_t *wrapper_manifest;
+    const kzt_wrapper_probe_bridge_ops_t *bridge_ops;
+} kzt_rela_request_wrapper_only_input_t;
+
 void kzt_rela_request_enricher_result_init(
+    kzt_rela_request_enricher_result_t *result);
+
+/* Applies only wrapper/bridge evidence to an already validated request.  It
+ * never reads registry state; callers initialize result before use. */
+int kzt_rela_immediate_request_enrich_wrapper_only(
+    kzt_rela_immediate_candidate_request_t *request,
+    const kzt_rela_request_wrapper_only_input_t *input,
     kzt_rela_request_enricher_result_t *result);
 
 int kzt_rela_immediate_request_enrich(

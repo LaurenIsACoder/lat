@@ -167,8 +167,6 @@ int kzt_rela_immediate_jump_slot_try_write(
     }
 
     result->writer_called = result->record.writer_called;
-    result->skip_legacy_write =
-        result->record.result == KZT_PATCH_SPIKE_RESULT_APPLIED &&
-        result->record.skip_legacy_write;
+    result->skip_legacy_write = result->record.skip_legacy_write;
     return 0;
 }

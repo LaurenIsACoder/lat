@@ -214,7 +214,7 @@ void* getGLProcAddress(glprocaddress_t procaddr, const char* rname)
     }
     const char* constname = kh_key(wrappers->glwrappers, k);
     AddOffsetSymbol(my_context->maplib, symbol, rname);
-    ret = AddBridge(my_context->system, kh_value(wrappers->glwrappers, k), symbol, 0, constname);
+    ret = AddCheckBridge(my_context->system, kh_value(wrappers->glwrappers, k), symbol, 0, constname);
     printf_dlsym(LOG_DEBUG, "%p\n", (void*)ret);
     return (void*)ret;
 }

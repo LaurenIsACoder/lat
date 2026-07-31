@@ -20,7 +20,9 @@ typedef struct kzt_patch_spike_permission_lease {
     int checked;
     int was_writable;
     int write_enabled;
+    int mmap_lock_held;
     int restore_attempted;
+    unsigned int restore_attempts;
     int restored;
 } kzt_patch_spike_permission_lease_t;
 
@@ -96,6 +98,7 @@ typedef struct kzt_patch_spike_record {
     int permission_was_writable;
     int permission_write_enabled;
     int permission_restore_attempted;
+    unsigned int permission_restore_attempts;
     int permission_restored;
 } kzt_patch_spike_record_t;
 

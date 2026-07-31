@@ -1,3 +1,5 @@
+#include "qemu/osdep.h"
+
 #include "kzt_patch_spike_guard.h"
 
 #include <string.h>
@@ -109,6 +111,13 @@ int kzt_patch_spike_guard_circuit_open(
     const kzt_patch_spike_guard_t *guard)
 {
     return guard && __atomic_load_n(&guard->circuit_open, __ATOMIC_ACQUIRE);
+}
+
+void kzt_patch_spike_guard_trip(kzt_patch_spike_guard_t *guard)
+{
+    if (guard) {
+        __atomic_store_n(&guard->circuit_open, 1, __ATOMIC_RELEASE);
+    }
 }
 
 unsigned long kzt_patch_spike_guard_budget_remaining(
@@ -251,7 +260,23 @@ int kzt_patch_spike_guard_try_write(
         int preserve_guest = kzt_patch_spike_failure_preserves_guest(failure);
 
         if (failure == KZT_PATCH_SPIKE_FAILURE_PERMISSION_RESTORE_FAILED) {
+            if (writer->finish_slot &&
+                writer->finish_slot(decision, writer->opaque) ==
+                    KZT_PATCH_SPIKE_WRITER_OK) {
+                kzt_patch_spike_outcome_set(
+                    outcome, KZT_PATCH_SPIKE_RESULT_FAIL_OPEN,
+                    KZT_PATCH_SPIKE_FAILURE_PERMISSION_RESTORE_FAILED,
+                    KZT_PATCH_SPIKE_ACTION_PRESERVE_GUEST, guard);
+                kzt_patch_spike_guard_unlock(guard);
+                return 0;
+            }
             __atomic_store_n(&guard->circuit_open, 1, __ATOMIC_RELEASE);
+            kzt_patch_spike_outcome_set(
+                outcome, KZT_PATCH_SPIKE_RESULT_UNRECOVERABLE,
+                KZT_PATCH_SPIKE_FAILURE_TRANSACTION_UNRECOVERABLE,
+                KZT_PATCH_SPIKE_ACTION_TRANSACTION_UNRECOVERABLE, guard);
+            kzt_patch_spike_guard_unlock(guard);
+            return 0;
         }
         kzt_patch_spike_outcome_set(
             outcome, preserve_guest ? KZT_PATCH_SPIKE_RESULT_GUEST_PRESERVED :
@@ -271,19 +296,13 @@ int kzt_patch_spike_guard_try_write(
             if (writer->finish_slot &&
                 writer->finish_slot(decision, writer->opaque) !=
                     KZT_PATCH_SPIKE_WRITER_OK) {
-                __atomic_store_n(&guard->circuit_open, 1, __ATOMIC_RELEASE);
-                kzt_patch_spike_outcome_set(
-                    outcome, KZT_PATCH_SPIKE_RESULT_GUEST_PRESERVED,
-                    KZT_PATCH_SPIKE_FAILURE_PERMISSION_RESTORE_FAILED,
-                    KZT_PATCH_SPIKE_ACTION_PRESERVE_GUEST, guard);
-                kzt_patch_spike_guard_unlock(guard);
-                return 0;
+                (void)writer->finish_slot(decision, writer->opaque);
             }
             __atomic_store_n(&guard->circuit_open, 1, __ATOMIC_RELEASE);
             kzt_patch_spike_outcome_set(
-                outcome, KZT_PATCH_SPIKE_RESULT_GUEST_PRESERVED,
-                KZT_PATCH_SPIKE_FAILURE_ROLLBACK_FAILED,
-                KZT_PATCH_SPIKE_ACTION_PRESERVE_GUEST, guard);
+                outcome, KZT_PATCH_SPIKE_RESULT_UNRECOVERABLE,
+                KZT_PATCH_SPIKE_FAILURE_TRANSACTION_UNRECOVERABLE,
+                KZT_PATCH_SPIKE_ACTION_TRANSACTION_UNRECOVERABLE, guard);
             kzt_patch_spike_guard_unlock(guard);
             return 0;
         }
@@ -291,13 +310,16 @@ int kzt_patch_spike_guard_try_write(
         if (writer->finish_slot &&
             writer->finish_slot(decision, writer->opaque) !=
                 KZT_PATCH_SPIKE_WRITER_OK) {
-            __atomic_store_n(&guard->circuit_open, 1, __ATOMIC_RELEASE);
-            kzt_patch_spike_outcome_set(
-                outcome, KZT_PATCH_SPIKE_RESULT_GUEST_PRESERVED,
-                KZT_PATCH_SPIKE_FAILURE_PERMISSION_RESTORE_FAILED,
-                KZT_PATCH_SPIKE_ACTION_PRESERVE_GUEST, guard);
-            kzt_patch_spike_guard_unlock(guard);
-            return 0;
+            if (writer->finish_slot(decision, writer->opaque) !=
+                KZT_PATCH_SPIKE_WRITER_OK) {
+                __atomic_store_n(&guard->circuit_open, 1, __ATOMIC_RELEASE);
+                kzt_patch_spike_outcome_set(
+                    outcome, KZT_PATCH_SPIKE_RESULT_UNRECOVERABLE,
+                    KZT_PATCH_SPIKE_FAILURE_TRANSACTION_UNRECOVERABLE,
+                    KZT_PATCH_SPIKE_ACTION_TRANSACTION_UNRECOVERABLE, guard);
+                kzt_patch_spike_guard_unlock(guard);
+                return 0;
+            }
         }
 
         kzt_patch_spike_outcome_set(
@@ -311,11 +333,27 @@ int kzt_patch_spike_guard_try_write(
     if (writer->finish_slot &&
         writer->finish_slot(decision, writer->opaque) !=
             KZT_PATCH_SPIKE_WRITER_OK) {
+        int rollback_succeeded;
+        int restore_succeeded;
+
+        outcome->rollback_called = 1;
+        rollback_succeeded = writer->rollback_slot(
+            decision, previous_value, writer->opaque) == 0;
+        restore_succeeded = writer->finish_slot(
+            decision, writer->opaque) == KZT_PATCH_SPIKE_WRITER_OK;
+        if (rollback_succeeded && restore_succeeded) {
+            kzt_patch_spike_outcome_set(
+                outcome, KZT_PATCH_SPIKE_RESULT_ROLLED_BACK,
+                KZT_PATCH_SPIKE_FAILURE_PERMISSION_RESTORE_FAILED,
+                KZT_PATCH_SPIKE_ACTION_ROLLBACK_COMPLETE, guard);
+            kzt_patch_spike_guard_unlock(guard);
+            return 0;
+        }
         __atomic_store_n(&guard->circuit_open, 1, __ATOMIC_RELEASE);
         kzt_patch_spike_outcome_set(
-            outcome, KZT_PATCH_SPIKE_RESULT_GUEST_PRESERVED,
-            KZT_PATCH_SPIKE_FAILURE_PERMISSION_RESTORE_FAILED,
-            KZT_PATCH_SPIKE_ACTION_PRESERVE_GUEST, guard);
+            outcome, KZT_PATCH_SPIKE_RESULT_UNRECOVERABLE,
+            KZT_PATCH_SPIKE_FAILURE_TRANSACTION_UNRECOVERABLE,
+            KZT_PATCH_SPIKE_ACTION_TRANSACTION_UNRECOVERABLE, guard);
         kzt_patch_spike_guard_unlock(guard);
         return 0;
     }
@@ -346,6 +384,10 @@ const char *kzt_patch_spike_result_name(kzt_patch_spike_result_t result)
         return "GUEST_PRESERVED";
     case KZT_PATCH_SPIKE_RESULT_CIRCUIT_OPEN:
         return "CIRCUIT_OPEN";
+    case KZT_PATCH_SPIKE_RESULT_ROLLED_BACK:
+        return "ROLLED_BACK";
+    case KZT_PATCH_SPIKE_RESULT_UNRECOVERABLE:
+        return "UNRECOVERABLE";
     }
 
     return "UNKNOWN";
@@ -382,6 +424,8 @@ const char *kzt_patch_spike_failure_name(kzt_patch_spike_failure_t failure)
         return "GENERATION_MISMATCH";
     case KZT_PATCH_SPIKE_FAILURE_CIRCUIT_BREAKER_OPEN:
         return "CIRCUIT_BREAKER_OPEN";
+    case KZT_PATCH_SPIKE_FAILURE_TRANSACTION_UNRECOVERABLE:
+        return "TRANSACTION_UNRECOVERABLE";
     }
 
     return "UNKNOWN";

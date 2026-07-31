@@ -121,7 +121,9 @@ int kzt_wrapper_bridge_provider_prepare_with_version_evidence(
         }
         if (!candidate.abi_wrapper || !candidate.native_symbol ||
             !candidate.context_owner || !candidate.wrapper_provider ||
-            !candidate.native_lookup_handle || !candidate.native_owner ||
+            !candidate.native_lookup_handle ||
+            (!candidate.native_owner &&
+             !candidate.retained_provider_handle) ||
             !candidate.bridge_owner || !candidate.bridge_storage ||
             candidate.stack_bytes < 0 || !candidate.native_name[0] ||
             (!!candidate.resolved_bridge_target !=

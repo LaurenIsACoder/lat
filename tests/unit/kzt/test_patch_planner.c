@@ -429,6 +429,29 @@ static void test_bridge_target_is_required_for_approval(void)
                     KZT_PATCH_REASON_INPUT_UNAVAILABLE_BRIDGE_TARGET, 0);
 }
 
+static void test_guest_owned_dlclose_is_kept_guest(void)
+{
+    kzt_patch_candidate_t candidate = base_candidate();
+    kzt_patch_decision_t decision;
+
+    candidate.symbol_name = "dlclose";
+    candidate.version_evidence =
+        KZT_SYMBOL_VERSION_CONFIRMED_UNVERSIONED;
+    candidate.version = NULL;
+    candidate.wrapper_version_evidence =
+        KZT_SYMBOL_VERSION_CONFIRMED_UNVERSIONED;
+    candidate.wrapper_symbol_version = NULL;
+    candidate.wrapper_match = KZT_PATCH_WRAPPER_UNVERSIONED_MATCH;
+
+    check_int("guest-dlclose.policy",
+              kzt_patch_symbol_must_stay_guest(candidate.symbol_name), 1);
+    check_int("guest-dlclose.decide",
+              kzt_patch_planner_decide(&candidate, &decision), 0);
+    assert_decision("guest-dlclose", &decision,
+                    KZT_PATCH_DECISION_REJECTED,
+                    KZT_PATCH_REASON_POLICY_KEEP_GUEST, 0);
+}
+
 static int test_matches_filter(const char *name, int argc, char **argv)
 {
     int i;
@@ -497,6 +520,10 @@ int main(int argc, char **argv)
     if (test_matches_filter("bridge_target_is_required_for_approval",
                             argc, argv)) {
         test_bridge_target_is_required_for_approval();
+    }
+    if (test_matches_filter("guest_owned_dlclose_is_kept_guest",
+                            argc, argv)) {
+        test_guest_owned_dlclose_is_kept_guest();
     }
 
     if (failures) {

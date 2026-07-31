@@ -81,7 +81,7 @@ EXPORT void* my_eglGetProcAddress(void* name)
     }
     const char* constname = kh_key(my_context->glwrappers, k);
     AddOffsetSymbol(my_context->maplib, symbol, rname);
-    ret = AddBridge(my_context->system, kh_value(my_context->glwrappers, k), symbol, 0, constname);
+    ret = AddCheckBridge(my_context->system, kh_value(my_context->glwrappers, k), symbol, 0, constname);
     if(relocation_log<LOG_DEBUG) printf_log(LOG_NONE, "%p\n", (void*)ret);
     return (void*)ret;
 

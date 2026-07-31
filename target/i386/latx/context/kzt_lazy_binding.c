@@ -181,6 +181,14 @@ int kzt_lazy_binding_complete(
     } else if (route_result.status == KZT_LAZY_BINDING_ROUTE_CAS_MISMATCH) {
         result->status = KZT_LAZY_BINDING_CAS_MISMATCH;
         result->reason = KZT_LAZY_BINDING_REASON_CAS_MISMATCH;
+    } else if (route_result.status ==
+               KZT_LAZY_BINDING_ROUTE_WRITE_ROLLED_BACK) {
+        result->status = KZT_LAZY_BINDING_WRITE_ROLLED_BACK;
+        result->reason = KZT_LAZY_BINDING_REASON_WRITE_ROLLED_BACK;
+    } else if (route_result.status ==
+               KZT_LAZY_BINDING_ROUTE_UNRECOVERABLE) {
+        result->status = KZT_LAZY_BINDING_UNRECOVERABLE;
+        result->reason = KZT_LAZY_BINDING_REASON_UNRECOVERABLE;
     } else {
         result->status = KZT_LAZY_BINDING_GUEST_PRESERVED;
         result->reason = KZT_LAZY_BINDING_REASON_NATIVE_UNAVAILABLE;

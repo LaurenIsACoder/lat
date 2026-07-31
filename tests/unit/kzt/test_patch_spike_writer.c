@@ -22,6 +22,7 @@ typedef struct fake_slot {
     int fail_permission_begin;
     int fail_permission_begin_after_enable;
     int fail_permission_end;
+    int fail_permission_end_once;
     int fail_generation;
 } fake_slot_t;
 
@@ -226,6 +227,10 @@ static int fake_end_write(kzt_patch_spike_permission_lease_t *lease,
         return -1;
     }
     ++slot->end_calls;
+    if (slot->fail_permission_end_once) {
+        slot->fail_permission_end_once = 0;
+        return -1;
+    }
     if (slot->fail_permission_end) {
         return -1;
     }
@@ -532,9 +537,9 @@ static void test_rollback_failure_is_observable(void)
                                                              &ops,
                                                              &record), 0);
     check_int("rollback-fail.result", record.result,
-              KZT_PATCH_SPIKE_RESULT_GUEST_PRESERVED);
+              KZT_PATCH_SPIKE_RESULT_UNRECOVERABLE);
     check_int("rollback-fail.failure", record.failure,
-              KZT_PATCH_SPIKE_FAILURE_ROLLBACK_FAILED);
+              KZT_PATCH_SPIKE_FAILURE_TRANSACTION_UNRECOVERABLE);
     check_int("rollback-fail.rollback-called", record.rollback_called, 1);
     check_int("rollback-fail.rollback-success", record.rollback_succeeded, 0);
     check_int("rollback-fail.circuit",
@@ -571,7 +576,44 @@ static void test_permission_enable_failure_does_not_write(void)
     check_int("permission-enable.preserve", record.skip_legacy_write, 1);
 }
 
-static void test_permission_restore_failure_opens_circuit(void)
+static void test_permission_restore_failure_rolls_back_and_recovers(void)
+{
+    kzt_patch_decision_t decision = approved_decision(0x7100000018);
+    kzt_patch_spike_guard_t guard = init_guard(1, 1, 8);
+    kzt_patch_spike_record_t record;
+    fake_slot_t slot = {
+        .slot_addr = decision.slot_addr,
+        .value = decision.slot_current_value,
+        .replacement_value = decision.bridge_target,
+        .previous_value = decision.slot_current_value,
+        .fail_permission_end_once = 1,
+    };
+    kzt_patch_spike_slot_ops_t ops = fake_slot_ops(&slot);
+
+    check_int("permission-restore.apply",
+              kzt_patch_spike_writer_try_apply_with_slot_ops(
+                  &guard, &decision, &ops, &record), 0);
+    check_int("permission-restore.result", record.result,
+              KZT_PATCH_SPIKE_RESULT_ROLLED_BACK);
+    check_int("permission-restore.failure", record.failure,
+              KZT_PATCH_SPIKE_FAILURE_PERMISSION_RESTORE_FAILED);
+    check_int("permission-restore.end", slot.end_calls, 2);
+    check_int("permission-restore.write", record.write_succeeded, 1);
+    check_int("permission-restore.verify", record.verify_succeeded, 1);
+    check_int("permission-restore.attempted",
+              record.permission_restore_attempted, 1);
+    check_int("permission-restore.rollback-called", record.rollback_called, 1);
+    check_int("permission-restore.rollback-succeeded",
+              record.rollback_succeeded, 1);
+    check_uintptr("permission-restore.slot", slot.value,
+                  decision.slot_current_value);
+    check_int("permission-restore.restored", record.permission_restored, 1);
+    check_int("permission-restore.circuit",
+              kzt_patch_spike_guard_circuit_open(&guard), 0);
+    check_int("permission-restore.preserve", record.skip_legacy_write, 1);
+}
+
+static void test_permission_restore_failure_can_be_unrecoverable(void)
 {
     kzt_patch_decision_t decision = approved_decision(0x7100000018);
     kzt_patch_spike_guard_t guard = init_guard(1, 1, 8);
@@ -585,22 +627,26 @@ static void test_permission_restore_failure_opens_circuit(void)
     };
     kzt_patch_spike_slot_ops_t ops = fake_slot_ops(&slot);
 
-    check_int("permission-restore.apply",
+    check_int("permission-unrecoverable.apply",
               kzt_patch_spike_writer_try_apply_with_slot_ops(
                   &guard, &decision, &ops, &record), 0);
-    check_int("permission-restore.result", record.result,
-              KZT_PATCH_SPIKE_RESULT_GUEST_PRESERVED);
-    check_int("permission-restore.failure", record.failure,
-              KZT_PATCH_SPIKE_FAILURE_PERMISSION_RESTORE_FAILED);
-    check_int("permission-restore.end", slot.end_calls, 1);
-    check_int("permission-restore.write", record.write_succeeded, 1);
-    check_int("permission-restore.verify", record.verify_succeeded, 1);
-    check_int("permission-restore.attempted",
-              record.permission_restore_attempted, 1);
-    check_int("permission-restore.restored", record.permission_restored, 0);
-    check_int("permission-restore.circuit",
+    check_int("permission-unrecoverable.result", record.result,
+              KZT_PATCH_SPIKE_RESULT_UNRECOVERABLE);
+    check_int("permission-unrecoverable.failure", record.failure,
+              KZT_PATCH_SPIKE_FAILURE_TRANSACTION_UNRECOVERABLE);
+    check_int("permission-unrecoverable.end", slot.end_calls, 2);
+    check_int("permission-unrecoverable.rollback-called",
+              record.rollback_called, 1);
+    check_int("permission-unrecoverable.rollback-succeeded",
+              record.rollback_succeeded, 1);
+    check_uintptr("permission-unrecoverable.slot", slot.value,
+                  decision.slot_current_value);
+    check_int("permission-unrecoverable.restored",
+              record.permission_restored, 0);
+    check_int("permission-unrecoverable.circuit",
               kzt_patch_spike_guard_circuit_open(&guard), 1);
-    check_int("permission-restore.preserve", record.skip_legacy_write, 1);
+    check_int("permission-unrecoverable.skip-legacy",
+              record.skip_legacy_write, 1);
 }
 
 static void test_partial_permission_enable_is_restored(void)
@@ -800,9 +846,9 @@ static void test_persistent_guard_circuit_blocks_second_write(void)
                                                              &first_ops,
                                                              &first_record), 0);
     check_int("persistent-circuit.first-result", first_record.result,
-              KZT_PATCH_SPIKE_RESULT_GUEST_PRESERVED);
+              KZT_PATCH_SPIKE_RESULT_UNRECOVERABLE);
     check_int("persistent-circuit.first-failure", first_record.failure,
-              KZT_PATCH_SPIKE_FAILURE_ROLLBACK_FAILED);
+              KZT_PATCH_SPIKE_FAILURE_TRANSACTION_UNRECOVERABLE);
     check_int("persistent-circuit.first-rollback", first_record.rollback_called,
               1);
     check_int("persistent-circuit.open",
@@ -888,7 +934,8 @@ int main(void)
     test_verify_failure_rolls_back_successfully();
     test_rollback_failure_is_observable();
     test_permission_enable_failure_does_not_write();
-    test_permission_restore_failure_opens_circuit();
+    test_permission_restore_failure_rolls_back_and_recovers();
+    test_permission_restore_failure_can_be_unrecoverable();
     test_partial_permission_enable_is_restored();
     test_generation_mismatch_does_not_touch_permissions_or_slot();
     test_non_approved_decision_does_not_write();

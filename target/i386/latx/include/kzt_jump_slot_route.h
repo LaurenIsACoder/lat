@@ -12,16 +12,25 @@ typedef enum kzt_jump_slot_route_writer_status {
     KZT_JUMP_SLOT_ROUTE_WRITER_APPLIED,
     KZT_JUMP_SLOT_ROUTE_WRITER_ERROR,
     KZT_JUMP_SLOT_ROUTE_WRITER_PRESERVE,
+    KZT_JUMP_SLOT_ROUTE_WRITER_ROLLED_BACK,
+    KZT_JUMP_SLOT_ROUTE_WRITER_UNRECOVERABLE,
 } kzt_jump_slot_route_writer_status_t;
 
 typedef enum kzt_jump_slot_route_status {
     KZT_JUMP_SLOT_ROUTE_BYPASS = 0,
     KZT_JUMP_SLOT_ROUTE_NATIVE_APPLIED,
-    KZT_JUMP_SLOT_ROUTE_LEGACY_APPLIED,
     KZT_JUMP_SLOT_ROUTE_GUEST_PRESERVED,
     KZT_JUMP_SLOT_ROUTE_CAS_MISMATCH,
     KZT_JUMP_SLOT_ROUTE_WRITE_ERROR,
+    KZT_JUMP_SLOT_ROUTE_WRITE_ROLLED_BACK,
+    KZT_JUMP_SLOT_ROUTE_UNRECOVERABLE,
 } kzt_jump_slot_route_status_t;
+
+typedef enum kzt_jump_slot_route_slot_action {
+    KZT_JUMP_SLOT_ROUTE_SLOT_LEGACY_WRITE = 0,
+    KZT_JUMP_SLOT_ROUTE_SLOT_ROUTE_APPLIED,
+    KZT_JUMP_SLOT_ROUTE_SLOT_PRESERVE,
+} kzt_jump_slot_route_slot_action_t;
 
 typedef int (*kzt_jump_slot_route_load_fn)(uintptr_t slot_addr,
                                             uintptr_t *value,
@@ -44,6 +53,8 @@ typedef struct kzt_jump_slot_route_ops {
     int (*validate_source_identity)(
         const kzt_rela_immediate_candidate_request_t *request,
         void *opaque);
+    int (*preserve_guest_after_bridge_failure)(uintptr_t *value,
+                                               void *opaque);
     kzt_jump_slot_route_writer_status_t (*try_native_writer)(
         const kzt_rela_immediate_candidate_request_t *request,
         const kzt_patch_spike_slot_ops_t *slot_ops, void *opaque);
@@ -59,7 +70,6 @@ typedef struct kzt_jump_slot_route_input {
     int enabled;
     int preserve_observed_on_failure;
     int expected_guest_target_present;
-    int resolved_target_matches_legacy;
     library_t *resolved_provider;
     kzt_rela_immediate_candidate_request_t request;
 } kzt_jump_slot_route_input_t;
@@ -78,6 +88,21 @@ typedef struct kzt_jump_slot_route_result {
     int legacy_fallback_attempted;
 } kzt_jump_slot_route_result_t;
 
+typedef struct kzt_jump_slot_route_caller_decision {
+    kzt_jump_slot_route_slot_action_t slot_action;
+    uintptr_t call_target;
+    int slot_value_usable;
+} kzt_jump_slot_route_caller_decision_t;
+
+/* This is pure caller policy.  slot_value_usable confirms that a route-owned
+ * slot has a nonzero final value which is not an unresolved stub. */
+kzt_jump_slot_route_caller_decision_t kzt_jump_slot_route_caller_decide(
+    int route_call_succeeded,
+    const kzt_jump_slot_route_result_t *result,
+    uintptr_t legacy_target,
+    int final_value_usable);
+
+/* A nonzero return is before this function attempts or commits a slot write. */
 int kzt_jump_slot_route_apply(const kzt_jump_slot_route_input_t *input,
                               const kzt_jump_slot_route_ops_t *ops,
                               kzt_jump_slot_route_result_t *result);

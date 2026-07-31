@@ -9,6 +9,8 @@ typedef enum kzt_patch_spike_action {
     KZT_PATCH_SPIKE_ACTION_KEEP_LEGACY = 0,
     KZT_PATCH_SPIKE_ACTION_USE_NATIVE_BRIDGE,
     KZT_PATCH_SPIKE_ACTION_PRESERVE_GUEST,
+    KZT_PATCH_SPIKE_ACTION_ROLLBACK_COMPLETE,
+    KZT_PATCH_SPIKE_ACTION_TRANSACTION_UNRECOVERABLE,
 } kzt_patch_spike_action_t;
 
 typedef enum kzt_patch_spike_result {
@@ -19,6 +21,8 @@ typedef enum kzt_patch_spike_result {
     KZT_PATCH_SPIKE_RESULT_FAIL_OPEN,
     KZT_PATCH_SPIKE_RESULT_GUEST_PRESERVED,
     KZT_PATCH_SPIKE_RESULT_CIRCUIT_OPEN,
+    KZT_PATCH_SPIKE_RESULT_ROLLED_BACK,
+    KZT_PATCH_SPIKE_RESULT_UNRECOVERABLE,
 } kzt_patch_spike_result_t;
 
 typedef enum kzt_patch_spike_failure {
@@ -36,6 +40,7 @@ typedef enum kzt_patch_spike_failure {
     KZT_PATCH_SPIKE_FAILURE_PERMISSION_RESTORE_FAILED,
     KZT_PATCH_SPIKE_FAILURE_GENERATION_MISMATCH,
     KZT_PATCH_SPIKE_FAILURE_CIRCUIT_BREAKER_OPEN,
+    KZT_PATCH_SPIKE_FAILURE_TRANSACTION_UNRECOVERABLE,
 } kzt_patch_spike_failure_t;
 
 typedef enum kzt_patch_spike_writer_status {
@@ -99,6 +104,7 @@ int kzt_patch_spike_guard_should_plan(
     const kzt_patch_spike_guard_t *guard);
 int kzt_patch_spike_guard_circuit_open(
     const kzt_patch_spike_guard_t *guard);
+void kzt_patch_spike_guard_trip(kzt_patch_spike_guard_t *guard);
 unsigned long kzt_patch_spike_guard_budget_remaining(
     const kzt_patch_spike_guard_t *guard);
 

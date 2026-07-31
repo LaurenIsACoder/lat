@@ -1,6 +1,7 @@
 #ifndef KZT_PLT_RESOLVER_ADAPTER_H
 #define KZT_PLT_RESOLVER_ADAPTER_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "kzt_lazy_binding.h"
@@ -59,6 +60,17 @@ typedef struct kzt_plt_resolver_enter_result {
     uintptr_t selected_resolver;
     int pending_armed;
 } kzt_plt_resolver_enter_result_t;
+
+int kzt_plt_resolver_injection_allowed(
+    uintptr_t guest_resolver, uintptr_t resolver_bridge);
+
+int kzt_plt_resolver_relocation_index_valid(
+    uint64_t relocation_index, uintptr_t relocation_table,
+    size_t relocation_table_size, size_t relocation_entry_size);
+
+int kzt_plt_resolver_symbol_index_valid(
+    unsigned long symbol_index, uintptr_t symbol_table,
+    size_t symbol_count);
 
 int kzt_plt_resolver_enter(
     CPUX86State *cpu, const kzt_plt_resolver_runtime_ops_t *ops,

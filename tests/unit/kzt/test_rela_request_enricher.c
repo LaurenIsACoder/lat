@@ -328,6 +328,116 @@ static void test_all_evidence_allows_approved_plan(void)
     kzt_guest_registry_destroy(&registry);
 }
 
+static void test_source_and_owner_enrichment_do_not_need_snapshot_allocation(void)
+{
+    kzt_guest_registry_t *registry = registry_with_source_and_owner(1, 1);
+    kzt_rela_request_enricher_input_t input = { .registry = registry };
+    kzt_rela_request_enricher_result_t result;
+    kzt_rela_immediate_candidate_request_t request = base_request();
+
+    kzt_guest_registry_test_set_alloc_failure_after(0);
+    check_int("compact-enrich.call",
+              kzt_rela_immediate_request_enrich(&request, &input, &result),
+              0);
+    kzt_guest_registry_test_set_alloc_failure_after(-1);
+    check_ulong("compact-enrich.source", request.source.link_map_addr,
+                0x1000);
+    check_ulong("compact-enrich.source-generation", request.source.generation,
+                1);
+    check_int("compact-enrich.owner", request.owner_match,
+              KZT_PATCH_OWNER_MATCH);
+    check_ulong("compact-enrich.owner-link-map",
+                request.current_owner.link_map_addr, 0x2000);
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_wrapper_only_preserves_validated_base_evidence(void)
+{
+    kzt_guest_registry_t *registry = registry_with_source_and_owner(1, 1);
+    kzt_wrapper_probe_manifest_t manifest = wrapper_manifest();
+    fake_bridge_state_t bridge = { .next_bridge_target = 0x72000000 };
+    kzt_wrapper_probe_bridge_ops_t ops = bridge_ops(&bridge);
+    kzt_rela_request_enricher_input_t full_input = { .registry = registry };
+    kzt_rela_request_wrapper_only_input_t wrapper_input = {
+        .wrapper_manifest = &manifest,
+        .bridge_ops = &ops,
+    };
+    kzt_rela_request_enricher_result_t result;
+    kzt_rela_immediate_candidate_request_t request = base_request();
+    kzt_rela_immediate_candidate_request_t before;
+
+    kzt_rela_request_enricher_result_init(&result);
+    check_int("wrapper_only.base", kzt_rela_immediate_request_enrich(
+                  &request, &full_input, &result), 0);
+    before = request;
+    check_int("wrapper_only.call",
+              kzt_rela_immediate_request_enrich_wrapper_only(
+                  &request, &wrapper_input, &result), 0);
+    check_ulong("wrapper_only.source.link_map", request.source.link_map_addr,
+                before.source.link_map_addr);
+    check_ulong("wrapper_only.source.generation", request.source.generation,
+                before.source.generation);
+    check_ulong("wrapper_only.dynamic.addr", request.dynamic_addr,
+                before.dynamic_addr);
+    check_ulong("wrapper_only.dynamic.bias", request.load_bias,
+                before.load_bias);
+    check_int("wrapper_only.dynamic.available", request.dynamic_view_available,
+              before.dynamic_view_available);
+    check_ulong("wrapper_only.dynamic.generation",
+                request.dynamic_view_generation,
+                before.dynamic_view_generation);
+    check_ulong("wrapper_only.owner.link_map",
+                request.current_owner.link_map_addr,
+                before.current_owner.link_map_addr);
+    check_ulong("wrapper_only.owner.generation",
+                request.current_owner.generation,
+                before.current_owner.generation);
+    check_int("wrapper_only.owner.match", request.owner_match,
+              before.owner_match);
+    check_ulong("wrapper_only.slot.addr", request.slot_addr,
+                before.slot_addr);
+    check_ulong("wrapper_only.slot.value", request.slot_current_value,
+                before.slot_current_value);
+    check_ulong("wrapper_only.symbol.index", request.symbol_index,
+                before.symbol_index);
+    check_int("wrapper_only.symbol.name",
+              strcmp(request.symbol_name, before.symbol_name), 0);
+    check_int("wrapper_only.version.evidence", request.version_evidence,
+              before.version_evidence);
+    check_int("wrapper_only.version", strcmp(request.version, before.version),
+              0);
+    check_ulong("wrapper_only.bridge", request.native_bridge_target,
+                bridge.next_bridge_target);
+    check_int("wrapper_only.add", bridge.add_calls, 1);
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_wrapper_only_needs_validated_base_evidence(void)
+{
+    kzt_wrapper_probe_manifest_t manifest = wrapper_manifest();
+    fake_bridge_state_t bridge = { .next_bridge_target = 0x72000000 };
+    kzt_wrapper_probe_bridge_ops_t ops = bridge_ops(&bridge);
+    kzt_rela_request_wrapper_only_input_t input = {
+        .wrapper_manifest = &manifest,
+        .bridge_ops = &ops,
+    };
+    kzt_rela_request_enricher_result_t result;
+    kzt_rela_immediate_candidate_request_t request = base_request();
+
+    kzt_rela_request_enricher_result_init(&result);
+    request.dynamic_view_available = 0;
+    request.owner_match = KZT_PATCH_OWNER_MATCH;
+    request.current_owner.known = 1;
+    request.current_owner.link_map_addr = 0x2000;
+    request.current_owner.generation = 1;
+    check_int("wrapper_only.missing-base",
+              kzt_rela_immediate_request_enrich_wrapper_only(
+                  &request, &input, &result), 0);
+    check_ulong("wrapper_only.missing-base.no-bridge",
+                request.native_bridge_target, 0);
+    check_int("wrapper_only.missing-base.no-add", bridge.add_calls, 0);
+}
+
 static void test_unresolved_stub_detector_coordinates_and_bounds(void)
 {
     const uintptr_t plt_start = 0x2000;
@@ -410,6 +520,75 @@ static void test_unresolved_stub_detector_coordinates_and_bounds(void)
               kzt_rela_slot_current_is_unresolved_stub(
                   0x10, KZT_RELA_STUB_COORDINATE_RUNTIME_REBASED,
                   -0x20, 0x10, 0x18, 0, 0), 0);
+}
+
+static void test_jump_slot_defer_plan(void)
+{
+    const uintptr_t plt_start = 0x2000;
+    const uintptr_t plt_end = 0x2040;
+    const uintptr_t gotplt_start = 0x3000;
+    const uintptr_t gotplt_end = 0x3040;
+    const intptr_t load_bias = 0x71000000;
+    static const struct {
+        const char *name;
+        uintptr_t slot_current_value;
+        int bind_is_local;
+        int bindnow;
+        int need_resolver_present;
+        int expected_unresolved_stub;
+        int expected_defer;
+        int expected_add_delta;
+    } cases[] = {
+        { "raw", 0x2010, 0, 0, 1, 1, 1, 1 },
+        { "runtime-rebased", 0x71002010, 0, 0, 1, 1, 1, 0 },
+        { "resolved", 0x71005000, 0, 0, 1, 0, 0, 0 },
+        { "local.raw", 0x2010, 1, 0, 1, 1, 0, 0 },
+        { "local.runtime", 0x71002010, 1, 0, 1, 1, 0, 0 },
+        { "bindnow.raw", 0x2010, 0, 1, 1, 1, 0, 0 },
+        { "bindnow.runtime", 0x71002010, 0, 1, 1, 1, 0, 0 },
+        { "no-need-resolver.raw", 0x2010, 0, 0, 0, 1, 0, 0 },
+        { "no-need-resolver.runtime", 0x71002010, 0, 0, 0, 1, 0, 0 },
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        kzt_rela_jump_slot_defer_input_t input = {
+            .slot_current_value = cases[i].slot_current_value,
+            .bind_is_local = cases[i].bind_is_local,
+            .bindnow = cases[i].bindnow,
+            .need_resolver_present = cases[i].need_resolver_present,
+            .load_bias = load_bias,
+            .plt_start = plt_start,
+            .plt_end = plt_end,
+            .gotplt_start = gotplt_start,
+            .gotplt_end = gotplt_end,
+        };
+        kzt_rela_jump_slot_defer_plan_t plan =
+            kzt_rela_jump_slot_defer_plan(&input);
+
+        check_int(cases[i].name, plan.slot_is_unresolved_stub,
+                  cases[i].expected_unresolved_stub);
+        check_int(cases[i].name, plan.should_defer,
+                  cases[i].expected_defer);
+        check_int(cases[i].name, plan.should_add_delta,
+                  cases[i].expected_add_delta);
+    }
+
+    {
+        kzt_rela_jump_slot_defer_input_t overlapping_input = {
+            .slot_current_value = 0x2020,
+            .need_resolver_present = 1,
+            .load_bias = 0x10,
+            .plt_start = 0x2000,
+            .plt_end = 0x2040,
+        };
+        kzt_rela_jump_slot_defer_plan_t plan =
+            kzt_rela_jump_slot_defer_plan(&overlapping_input);
+
+        check_int("overlap.unresolved", plan.slot_is_unresolved_stub, 1);
+        check_int("overlap.defer", plan.should_defer, 1);
+        check_int("overlap.add-delta", plan.should_add_delta, 0);
+    }
 }
 
 static void test_distinct_targets_write_only_selected_slot(void)
@@ -741,10 +920,30 @@ static void test_dead_object_is_not_relocation_source(void)
     kzt_guest_registry_destroy(&registry);
 }
 
+static void test_malformed_wrapper_evidence_does_not_fail_base_enrichment(void)
+{
+    kzt_guest_registry_t *registry = registry_with_source_and_owner(1, 1);
+    kzt_rela_request_enricher_input_t input = { .registry = registry };
+    kzt_rela_request_enricher_result_t result;
+    kzt_rela_immediate_candidate_request_t request = base_request();
+
+    request.symbol_name = NULL;
+    check_int("malformed-wrapper.base-enrich",
+              kzt_rela_immediate_request_enrich(
+                  &request, &input, &result), 0);
+    check_int("malformed-wrapper.default", request.wrapper_match,
+              KZT_PATCH_WRAPPER_NO_MANIFEST);
+    kzt_guest_registry_destroy(&registry);
+}
+
 int main(void)
 {
     test_all_evidence_allows_approved_plan();
+    test_source_and_owner_enrichment_do_not_need_snapshot_allocation();
+    test_wrapper_only_preserves_validated_base_evidence();
+    test_wrapper_only_needs_validated_base_evidence();
     test_unresolved_stub_detector_coordinates_and_bounds();
+    test_jump_slot_defer_plan();
     test_distinct_targets_write_only_selected_slot();
     test_unresolved_stub_skips_owner_and_falls_back_to_legacy();
     test_no_manifest_keeps_default_fail_open();
@@ -753,6 +952,7 @@ int main(void)
     test_bridge_zero_blocks_approved_plan();
     test_native_bridge_is_not_used_as_expected_owner();
     test_dead_object_is_not_relocation_source();
+    test_malformed_wrapper_evidence_does_not_fail_base_enrichment();
 
     if (failures) {
         fprintf(stderr, "kzt-rela-request-enricher: %d failure(s)\n",

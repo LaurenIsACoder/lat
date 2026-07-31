@@ -4,6 +4,7 @@
 
 #include "kzt_plt_resolver_adapter.h"
 
+#include <limits.h>
 #include <string.h>
 
 #ifndef KZT_PLT_RESOLVER_ADAPTER_TEST
@@ -14,6 +15,32 @@ static void resolver_push64(CPUX86State *cpu, uintptr_t value)
 {
     cpu->regs[R_ESP] -= sizeof(uint64_t);
     *(uint64_t *)cpu->regs[R_ESP] = value;
+}
+
+int kzt_plt_resolver_injection_allowed(
+    uintptr_t guest_resolver, uintptr_t resolver_bridge)
+{
+    return guest_resolver && resolver_bridge &&
+           guest_resolver != resolver_bridge;
+}
+
+int kzt_plt_resolver_relocation_index_valid(
+    uint64_t relocation_index, uintptr_t relocation_table,
+    size_t relocation_table_size, size_t relocation_entry_size)
+{
+    return relocation_table && relocation_entry_size &&
+           relocation_table_size >= relocation_entry_size &&
+           relocation_table_size % relocation_entry_size == 0 &&
+           relocation_index <= INT_MAX &&
+           relocation_index <
+               relocation_table_size / relocation_entry_size;
+}
+
+int kzt_plt_resolver_symbol_index_valid(
+    unsigned long symbol_index, uintptr_t symbol_table,
+    size_t symbol_count)
+{
+    return symbol_table && symbol_count && symbol_index < symbol_count;
 }
 
 int kzt_plt_resolver_enter(

@@ -29,29 +29,52 @@ lazy = body(elfloader, "void PltResolver(void)")
 shared = "kzt_production_jump_slot_route("
 
 assert shared in eager
-assert shared in lazy
 assert eager.count("uintptr_t slot_observation = (uintptr_t)(*p);") == 1
-assert re.search(
-    r"kzt_rela_slot_current_is_unresolved_stub\(\s*slot_observation\s*,",
+assert "kzt_rela_jump_slot_defer_input_t defer_input" in eager
+assert "kzt_rela_jump_slot_defer_plan(&defer_input)" in eager
+assert not re.search(
+    r"kzt_rela_slot_current_is_unresolved_stub\s*\(\s*"
+    r"slot_observation\s*,",
     eager,
 )
 assert "uintptr_t expected_guest_target = slot_observation;" in eager
-assert "(void *)slot_observation, (void*)legacy_target" in eager
-assert "p,\n                                    slot_observation," in eager
+assert re.search(
+    r"kzt_production_jump_slot_route\s*\(\s*"
+    r"my_context\s*,\s*NULL\s*,\s*slot_observation\s*,",
+    eager,
+)
+assert re.search(r"&rela\[i\]\s*,\s*p\s*,\s*slot_observation\s*,", eager)
 assert "expected_guest_target = legacy_target" not in eager
 
-assert lazy.count("uintptr_t slot_observation = (uintptr_t)(*p);") == 1
-assert "(void *)slot_observation, (void*)legacy_target" in lazy
-assert "rel, p,\n                    slot_observation, 1," in lazy
+eager_final_coordinates = re.findall(
+    r"kzt_rela_slot_current_is_unresolved_stub\s*\(\s*"
+    r"route_result\.final_value\s*,\s*"
+    r"(KZT_RELA_STUB_COORDINATE_\w+)",
+    eager,
+)
+assert eager_final_coordinates == [
+    "KZT_RELA_STUB_COORDINATE_LINK_TIME_RAW",
+    "KZT_RELA_STUB_COORDINATE_RUNTIME_REBASED",
+]
 
-# Runtime-disabled KZT retains the historical direct stores.  Runtime-enabled
-# eager and lazy branches do not add an unchecked store after entering Step5.
-assert "if (option_kzt || wine_option_kzt)" in eager
+# Eager keeps the normal relocation write in its caller.  Lazy first tries the
+# Registry-backed direct route, then hands off to the current object's guest
+# resolver without reviving the removed host lookup/write path.
+assert "option_kzt || wine_option_kzt" in eager
 assert "if (option_kzt || wine_option_kzt)" in lazy
+assert lazy.count("kzt_production_lazy_direct_route(") == 1
+assert lazy.count("kzt_plt_resolver_enter(") == 1
+assert "plt_resolver_handoff_guest(" not in lazy
+assert lazy.count("plt_resolver_handoff_guest_or_abort(") == 3
+assert "plt_resolver_lookup_host_symbol(" not in lazy
+assert "getAlternate(" not in lazy
+assert not re.search(r"\*p\s*=\s*(?:offs|legacy_target)\s*;", lazy)
 assert "__atomic_compare_exchange_n" in production
-assert "snapshot->namespace_id.status != KZT_GUEST_FIELD_OK" in production
-assert "snapshot->namespace_id.value != 0" in production
-assert "input.resolved_target_matches_legacy =\n        resolved_target == legacy_target;" in production
+assert "kzt_guest_registry_find_live_object(" in production
+assert "match.namespace_id_status != KZT_GUEST_FIELD_OK" in production
+assert "match.namespace_id != 0" in production
+assert "resolved_target_matches_legacy" not in production
+assert "state->resolved_provider = handle->library;" in production
 assert "production_request_is_main_namespace" in production
 assert "production_shadow_runtime_candidate" in production
 assert "kzt_runtime_candidate_shadow_run" in production
@@ -71,19 +94,16 @@ assert "kzt_rela_request_enricher_result_t" not in enrich
 assert "&state->base_enrich_result" in base_enrich
 assert "&state->bridge_enrich_result" in bridge_enrich
 
-# The shared helper retains the exact handle across bridge enrichment/writing,
-# releases it before fallback, and never performs a direct slot store.
+# The eager helper retains the exact handle across bridge enrichment/writing,
+# releases it before declining, and never performs a direct slot store.
 acquire = route.index("ops->acquire_exact_provider")
 bridge = route.index("ops->enrich_bridge", acquire)
 writer = route.index("ops->try_native_writer", bridge)
 release = route.index("ops->release_exact_provider", writer)
-fallback = route.index("route_legacy_fallback", release)
-assert acquire < bridge < writer < release < fallback
+decline = route.index("route_decline_without_write", release)
+assert acquire < bridge < writer < release < decline
+assert "route_legacy_fallback" not in route
 assert "*(uintptr_t *)" not in route
 assert "compare_exchange_slot" in route
 
-# Lazy currently has no raw expected guest target/owner proof and explicitly
-# enters the route with expected_guest_target_present == 0.
-assert "vername, 0, 0, legacy_target, &route_result" in lazy
-
-print("WI-237 eager/lazy shared jump-slot route contract: PASS")
+print("WI-237 eager route and lazy guest-handoff contract: PASS")

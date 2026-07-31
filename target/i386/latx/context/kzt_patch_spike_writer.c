@@ -104,6 +104,7 @@ static void kzt_patch_spike_record_permission(
     record->permission_was_writable = lease->was_writable;
     record->permission_write_enabled = lease->write_enabled;
     record->permission_restore_attempted = lease->restore_attempted;
+    record->permission_restore_attempts = lease->restore_attempts;
     record->permission_restored = lease->restored;
 }
 
@@ -121,12 +122,12 @@ static kzt_patch_spike_writer_status_t kzt_patch_spike_writer_finish_slot(
     }
 
     state->permission_lease.restore_attempted = 1;
+    ++state->permission_lease.restore_attempts;
     if (state->slot_ops->end_write &&
         state->slot_ops->end_write(&state->permission_lease,
                                    state->slot_ops->opaque) != 0) {
         kzt_patch_spike_record_permission(state->record,
                                           &state->permission_lease);
-        state->permission_active = 0;
         return KZT_PATCH_SPIKE_WRITER_PERMISSION_RESTORE_FAILED;
     }
     state->permission_lease.restored = 1;

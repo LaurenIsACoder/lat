@@ -212,6 +212,20 @@ static void test_default_config_is_closed_and_noop(void)
     assert_no_writer_calls("default.writer", &writer);
 }
 
+static void test_config_from_enabled_options(void)
+{
+    kzt_patch_spike_config_t config = { 0 };
+
+    option_kzt_patch_spike = 1;
+    option_kzt_patch_spike_write = 1;
+    option_kzt_patch_spike_budget = 1;
+    kzt_patch_spike_config_from_options(&config);
+
+    check_int("options.enabled", config.enabled, 1);
+    check_int("options.write-enabled", config.write_enabled, 1);
+    check_ulong("options.budget", config.budget, 1);
+}
+
 static void test_diagnostics_only_never_writes(void)
 {
     kzt_patch_decision_t decision = approved_decision();
@@ -417,9 +431,9 @@ static void test_rollback_failure_opens_circuit_breaker(void)
               kzt_patch_spike_guard_try_write(&guard, &decision, &ops,
                                               &outcome), 0);
     check_int("rollback-failure.result", outcome.result,
-              KZT_PATCH_SPIKE_RESULT_GUEST_PRESERVED);
+              KZT_PATCH_SPIKE_RESULT_UNRECOVERABLE);
     check_int("rollback-failure.failure", outcome.failure,
-              KZT_PATCH_SPIKE_FAILURE_ROLLBACK_FAILED);
+              KZT_PATCH_SPIKE_FAILURE_TRANSACTION_UNRECOVERABLE);
     check_int("rollback-failure.rollback-called", outcome.rollback_called, 1);
     check_int("rollback-failure.skip-legacy", outcome.skip_legacy_write, 1);
     check_int("rollback-failure.circuit-open",
@@ -496,6 +510,7 @@ static void test_concurrent_budget_reservation_allows_exactly_one_writer(void)
 int main(void)
 {
     test_default_config_is_closed_and_noop();
+    test_config_from_enabled_options();
     test_diagnostics_only_never_writes();
     test_spike_on_without_write_or_budget_is_noop();
     test_approved_budget_one_allows_one_write();

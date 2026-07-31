@@ -548,11 +548,12 @@ static void test_wi231_writer_failures_fail_open_to_legacy(void)
     wi231_apply_step4_request_contract(&request, &slot, legacy_target,
                                        &route);
     check_int("wi231.rollback_fail.failure", route.record.failure,
-              KZT_PATCH_SPIKE_FAILURE_ROLLBACK_FAILED);
+              KZT_PATCH_SPIKE_FAILURE_TRANSACTION_UNRECOVERABLE);
     check_int("wi231.rollback_fail.rollback",
               route.record.rollback_called, 1);
-    check_int("wi231.rollback_fail.legacy", slot.legacy_write_calls, 1);
-    check_ulong("wi231.rollback_fail.final", slot.value, legacy_target);
+    check_int("wi231.rollback_fail.legacy", slot.legacy_write_calls, 0);
+    check_ulong("wi231.rollback_fail.final", slot.value,
+                request.native_bridge_target);
     wi231_trace("writer-rollback-fail-fail-open", &slot, &route);
 }
 

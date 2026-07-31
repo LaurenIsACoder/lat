@@ -71,6 +71,16 @@ static int route_guest_target(const kzt_lazy_binding_pending_t *pending,
         result->final_value = fixture->competing_target;
         fixture->slot = fixture->competing_target;
         break;
+    case KZT_LAZY_BINDING_ROUTE_WRITE_ROLLED_BACK:
+        result->selected_target = guest_target;
+        result->final_value = guest_target;
+        fixture->slot = guest_target;
+        break;
+    case KZT_LAZY_BINDING_ROUTE_UNRECOVERABLE:
+        result->selected_target = fixture->competing_target;
+        result->final_value = fixture->competing_target;
+        fixture->slot = fixture->competing_target;
+        break;
     case KZT_LAZY_BINDING_ROUTE_GUEST_PRESERVED:
     case KZT_LAZY_BINDING_ROUTE_ERROR:
         result->selected_target = guest_target;
@@ -191,6 +201,49 @@ static void test_expected_target_mismatch_preserves_competitor_without_retry(voi
     CHECK("race.report-final", result.slot_after == f.competing_target);
     CHECK("race.one-route", f.route_calls == 1);
     CHECK("race.consumed", result.pending_armed == 0);
+}
+
+static void test_transaction_failure_statuses_are_not_guest_preserved(void)
+{
+    const struct {
+        kzt_lazy_binding_route_status_t route_status;
+        kzt_lazy_binding_status_t status;
+        kzt_lazy_binding_reason_t reason;
+        uintptr_t final_value;
+    } cases[] = {
+        {
+            KZT_LAZY_BINDING_ROUTE_WRITE_ROLLED_BACK,
+            KZT_LAZY_BINDING_WRITE_ROLLED_BACK,
+            KZT_LAZY_BINDING_REASON_WRITE_ROLLED_BACK,
+            0,
+        },
+        {
+            KZT_LAZY_BINDING_ROUTE_UNRECOVERABLE,
+            KZT_LAZY_BINDING_UNRECOVERABLE,
+            KZT_LAZY_BINDING_REASON_UNRECOVERABLE,
+            1,
+        },
+    };
+    size_t i;
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        fixture_t f = fixture();
+        kzt_lazy_binding_begin_request_t request = begin_request_for(&f);
+        kzt_lazy_binding_ops_t ops = ops_for(&f);
+        kzt_lazy_binding_result_t result;
+        kzt_lazy_binding_pending_t pending;
+
+        begin_binding(&request, &pending, &result);
+        f.slot = f.guest_target;
+        f.route_status = cases[i].route_status;
+        CHECK("transaction-status.complete",
+              kzt_lazy_binding_complete(&pending, &ops, &result) == 0);
+        CHECK("transaction-status.status", result.status == cases[i].status);
+        CHECK("transaction-status.reason", result.reason == cases[i].reason);
+        CHECK("transaction-status.final",
+              result.slot_after == (cases[i].final_value ?
+                                    f.competing_target : f.guest_target));
+    }
 }
 
 static void test_missing_symbol_version_fails_open(void)
@@ -470,6 +523,7 @@ int main(void)
     test_first_call_hands_off_to_guest();
     test_post_bind_call_can_install_native_bridge();
     test_expected_target_mismatch_preserves_competitor_without_retry();
+    test_transaction_failure_statuses_are_not_guest_preserved();
     test_missing_symbol_version_fails_open();
     test_confirmed_unversioned_binding_can_apply();
     test_unknown_and_error_version_evidence_fail_open();

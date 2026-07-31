@@ -8,6 +8,7 @@ typedef struct kzt_jump_slot_route_slot_state {
     uintptr_t committed_value;
     int last_read_present;
     int write_succeeded;
+    int write_attempted;
     int cas_mismatch;
 } kzt_jump_slot_route_slot_state_t;
 
@@ -36,6 +37,7 @@ static int route_slot_write(uintptr_t slot_addr, uintptr_t value, void *opaque)
     }
     expected = state->write_succeeded ? state->committed_value :
                                         state->last_read;
+    state->write_attempted = 1;
     exchanged = state->ops->compare_exchange_slot(
         slot_addr, &expected, value, state->ops->opaque);
     if (exchanged > 0) {
@@ -102,14 +104,10 @@ static int route_owner_identity_matches(
            request->current_owner.generation == acquired_owner->generation;
 }
 
-static int route_legacy_fallback(
+static int route_decline_without_write(
     const kzt_jump_slot_route_input_t *input,
-    const kzt_jump_slot_route_ops_t *ops,
     kzt_jump_slot_route_result_t *result)
 {
-    uintptr_t expected = result->observed_value;
-    int exchanged;
-
     if (input->preserve_observed_on_failure) {
         result->status = KZT_JUMP_SLOT_ROUTE_GUEST_PRESERVED;
         result->selected_target = result->observed_value;
@@ -117,24 +115,54 @@ static int route_legacy_fallback(
         return 0;
     }
 
-    result->legacy_fallback_attempted = 1;
+    result->status = KZT_JUMP_SLOT_ROUTE_BYPASS;
     result->selected_target = input->request.legacy_target;
-    exchanged = ops->compare_exchange_slot(
-        input->request.slot_addr, &expected, input->request.legacy_target,
-        ops->opaque);
-    if (exchanged < 0) {
-        result->status = KZT_JUMP_SLOT_ROUTE_WRITE_ERROR;
-        result->final_value = expected;
-        return 0;
-    }
-    if (exchanged == 0) {
-        result->status = KZT_JUMP_SLOT_ROUTE_CAS_MISMATCH;
-        result->final_value = expected;
-        return 0;
-    }
-    result->status = KZT_JUMP_SLOT_ROUTE_LEGACY_APPLIED;
-    result->final_value = input->request.legacy_target;
+    result->final_value = result->observed_value;
     return 0;
+}
+
+kzt_jump_slot_route_caller_decision_t kzt_jump_slot_route_caller_decide(
+    int route_call_succeeded,
+    const kzt_jump_slot_route_result_t *result,
+    uintptr_t legacy_target,
+    int final_value_usable)
+{
+    kzt_jump_slot_route_caller_decision_t decision = {
+        .slot_action = KZT_JUMP_SLOT_ROUTE_SLOT_PRESERVE,
+        .call_target = legacy_target,
+        .slot_value_usable = 0,
+    };
+
+    if (!route_call_succeeded || !result) {
+        decision.slot_action = KZT_JUMP_SLOT_ROUTE_SLOT_LEGACY_WRITE;
+        return decision;
+    }
+
+    switch (result->status) {
+    case KZT_JUMP_SLOT_ROUTE_BYPASS:
+        decision.slot_action = KZT_JUMP_SLOT_ROUTE_SLOT_LEGACY_WRITE;
+        break;
+    case KZT_JUMP_SLOT_ROUTE_NATIVE_APPLIED:
+        if (final_value_usable) {
+            decision.slot_action = KZT_JUMP_SLOT_ROUTE_SLOT_ROUTE_APPLIED;
+            decision.call_target = result->final_value;
+            decision.slot_value_usable = 1;
+        }
+        break;
+    case KZT_JUMP_SLOT_ROUTE_GUEST_PRESERVED:
+    case KZT_JUMP_SLOT_ROUTE_CAS_MISMATCH:
+    case KZT_JUMP_SLOT_ROUTE_WRITE_ROLLED_BACK:
+    case KZT_JUMP_SLOT_ROUTE_UNRECOVERABLE:
+        if (final_value_usable) {
+            decision.call_target = result->final_value;
+            decision.slot_value_usable = 1;
+        }
+        break;
+    case KZT_JUMP_SLOT_ROUTE_WRITE_ERROR:
+    default:
+        break;
+    }
+    return decision;
 }
 
 int kzt_jump_slot_route_apply(const kzt_jump_slot_route_input_t *input,
@@ -164,7 +192,7 @@ int kzt_jump_slot_route_apply(const kzt_jump_slot_route_input_t *input,
     }
     if (ops->load_slot(input->request.slot_addr, &result->observed_value,
                        ops->opaque) != 0) {
-        return 0;
+        return -1;
     }
     if (input->request.slot_current_value_present &&
         result->observed_value != input->request.slot_current_value) {
@@ -180,9 +208,8 @@ int kzt_jump_slot_route_apply(const kzt_jump_slot_route_input_t *input,
     memset(&acquired_owner, 0, sizeof(acquired_owner));
     memset(&slot_state, 0, sizeof(slot_state));
 
-    if (input->resolved_target_matches_legacy &&
-        input->expected_guest_target_present &&
-        request.expected_guest_target && input->resolved_provider &&
+    if (input->expected_guest_target_present &&
+        request.expected_guest_target &&
         ops->enrich_base && ops->acquire_exact_provider &&
         ops->release_exact_provider && ops->enrich_bridge &&
         ops->try_native_writer &&
@@ -194,7 +221,9 @@ int kzt_jump_slot_route_apply(const kzt_jump_slot_route_input_t *input,
                                         ops->opaque) == 0) {
             acquired = 1;
             result->exact_provider_acquired = 1;
-            if (handle.library == input->resolved_provider) {
+            if (handle.library &&
+                (!input->resolved_provider ||
+                 handle.library == input->resolved_provider)) {
                 result->exact_provider_matched = 1;
                 if (ops->enrich_bridge(&request, handle.library,
                                        ops->opaque) == 0 &&
@@ -226,6 +255,30 @@ int kzt_jump_slot_route_apply(const kzt_jump_slot_route_input_t *input,
     if (acquired) {
         ops->release_exact_provider(&handle, ops->opaque);
     }
+    if (!result->native_writer_called &&
+        ops->preserve_guest_after_bridge_failure &&
+        ops->preserve_guest_after_bridge_failure(&result->final_value,
+                                                 ops->opaque) > 0) {
+        result->status = KZT_JUMP_SLOT_ROUTE_GUEST_PRESERVED;
+        result->selected_target = result->final_value;
+        return 0;
+    }
+    if (result->writer_status ==
+        KZT_JUMP_SLOT_ROUTE_WRITER_UNRECOVERABLE) {
+        result->status = KZT_JUMP_SLOT_ROUTE_UNRECOVERABLE;
+        result->selected_target = slot_state.last_read_present ?
+                                  slot_state.last_read : result->observed_value;
+        result->final_value = result->selected_target;
+        return 0;
+    }
+    if (result->writer_status ==
+        KZT_JUMP_SLOT_ROUTE_WRITER_ROLLED_BACK) {
+        result->status = KZT_JUMP_SLOT_ROUTE_WRITE_ROLLED_BACK;
+        result->selected_target = slot_state.last_read_present ?
+                                  slot_state.last_read : result->observed_value;
+        result->final_value = result->selected_target;
+        return 0;
+    }
     if (result->native_writer_called && slot_state.cas_mismatch) {
         result->status = KZT_JUMP_SLOT_ROUTE_CAS_MISMATCH;
         result->selected_target = slot_state.last_read;
@@ -238,6 +291,13 @@ int kzt_jump_slot_route_apply(const kzt_jump_slot_route_input_t *input,
         result->final_value = request.native_bridge_target;
         return 0;
     }
+    if (result->native_writer_called && slot_state.write_attempted) {
+        result->status = KZT_JUMP_SLOT_ROUTE_GUEST_PRESERVED;
+        result->selected_target = slot_state.last_read_present ?
+                                  slot_state.last_read : result->observed_value;
+        result->final_value = result->selected_target;
+        return 0;
+    }
     if (result->writer_status == KZT_JUMP_SLOT_ROUTE_WRITER_PRESERVE) {
         result->status = KZT_JUMP_SLOT_ROUTE_GUEST_PRESERVED;
         result->selected_target = slot_state.last_read_present ?
@@ -246,5 +306,5 @@ int kzt_jump_slot_route_apply(const kzt_jump_slot_route_input_t *input,
         return 0;
     }
 
-    return route_legacy_fallback(input, ops, result);
+    return route_decline_without_write(input, result);
 }

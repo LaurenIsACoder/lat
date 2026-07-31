@@ -47,6 +47,10 @@ static const char *kzt_lazy_diagnostic_status_name(
         return "NATIVE_APPLIED";
     case KZT_LAZY_BINDING_CAS_MISMATCH:
         return "CAS_MISMATCH";
+    case KZT_LAZY_BINDING_WRITE_ROLLED_BACK:
+        return "WRITE_ROLLED_BACK";
+    case KZT_LAZY_BINDING_UNRECOVERABLE:
+        return "UNRECOVERABLE";
     case KZT_LAZY_BINDING_ERROR:
         return "ERROR";
     case KZT_LAZY_BINDING_GUEST_PRESERVED:
@@ -97,6 +101,10 @@ static const char *kzt_lazy_diagnostic_reason_name(
         return "SLOT_READ_ERROR";
     case KZT_LAZY_BINDING_REASON_CAS_ERROR:
         return "CAS_ERROR";
+    case KZT_LAZY_BINDING_REASON_WRITE_ROLLED_BACK:
+        return "WRITE_ROLLED_BACK";
+    case KZT_LAZY_BINDING_REASON_UNRECOVERABLE:
+        return "UNRECOVERABLE";
     }
 
     return "UNKNOWN";

@@ -261,6 +261,12 @@ int kzt_patch_planner_decide(const kzt_patch_candidate_t *candidate,
             KZT_PATCH_REASON_INPUT_MALFORMED_SYMBOL_NAME);
     }
 
+    if (kzt_patch_symbol_must_stay_guest(candidate->symbol_name)) {
+        return kzt_patch_decision_set(decision,
+                                      KZT_PATCH_DECISION_REJECTED,
+                                      KZT_PATCH_REASON_POLICY_KEEP_GUEST);
+    }
+
     if (!kzt_symbol_version_evidence_valid(candidate->version_evidence,
                                            candidate->version)) {
         return kzt_patch_decision_set(

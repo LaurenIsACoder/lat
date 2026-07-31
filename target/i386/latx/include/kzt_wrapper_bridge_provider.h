@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "kzt_guest_library_binding.h"
 #include "kzt_wrapper_probe.h"
 
 typedef void (*kzt_wrapper_bridge_abi_wrapper_t)(uintptr_t fnc);
@@ -28,6 +29,7 @@ typedef struct kzt_wrapper_bridge_provider_match {
     int wrapper_provider_lifetime_bound;
     int native_owner_lifetime_bound;
     int bridge_owner_lifetime_bound;
+    const kzt_guest_library_handle_t *retained_provider_handle;
 } kzt_wrapper_bridge_provider_match_t;
 
 typedef int (*kzt_wrapper_bridge_provider_inspect_fn)(
