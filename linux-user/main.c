@@ -294,6 +294,11 @@ CPUArchState *cpu_copy(CPUArchState *env)
 
     new_cpu->tcg_cflags = cpu->tcg_cflags;
     memcpy(new_env, env, sizeof(CPUArchState));
+#if defined(CONFIG_LATX_KZT) && defined(TARGET_X86_64)
+    memset(&new_env->kzt_guest_dlerror_state, 0,
+           sizeof(new_env->kzt_guest_dlerror_state));
+    new_env->kzt_guest_dlerror_state.dlerror_slow_required = 0;
+#endif
 
     /*
      * NOTE: Current QEMU only has one and only one gdt_table ptr.

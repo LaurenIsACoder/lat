@@ -96,6 +96,7 @@ struct elfheader_s {
     library_t   *lib;
     needed_libs_t *neededlibs;
     uintptr_t self_link_map;
+    uintptr_t kzt_guest_resolver;
     FILE*       file;
     int         fileno;
     int         had_RelocateElfPlt;

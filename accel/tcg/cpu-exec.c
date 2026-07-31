@@ -31,10 +31,12 @@
 #include "qemu/rcu.h"
 #include "exec/tb-hash.h"
 #include "exec/tb-lookup.h"
+#include "exec/tb-context.h"
 #include "exec/log.h"
 #include "qemu/main-loop.h"
 #if defined(CONFIG_LATX_KZT)
 #include "qemu.h"
+#include "elfloader.h"
 #include "elfloader_private.h"
 #include "box64context.h"
 #include "librarian.h"
@@ -43,6 +45,7 @@
 #include "library.h"
 #include "fileutils.h"
 #include "bridge_private.h"
+#include "exec/fasttb.h"
 void *getAlternate(void *addr);
 extern const char *interp_prefix;
 extern struct elfheader_s * elf_header;
@@ -723,6 +726,424 @@ inline void tb_add_jump(TranslationBlock *tb, int n,
 #include "tu.h"
 #endif
 
+#if defined(CONFIG_LATX_KZT)
+void kzt_tb_pin_prebind_bridge(CPUState *cpu, target_ulong pc);
+bool kzt_tb_prebind_target_is_prepared(CPUState *cpu, target_ulong pc);
+void kzt_tb_prebind_guest_note_prepared(CPUState *cpu, target_ulong pc);
+void kzt_tb_steady_diagnostics_note_guest_prepare(
+    CPUState *cpu, target_ulong pc);
+void kzt_tb_steady_diagnostics_snapshot_fast_cache(CPUState *cpu);
+void kzt_tb_steady_diagnostics_report(void);
+
+static int kzt_pinned_bridge_diagnostics = -1;
+
+#define KZT_STEADY_GUEST_PREPARED_MAX 8
+
+typedef struct KztSteadyTbDiagnostics {
+    int enabled;
+    int reported;
+    uint64_t pin;
+    uint64_t pin_replace;
+    uint64_t pinned_hit;
+    uint64_t pinned_miss;
+    uint64_t pinned_restore;
+    uint64_t empty_miss;
+    uint64_t collision_miss;
+    uint64_t flags_miss;
+    uint64_t generation_miss;
+    uint64_t invalid_miss;
+    uint64_t store;
+    uint64_t store_reject;
+    uint64_t translate;
+    uint64_t bridge_translate;
+    uint64_t guest_hit;
+    uint64_t guest_retranslate;
+    uint64_t guest_prepared_dropped;
+    target_ulong last_pin_pc;
+    target_ulong last_replaced_pc;
+    target_ulong last_miss_pc;
+    target_ulong fast_cache_pc;
+    target_ulong jmp_cache_pc;
+    const void *fast_cache_ptr;
+    unsigned int fast_cache_hash;
+    int fast_cache_snapshot_valid;
+    target_ulong guest_prepared[KZT_STEADY_GUEST_PREPARED_MAX];
+    unsigned int guest_prepared_count;
+} KztSteadyTbDiagnostics;
+
+static KztSteadyTbDiagnostics kzt_steady_tb_diagnostics = {
+    .enabled = -1,
+};
+
+static bool kzt_steady_tb_diagnostics_enabled(void)
+{
+    int enabled = qatomic_read(&kzt_steady_tb_diagnostics.enabled);
+
+    if (unlikely(enabled < 0)) {
+        int configured = getenv("LATX_KZT_STEADY_DIAGNOSTICS") ? 1 : 0;
+
+        enabled = qatomic_cmpxchg(
+            &kzt_steady_tb_diagnostics.enabled, -1, configured);
+        if (enabled < 0) {
+            enabled = configured;
+        }
+    }
+    return enabled != 0;
+}
+
+static bool kzt_steady_tb_guest_prepared(target_ulong pc)
+{
+    unsigned int i;
+    unsigned int count = qatomic_read(
+        &kzt_steady_tb_diagnostics.guest_prepared_count);
+
+    for (i = 0; i < count; i++) {
+        if (qatomic_read(&kzt_steady_tb_diagnostics.guest_prepared[i]) == pc) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void kzt_tb_steady_diagnostics_note_guest_prepare(
+    CPUState *cpu, target_ulong pc)
+{
+    unsigned int i;
+    unsigned int count;
+
+    (void)cpu;
+    if (!pc || !kzt_steady_tb_diagnostics_enabled()) {
+        return;
+    }
+    count = qatomic_read(&kzt_steady_tb_diagnostics.guest_prepared_count);
+    for (i = 0; i < count; i++) {
+        if (qatomic_read(&kzt_steady_tb_diagnostics.guest_prepared[i]) == pc) {
+            return;
+        }
+    }
+    if (count >= KZT_STEADY_GUEST_PREPARED_MAX) {
+        qatomic_inc(&kzt_steady_tb_diagnostics.guest_prepared_dropped);
+        return;
+    }
+    qatomic_set(&kzt_steady_tb_diagnostics.guest_prepared[count], pc);
+    qatomic_set(&kzt_steady_tb_diagnostics.guest_prepared_count, count + 1);
+}
+
+void kzt_tb_steady_diagnostics_snapshot_fast_cache(CPUState *cpu)
+{
+    CPUX86State *env;
+    FastTB *fast_cache;
+    TranslationBlock *jmp_cache_tb;
+    target_ulong pinned_pc;
+    unsigned int hash;
+
+    if (!cpu || !kzt_steady_tb_diagnostics_enabled() ||
+        !(env = cpu->env_ptr) || !(fast_cache = env->tb_jmp_cache_ptr) ||
+        !(pinned_pc = qatomic_read(
+              &kzt_steady_tb_diagnostics.last_pin_pc))) {
+        return;
+    }
+    hash = tb_jmp_cache_hash_func(pinned_pc);
+    jmp_cache_tb = qatomic_read(&cpu->tb_jmp_cache[hash]);
+    qatomic_set(&kzt_steady_tb_diagnostics.fast_cache_hash, hash);
+    qatomic_set(&kzt_steady_tb_diagnostics.fast_cache_pc,
+                qatomic_read(&fast_cache[hash].pc));
+    qatomic_set(&kzt_steady_tb_diagnostics.fast_cache_ptr,
+                qatomic_read(&fast_cache[hash].ptr));
+    qatomic_set(&kzt_steady_tb_diagnostics.jmp_cache_pc,
+                jmp_cache_tb ? jmp_cache_tb->pc : 0);
+    qatomic_set(&kzt_steady_tb_diagnostics.fast_cache_snapshot_valid, 1);
+}
+
+void kzt_tb_steady_diagnostics_report(void)
+{
+    CPUState *cpu = first_cpu;
+    target_ulong pinned_pc = qatomic_read(
+        &kzt_steady_tb_diagnostics.last_pin_pc);
+    unsigned int fast_cache_hash = qatomic_read(
+        &kzt_steady_tb_diagnostics.fast_cache_hash);
+    target_ulong fast_cache_pc = qatomic_read(
+        &kzt_steady_tb_diagnostics.fast_cache_pc);
+    const void *fast_cache_ptr = qatomic_read(
+        &kzt_steady_tb_diagnostics.fast_cache_ptr);
+    target_ulong jmp_cache_pc = qatomic_read(
+        &kzt_steady_tb_diagnostics.jmp_cache_pc);
+    int fast_cache_snapshot_valid = qatomic_read(
+        &kzt_steady_tb_diagnostics.fast_cache_snapshot_valid);
+
+    if (!kzt_steady_tb_diagnostics_enabled() ||
+        qatomic_cmpxchg(&kzt_steady_tb_diagnostics.reported, 0, 1) != 0) {
+        return;
+    }
+    fprintf(stderr,
+            "kzt_steady_tb_summary schema=1 pin=%lu pin_replace=%lu "
+            "pinned_hit=%lu pinned_miss=%lu pinned_restore=%lu "
+            "empty_miss=%lu "
+            "collision_miss=%lu flags_miss=%lu generation_miss=%lu "
+            "invalid_miss=%lu store=%lu store_reject=%lu translate=%lu "
+            "bridge_translate=%lu guest_prepared=%u guest_hit=%lu "
+            "guest_retranslate=%lu guest_prepared_dropped=%lu "
+            "flush_generation=%u tb_flush_count=%u "
+            "tb_invalidate_count=%zu last_pin_pc=0x%lx "
+            "last_replaced_pc=0x%lx last_miss_pc=0x%lx "
+            "fast_cache_hash=%u fast_cache_pc=0x%lx fast_cache_ptr=%p "
+            "fast_cache_snapshot_valid=%d fast_cache_matches_pin=%d "
+            "jmp_cache_pc=0x%lx "
+            "slot0_pc=0x%lx slot1_pc=0x%lx slot2_pc=0x%lx "
+            "slot3_pc=0x%lx\n",
+            (unsigned long)qatomic_read(&kzt_steady_tb_diagnostics.pin),
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.pin_replace),
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.pinned_hit),
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.pinned_miss),
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.pinned_restore),
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.empty_miss),
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.collision_miss),
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.flags_miss),
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.generation_miss),
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.invalid_miss),
+            (unsigned long)qatomic_read(&kzt_steady_tb_diagnostics.store),
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.store_reject),
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.translate),
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.bridge_translate),
+            qatomic_read(&kzt_steady_tb_diagnostics.guest_prepared_count),
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.guest_hit),
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.guest_retranslate),
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.guest_prepared_dropped),
+            cpu ? cpu->kzt_pinned_bridge_flush_generation : 0,
+            qatomic_read(&tb_ctx.tb_flush_count),
+            tcg_tb_phys_invalidate_count(),
+            (unsigned long)pinned_pc,
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.last_replaced_pc),
+            (unsigned long)qatomic_read(
+                &kzt_steady_tb_diagnostics.last_miss_pc),
+            fast_cache_hash, (unsigned long)fast_cache_pc, fast_cache_ptr,
+            fast_cache_snapshot_valid,
+            fast_cache_snapshot_valid && fast_cache_pc == pinned_pc,
+            (unsigned long)jmp_cache_pc,
+            (unsigned long)(cpu ? cpu->kzt_pinned_bridge_cache[0].pc : 0),
+            (unsigned long)(cpu ? cpu->kzt_pinned_bridge_cache[1].pc : 0),
+            (unsigned long)(cpu ? cpu->kzt_pinned_bridge_cache[2].pc : 0),
+            (unsigned long)(cpu ? cpu->kzt_pinned_bridge_cache[3].pc : 0));
+}
+
+static unsigned int kzt_pinned_bridge_index(target_ulong pc)
+{
+    return (unsigned int)((pc >> 5) & 3);
+}
+
+static unsigned int kzt_prebind_prepared_guest_index(target_ulong pc)
+{
+    return (unsigned int)((pc >> 4) & 7);
+}
+
+bool kzt_tb_prebind_target_is_prepared(CPUState *cpu, target_ulong pc)
+{
+    unsigned int index;
+
+    if (!cpu || !pc) {
+        return false;
+    }
+    if (pc > reserved_va) {
+        TranslationBlock *tb;
+
+        index = kzt_pinned_bridge_index(pc);
+        tb = qatomic_read(&cpu->kzt_pinned_bridge_cache[index].tb);
+        return cpu->kzt_pinned_bridge_cache[index].pc == pc &&
+               cpu->kzt_pinned_bridge_cache[index].flush_generation ==
+                   cpu->kzt_pinned_bridge_flush_generation &&
+               tb && !(tb->cflags & CF_INVALID);
+    }
+    index = kzt_prebind_prepared_guest_index(pc);
+    return cpu->kzt_prebind_prepared_guest[index].pc == pc &&
+           cpu->kzt_prebind_prepared_guest[index].flush_generation ==
+               cpu->kzt_pinned_bridge_flush_generation;
+}
+
+void kzt_tb_prebind_guest_note_prepared(CPUState *cpu, target_ulong pc)
+{
+    unsigned int index;
+
+    if (!cpu || !pc || pc > reserved_va) {
+        return;
+    }
+    index = kzt_prebind_prepared_guest_index(pc);
+    cpu->kzt_prebind_prepared_guest[index].pc = pc;
+    cpu->kzt_prebind_prepared_guest[index].flush_generation =
+        cpu->kzt_pinned_bridge_flush_generation;
+}
+
+static void kzt_pinned_bridge_restore_jmp_cache(
+    CPUState *cpu, TranslationBlock *tb)
+{
+    unsigned int hash;
+
+    if (!cpu || !tb) {
+        return;
+    }
+    hash = tb_jmp_cache_hash_func(tb->pc);
+#ifdef CONFIG_LATX_FAST_JMPCACHE
+    latx_fast_jmp_cache_add(cpu, hash, tb);
+#endif
+    qatomic_set(&cpu->tb_jmp_cache[hash], tb);
+    if (unlikely(kzt_steady_tb_diagnostics_enabled())) {
+        qatomic_inc(&kzt_steady_tb_diagnostics.pinned_restore);
+    }
+}
+
+static bool kzt_pinned_bridge_diagnostics_enabled(void)
+{
+    int enabled = qatomic_read(&kzt_pinned_bridge_diagnostics);
+
+    if (unlikely(enabled < 0)) {
+        enabled = getenv("LATX_KZT_PINNED_BRIDGE_DIAGNOSTICS") ? 1 : 0;
+        qatomic_set(&kzt_pinned_bridge_diagnostics, enabled);
+    }
+    return enabled;
+}
+
+static void kzt_pinned_bridge_report(const char *event, CPUState *cpu,
+                                     target_ulong pc, uint32_t flags,
+                                     uint32_t cflags, TranslationBlock *tb)
+{
+    if (!kzt_pinned_bridge_diagnostics_enabled()) {
+        return;
+    }
+    fprintf(stderr,
+            "kzt_pinned_bridge schema=1 event=%s cpu=%p pc=0x%lx "
+            "flags=0x%x cflags=0x%x generation=%u tb=%p\n",
+            event, cpu, (unsigned long)pc, flags, cflags,
+            cpu->kzt_pinned_bridge_flush_generation, tb);
+}
+
+static TranslationBlock *kzt_pinned_bridge_lookup(
+    CPUState *cpu, target_ulong pc, uint32_t flags, uint32_t cflags)
+{
+    unsigned int index;
+    TranslationBlock *tb;
+    bool steady_diagnostics;
+
+    if (!cpu || !pc || pc <= reserved_va) {
+        return NULL;
+    }
+    steady_diagnostics = unlikely(kzt_steady_tb_diagnostics_enabled());
+    index = kzt_pinned_bridge_index(pc);
+    if (cpu->kzt_pinned_bridge_cache[index].pc != pc ||
+        cpu->kzt_pinned_bridge_cache[index].flags != flags ||
+        cpu->kzt_pinned_bridge_cache[index].cflags != cflags ||
+        cpu->kzt_pinned_bridge_cache[index].flush_generation !=
+            cpu->kzt_pinned_bridge_flush_generation) {
+        if (steady_diagnostics) {
+            qatomic_inc(&kzt_steady_tb_diagnostics.pinned_miss);
+            qatomic_set(&kzt_steady_tb_diagnostics.last_miss_pc, pc);
+            if (!cpu->kzt_pinned_bridge_cache[index].pc) {
+                qatomic_inc(&kzt_steady_tb_diagnostics.empty_miss);
+            } else if (cpu->kzt_pinned_bridge_cache[index].pc != pc) {
+                qatomic_inc(&kzt_steady_tb_diagnostics.collision_miss);
+            } else if (cpu->kzt_pinned_bridge_cache[index].flush_generation !=
+                       cpu->kzt_pinned_bridge_flush_generation) {
+                qatomic_inc(&kzt_steady_tb_diagnostics.generation_miss);
+            } else {
+                qatomic_inc(&kzt_steady_tb_diagnostics.flags_miss);
+            }
+        }
+        if (cpu->kzt_pinned_bridge_cache[index].pc) {
+            kzt_pinned_bridge_report("miss", cpu, pc, flags, cflags, NULL);
+        }
+        return NULL;
+    }
+    tb = qatomic_read(&cpu->kzt_pinned_bridge_cache[index].tb);
+    if (tb && !(tb->cflags & CF_INVALID)) {
+        kzt_pinned_bridge_restore_jmp_cache(cpu, tb);
+        if (steady_diagnostics) {
+            qatomic_inc(&kzt_steady_tb_diagnostics.pinned_hit);
+        }
+        kzt_pinned_bridge_report("hit", cpu, pc, flags, cflags, tb);
+        return tb;
+    }
+    if (steady_diagnostics) {
+        qatomic_inc(&kzt_steady_tb_diagnostics.pinned_miss);
+        qatomic_inc(tb ? &kzt_steady_tb_diagnostics.invalid_miss :
+                         &kzt_steady_tb_diagnostics.empty_miss);
+        qatomic_set(&kzt_steady_tb_diagnostics.last_miss_pc, pc);
+    }
+    kzt_pinned_bridge_report("miss", cpu, pc, flags, cflags, NULL);
+    return NULL;
+}
+
+static void kzt_pinned_bridge_store(CPUState *cpu, TranslationBlock *tb)
+{
+    unsigned int index;
+
+    if (!cpu || !tb || !tb->pc || tb->pc <= reserved_va) {
+        return;
+    }
+    index = kzt_pinned_bridge_index(tb->pc);
+    if (cpu->kzt_pinned_bridge_cache[index].pc != tb->pc ||
+        cpu->kzt_pinned_bridge_cache[index].flush_generation !=
+            cpu->kzt_pinned_bridge_flush_generation) {
+        if (unlikely(kzt_steady_tb_diagnostics_enabled())) {
+            qatomic_inc(&kzt_steady_tb_diagnostics.store_reject);
+        }
+        return;
+    }
+    cpu->kzt_pinned_bridge_cache[index].flags = tb->flags;
+    cpu->kzt_pinned_bridge_cache[index].cflags = tb_cflags(tb);
+    qatomic_set(&cpu->kzt_pinned_bridge_cache[index].tb, tb);
+    if (unlikely(kzt_steady_tb_diagnostics_enabled())) {
+        qatomic_inc(&kzt_steady_tb_diagnostics.store);
+    }
+    kzt_pinned_bridge_report("store", cpu, tb->pc, tb->flags,
+                             tb_cflags(tb), tb);
+}
+
+void kzt_tb_pin_prebind_bridge(CPUState *cpu, target_ulong pc)
+{
+    unsigned int index;
+
+    if (!cpu || !pc || pc <= reserved_va) {
+        return;
+    }
+    index = kzt_pinned_bridge_index(pc);
+    if (kzt_tb_prebind_target_is_prepared(cpu, pc)) {
+        return;
+    }
+    if (unlikely(kzt_steady_tb_diagnostics_enabled())) {
+        target_ulong replaced = cpu->kzt_pinned_bridge_cache[index].pc;
+
+        qatomic_inc(&kzt_steady_tb_diagnostics.pin);
+        qatomic_set(&kzt_steady_tb_diagnostics.last_pin_pc, pc);
+        if (replaced && replaced != pc) {
+            qatomic_inc(&kzt_steady_tb_diagnostics.pin_replace);
+            qatomic_set(&kzt_steady_tb_diagnostics.last_replaced_pc,
+                        replaced);
+        }
+    }
+    qatomic_set(&cpu->kzt_pinned_bridge_cache[index].tb, NULL);
+    cpu->kzt_pinned_bridge_cache[index].pc = pc;
+    cpu->kzt_pinned_bridge_cache[index].flags = 0;
+    cpu->kzt_pinned_bridge_cache[index].cflags = 0;
+    cpu->kzt_pinned_bridge_cache[index].flush_generation =
+        cpu->kzt_pinned_bridge_flush_generation;
+    kzt_pinned_bridge_report("pin", cpu, pc, 0, 0, NULL);
+}
+#endif
+
 static inline TranslationBlock *tb_find(CPUState *cpu,
                                         TranslationBlock *last_tb,
                                         int tb_exit, uint32_t cflags)
@@ -731,10 +1152,36 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
     TranslationBlock *tb;
     target_ulong cs_base, pc;
     uint32_t flags;
+#if defined(CONFIG_LATX_KZT)
+    bool kzt_steady_diagnostics;
+    bool kzt_guest_prepared;
+#endif
 
     cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
 
+#if defined(CONFIG_LATX_KZT)
+    if (unlikely(pc > reserved_va &&
+                 KztPltResolverDispatch(env, pc))) {
+        last_tb = NULL;
+        cpu_get_tb_cpu_state(env, &pc, &cs_base, &flags);
+    }
+#endif
+
+#if defined(CONFIG_LATX_KZT)
+    kzt_steady_diagnostics = unlikely(kzt_steady_tb_diagnostics_enabled());
+    kzt_guest_prepared = kzt_steady_diagnostics && pc <= reserved_va &&
+                         kzt_steady_tb_guest_prepared(pc);
+    tb = kzt_pinned_bridge_lookup(cpu, pc, flags, cflags);
+    if (!tb) {
+        tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
+    }
+    if (kzt_guest_prepared) {
+        qatomic_inc(tb ? &kzt_steady_tb_diagnostics.guest_hit :
+                         &kzt_steady_tb_diagnostics.guest_retranslate);
+    }
+#else
     tb = tb_lookup(cpu, pc, cs_base, flags, cflags);
+#endif
 #ifdef CONFIG_LATX_AOT
     if (tb == NULL && option_aot) {
         mmap_lock();
@@ -745,6 +1192,14 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
     }
 #endif
     if (tb == NULL) {
+#if defined(CONFIG_LATX_KZT)
+        if (kzt_steady_diagnostics) {
+            qatomic_inc(&kzt_steady_tb_diagnostics.translate);
+            if (pc > reserved_va) {
+                qatomic_inc(&kzt_steady_tb_diagnostics.bridge_translate);
+            }
+        }
+#endif
 #if (defined CONFIG_LATX_AOT) && (defined CONFIG_LATX_DEBUG)
         if (option_debug_aot && option_load_aot) {
             static long long cnt;
@@ -759,6 +1214,9 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
 #endif
 
     tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
+#if defined(CONFIG_LATX_KZT)
+    kzt_pinned_bridge_store(cpu, tb);
+#endif
     jrra_pre_translate((void **)&tb, 1, cpu, flags, cflags);
 #ifdef CONFIG_LATX_PERF
     latx_timer_stop(TIMER_TS);

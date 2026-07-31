@@ -98,6 +98,7 @@ extern void my_cfree(void* m);
 extern void my_free(void* m);
 extern void my___free(void* m);
 extern void my_realloc(void* m, void *old, uintptr_t len);
+extern char *my_dlerror(void);
 extern void* x86free;
 extern void* x86realloc;
 static void kzt_helper_ptr(ADDR func, IR2_OPND ptr)
@@ -149,6 +150,37 @@ void kzt_wrapper_to_native(void)
     /* load &HASH_JMP_CACHE[0] */
     IR2_OPND jmp_cache_addr = ra_alloc_static0();
     la_ld_d(jmp_cache_addr, env_ir2_opnd, lsenv_offset_of_tb_jmp_cache_ptr(lsenv));
+}
+
+static void do_translate_dlerror_brick_tb(onebridge_t *bridge)
+{
+    const int fast_result_offset = offsetof(
+        CPUX86State, kzt_guest_dlerror_state.dlerror_fast_result);
+    IR2_OPND esp_ir2_opnd = ra_alloc_gpr(esp_index);
+    IR2_OPND fast_result = ra_alloc_itemp();
+    IR2_OPND slow_path = ra_alloc_label();
+    IR2_OPND finish = ra_alloc_label();
+
+    lsassert(fast_result_offset >= -2048 && fast_result_offset <= 2047);
+    kzt_native_to_wrapper();
+    la_ld_d(fast_result, env_ir2_opnd, fast_result_offset);
+    la_bne(fast_result, zero_ir2_opnd, slow_path);
+    la_st_d(zero_ir2_opnd, env_ir2_opnd,
+            lsenv_offset_of_gpr(lsenv, R_EAX));
+    la_b(finish);
+
+    la_label(slow_path);
+    wrapper_gpr_trans((ADDR)bridge->f);
+    tr_set_running_of_cs(false);
+    li_d(ra_ir2_opnd, (ADDR)bridge->w);
+    la_jirl(ra_ir2_opnd, ra_ir2_opnd, 0);
+    tr_set_running_of_cs(true);
+
+    la_label(finish);
+    ra_free_temp(fast_result);
+    kzt_wrapper_to_native();
+    gen_set_next_tb_code(&esp_ir2_opnd);
+    tr_generate_exit_tb_for_bridge();
 }
 
 static void do_translate_realloc_brick_tb(void)
@@ -212,6 +244,9 @@ static void do_translate_brick_tb(onebridge_t *bridge, struct cpu_state_info *st
         return;
     } else if (bridge->f == (uintptr_t)my_realloc) {
         do_translate_realloc_brick_tb();
+        return;
+    } else if (bridge->f == (uintptr_t)my_dlerror) {
+        do_translate_dlerror_brick_tb(bridge);
         return;
     }
     kzt_native_to_wrapper();

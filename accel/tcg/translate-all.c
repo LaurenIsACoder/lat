@@ -81,6 +81,21 @@
 #include "ts.h"
 #include "latx-smc.h"
 #endif
+#if defined(CONFIG_LATX_KZT)
+extern uintptr_t KztPltResolverBridge(void);
+extern uintptr_t kzt_lazy_target_bridge_pc;
+
+static uint64_t kzt_lazy_bridge_tb_gen_timing_now(void)
+{
+    struct timespec value;
+
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &value) != 0) {
+        return 0;
+    }
+    return (uint64_t)value.tv_sec * 1000000000ULL +
+           (uint64_t)value.tv_nsec;
+}
+#endif
 #ifdef CONFIG_LATX_FAST_JMPCACHE
 #include "exec/fasttb.h"
 #endif
@@ -2016,6 +2031,32 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     int64_t ti;
 #endif
     void *host_pc;
+#if defined(CONFIG_LATX_KZT)
+    const char *kzt_lazy_bridge_role = NULL;
+    uint64_t kzt_lazy_bridge_tb_gen_start = 0;
+    int kzt_lazy_diagnostics_enabled =
+        unlikely(option_kzt_lazy_diagnostics);
+    uintptr_t kzt_lazy_target_snapshot = kzt_lazy_diagnostics_enabled
+        ? __atomic_load_n(
+            &kzt_lazy_target_bridge_pc, __ATOMIC_ACQUIRE)
+        : 0;
+    uintptr_t kzt_plt_resolver_bridge = kzt_lazy_diagnostics_enabled
+        ? KztPltResolverBridge()
+        : 0;
+
+    if (kzt_lazy_diagnostics_enabled && kzt_plt_resolver_bridge &&
+        pc == kzt_plt_resolver_bridge) {
+        kzt_lazy_bridge_role = "resolver";
+    } else if (kzt_lazy_diagnostics_enabled &&
+               kzt_lazy_target_snapshot &&
+               pc == kzt_lazy_target_snapshot) {
+        kzt_lazy_bridge_role = "target";
+    }
+    if (kzt_lazy_bridge_role) {
+        kzt_lazy_bridge_tb_gen_start =
+            kzt_lazy_bridge_tb_gen_timing_now();
+    }
+#endif
 
     assert_memory_lock();
     qemu_thread_jit_write();
@@ -2441,6 +2482,21 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
         tcg_tb_remove(tb);
         return existing_tb;
     }
+#if defined(CONFIG_LATX_KZT)
+    if (kzt_lazy_bridge_role) {
+        uint64_t timing_done = kzt_lazy_bridge_tb_gen_timing_now();
+
+        fprintf(
+            stderr,
+            "kzt_lazy_bridge_tb_gen_timing schema=1 "
+            "role=%s pc=0x%lx total_ns=%lu\n",
+            kzt_lazy_bridge_role, (unsigned long)pc,
+            (unsigned long)(
+                timing_done >= kzt_lazy_bridge_tb_gen_start
+                    ? timing_done - kzt_lazy_bridge_tb_gen_start
+                    : 0));
+    }
+#endif
     return tb;
 }
 

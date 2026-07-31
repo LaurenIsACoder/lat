@@ -36,8 +36,17 @@ extern void __gcov_dump(void);
 #include "latx-perf.h"
 #endif
 
+#ifdef CONFIG_LATX_KZT
+void kzt_tb_steady_diagnostics_report(void);
+void kzt_lifecycle_diagnostics_report(void);
+#endif
+
 void preexit_cleanup(CPUArchState *env, int code)
 {
+#ifdef CONFIG_LATX_KZT
+    kzt_lifecycle_diagnostics_report();
+    kzt_tb_steady_diagnostics_report();
+#endif
 #ifdef CONFIG_LATX_PERF
     latx_timer_stop(TIMER_PROCESS);
 #endif

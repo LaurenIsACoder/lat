@@ -9,8 +9,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 #include <dlfcn.h>
 #include <sys/mman.h>
+#include <time.h>
 
 #include "box64context.h"
 #include "debug.h"
@@ -19,17 +21,71 @@
 #include "librarian.h"
 #include "library.h"
 #include "wrapper.h"
+#include "kzt_guest_dl_api.h"
 #ifdef CONFIG_LATX_KZT
 #include "kzt_guest_registry.h"
 #include "kzt_guest_registry_context.h"
 #include "kzt_guest_library_binding.h"
+#include "kzt_lazy_prebind_scope.h"
 #endif
 #include <pthread.h>
+
+#ifdef CONFIG_LATX_KZT
+static uint64_t kzt_context_init_timing_now(void)
+{
+    struct timespec value;
+
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &value) != 0) {
+        return 0;
+    }
+    return (uint64_t)value.tv_sec * 1000000000ULL +
+           (uint64_t)value.tv_nsec;
+}
+
+static uint64_t kzt_context_init_timing_delta(uint64_t start, uint64_t end)
+{
+    return start && end >= start ? end - start : 0;
+}
+#endif
+
+dlprivate_t *NewDLPrivate(void)
+{
+    dlprivate_t *dl = box_calloc(1, sizeof(*dl));
+
+    if (dl) {
+        dl->legacy_error.dlerror_slow_required = 1;
+    }
+    if (dl && kzt_guest_dl_api_entry_state_init(dl) != 0) {
+        box_free(dl);
+        return NULL;
+    }
+    return dl;
+}
+
+void FreeDLPrivate(dlprivate_t **dl)
+{
+    if (!dl || !*dl) {
+        return;
+    }
+    kzt_guest_dl_api_entry_state_destroy(*dl);
+    kzt_guest_dl_api_free_errors(&(*dl)->legacy_error);
+    box_free(*dl);
+    *dl = NULL;
+}
 
 box64context_t *NewBox64Context(int argc)
 {
 #ifdef CONFIG_LATX_KZT
     kzt_patch_spike_config_t patch_spike_config;
+    uint64_t timing_start = 0;
+    uint64_t timing_base = 0;
+    uint64_t timing_access = 0;
+    uint64_t timing_guard = 0;
+    int timing_enabled = kzt_registry_diagnostics_enabled();
+
+    if (timing_enabled) {
+        timing_start = kzt_context_init_timing_now();
+    }
 #endif
     // init and put default values
     box64context_t *context = (box64context_t*)box_calloc(1, sizeof(box64context_t));
@@ -47,13 +103,31 @@ box64context_t *NewBox64Context(int argc)
     context->argv = (char**)box_calloc(context->argc+1, sizeof(char*));
     pthread_mutex_init(&context->mutex_lock, NULL);
 #ifdef CONFIG_LATX_KZT
+    if (timing_enabled) {
+        timing_base = kzt_context_init_timing_now();
+    }
     /* Optional acceleration metadata is created on first KZT use so a
      * context that never observes a guest link-map keeps the old footprint. */
-    pthread_mutex_init(&context->kzt_bridge_mutex, NULL);
     (void)kzt_guest_library_access_init(&context->kzt_guest_library_access);
+    context->kzt_lazy_prebind_scope = kzt_lazy_prebind_scope_init();
+    if (timing_enabled) {
+        timing_access = kzt_context_init_timing_now();
+    }
     kzt_patch_spike_config_from_options(&patch_spike_config);
     kzt_patch_spike_guard_init(&context->kzt_patch_spike_guard,
                                &patch_spike_config);
+    if (timing_enabled) {
+        timing_guard = kzt_context_init_timing_now();
+        fprintf(
+            stderr,
+            "kzt_context_init_timing schema=1 base_ns=%" PRIu64 " "
+            "library_access_ns=%" PRIu64 " patch_guard_ns=%" PRIu64 " "
+            "total_ns=%" PRIu64 "\n",
+            kzt_context_init_timing_delta(timing_start, timing_base),
+            kzt_context_init_timing_delta(timing_base, timing_access),
+            kzt_context_init_timing_delta(timing_access, timing_guard),
+            kzt_context_init_timing_delta(timing_start, timing_guard));
+    }
 #endif
 
     return context;
@@ -84,6 +158,12 @@ int KztGuestLibraryLookupForContext(
                      &context->kzt_guest_library_access, key, handle)
                : -1;
 }
+
+kzt_lazy_prebind_scope_t *KztLazyPrebindScopeForContext(
+    box64context_t *context)
+{
+    return context ? context->kzt_lazy_prebind_scope : NULL;
+}
 #endif
 
 kzt_patch_spike_guard_t *KztPatchSpikeGuardForContext(box64context_t *context)
@@ -107,6 +187,8 @@ void FreeBox64Context(box64context_t** context)
 
     box64context_t* ctx = *context;   // local copy to do the cleanning
 
+    kzt_guest_dl_api_entry_state_destroy(ctx->dlprivate);
+
 #ifdef CONFIG_LATX_KZT
     /* FreeBox64Context is entered only after guest execution and loader
      * callbacks have stopped. Close the context-owned lookup gate first and
@@ -122,9 +204,9 @@ void FreeBox64Context(box64context_t** context)
         FreeLibrarian(&ctx->maplib);
 #ifdef CONFIG_LATX_KZT
     kzt_guest_library_access_destroy(&ctx->kzt_guest_library_access);
+    kzt_lazy_prebind_scope_destroy(&ctx->kzt_lazy_prebind_scope);
     kzt_guest_registry_context_destroy(&ctx->kzt_guest_registry_context,
                                        &ctx->mutex_lock);
-    pthread_mutex_destroy(&ctx->kzt_bridge_mutex);
 #endif
     FreeDictionnary(&ctx->versym);
 
@@ -163,11 +245,12 @@ void FreeBox64Context(box64context_t** context)
     box_free(ctx->box64path);
 
     FreeBridge(&ctx->system);
-
     if(ctx->stack_clone)
         box_free(ctx->stack_clone);
 
     free_neededlib(&ctx->neededlibs);
+
+    FreeDLPrivate(&ctx->dlprivate);
 
     box_free(ctx);
 }

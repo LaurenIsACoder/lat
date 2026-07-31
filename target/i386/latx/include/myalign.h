@@ -157,8 +157,18 @@ TranslationBlock * kzt_tb_find_exp(
             CPUState *cpu,
             TranslationBlock *last_tb,
             int tb_exit, uint32_t cflags);
+void kzt_tb_pin_prebind_bridge(CPUState *cpu, target_ulong pc);
+bool kzt_tb_prebind_target_is_prepared(CPUState *cpu, target_ulong pc);
+void kzt_tb_prebind_guest_note_prepared(CPUState *cpu, target_ulong pc);
+void kzt_tb_steady_diagnostics_note_guest_prepare(
+    CPUState *cpu, target_ulong pc);
+void kzt_tb_steady_diagnostics_snapshot_fast_cache(CPUState *cpu);
+void kzt_tb_steady_diagnostics_report(void);
 void kzt_bridge_init(void);
 void kzt_wine_bridge(abi_ulong start, int fd);
 int latx_dpy_xcb_sync(void *v1);
 elfheader_t* loadElfFromFile(const char* name);
+elfheader_t* tryLoadElfFromFile(const char* name);
+void freeElfFromFile(elfheader_t **header);
+void kzt_wine_init_x86(box64context_t *context, uintptr_t guest_dlsym);
 #endif  //__MY_ALIGN__H_

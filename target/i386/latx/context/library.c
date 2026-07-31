@@ -227,6 +227,13 @@ static void initNativeLib(library_t *lib, box64context_t* context) {
             lib->getnoweak = wrappedlibs[i].getnoweak;
             lib->getlocal = NativeLib_GetLocal;
             lib->type = LIB_WRAPPED;
+#ifdef CONFIG_LATX_KZT
+            /* Exact KZT bindings are optional metadata.  Track the library
+             * before callback publication; failure leaves the legacy loader
+             * path unchanged and exact lookup unavailable. */
+            (void)kzt_guest_library_track(
+                KztGuestLibraryBindingsForContext(context), lib);
+#endif
             // Call librarian to load all dependant elf
             if(AddNeededLib(context->maplib, &lib->needed, lib, 0, 0, (const char**)lib->priv.w.neededlibs, lib->priv.w.needed, context)) {
                 printf_log(LOG_INFO, "Error: loading a needed libs in elf %s\n", lib->name);
@@ -391,26 +398,70 @@ int ReloadLibrary(library_t* lib)
             return 1;
         }
     }
-    lib->active = 1;
 #ifdef CONFIG_LATX_KZT
-    /* Publish only after every reload step has succeeded. On failure the
-     * binding lifecycle remains DEAD and no exact pair is left pending. */
+    if (lib->type == LIB_WRAPPED) {
+        kzt_guest_library_bindings_t *bindings =
+            KztGuestLibraryBindingsForContext(lib->context);
+        kzt_guest_wrapper_source_proof_t source_proof = { 0 };
+        kzt_guest_library_binding_result_t publication;
+
+        if (!lib->x86linkmap ||
+            kzt_guest_library_wrapper_source_acquire(
+                lib->context, (uintptr_t)lib->x86linkmap,
+                lib->name, lib->name, &source_proof) != 0) {
+            return 1;
+        }
+        if (kzt_guest_library_reactivate(bindings, lib) != 0) {
+            kzt_guest_library_wrapper_source_release(&source_proof);
+            return 1;
+        }
+        publication = kzt_guest_library_note_loader_pair(
+            lib->context, (uintptr_t)lib->x86linkmap, lib, &source_proof);
+        if (publication != KZT_GUEST_LIBRARY_BINDING_ADDED &&
+            publication != KZT_GUEST_LIBRARY_BINDING_UNCHANGED) {
+            kzt_guest_library_inactivate(
+                bindings, NULL, lib, (uintptr_t)lib->x86linkmap);
+            kzt_guest_library_wrapper_source_release(&source_proof);
+            return 1;
+        }
+        lib->active = 1;
+        kzt_guest_library_wrapper_source_release(&source_proof);
+        return 0;
+    }
+    lib->active = 1;
     if (kzt_guest_library_reactivate(
             KztGuestLibraryBindingsForContext(lib->context), lib) == 0 &&
-        lib->x86linkmap)
-        kzt_guest_library_note_loader_pair(
-            lib->context, (uintptr_t)lib->x86linkmap, lib);
+        lib->x86linkmap) {
+        (void)kzt_guest_library_note_loader_pair(
+            lib->context, (uintptr_t)lib->x86linkmap, lib, NULL);
+    }
+#else
+    lib->active = 1;
 #endif
     return 0;
 }
 void InactiveLibrary(library_t* lib)
 {
+    if (!lib) return;
+#ifdef CONFIG_LATX_KZT
+    kzt_guest_library_inactivate(
+        KztGuestLibraryBindingsForContext(lib->context),
+        KztGuestRegistryForContext(lib->context), lib,
+        (uintptr_t)lib->x86linkmap);
+#endif
     lib->active = 0;
 }
 
 void Free1Library(library_t **lib)
 {
     if(!(*lib)) return;
+
+#ifdef CONFIG_LATX_KZT
+    kzt_guest_library_unbind(
+        KztGuestLibraryBindingsForContext((*lib)->context),
+        KztGuestRegistryForContext((*lib)->context), *lib,
+        (uintptr_t)(*lib)->x86linkmap);
+#endif
 
     //if((*lib)->type==1) {
     //    elfheader_t *elf_header = (*lib)->context->elfs[(*lib)->priv.n.elf_index];
@@ -796,6 +847,69 @@ static int getSymbolInSymbolMaps(library_t*lib, const char* name, khint_t pre_k,
         }
 
     return 0;
+}
+
+static int wrapper_manifest_symbol_is_function(library_t *lib,
+                                               const char *name,
+                                               khint_t pre_k)
+{
+    khint_t k;
+
+    k = pre_kh_get(datamap, lib->datamap, name, pre_k);
+    if (k != kh_end(lib->datamap)) return 0;
+    k = pre_kh_get(datamap, lib->wdatamap, name, pre_k);
+    if (k != kh_end(lib->wdatamap)) return 0;
+    k = pre_kh_get(datamap, lib->mydatamap, name, pre_k);
+    if (k != kh_end(lib->mydatamap)) return 0;
+
+    k = pre_kh_get(symbolmap, lib->mysymbolmap, name, pre_k);
+    if (k != kh_end(lib->mysymbolmap)) return 1;
+    k = pre_kh_get(symbolmap, lib->stsymbolmap, name, pre_k);
+    if (k != kh_end(lib->stsymbolmap)) return 1;
+    k = pre_kh_get(symbolmap, lib->symbolmap, name, pre_k);
+    if (k != kh_end(lib->symbolmap)) return 1;
+    k = pre_kh_get(symbolmap, lib->wmysymbolmap, name, pre_k);
+    if (k != kh_end(lib->wmysymbolmap)) return 1;
+    k = pre_kh_get(symbolmap, lib->wsymbolmap, name, pre_k);
+    if (k != kh_end(lib->wsymbolmap)) return 1;
+    k = pre_kh_get(symbol2map, lib->symbol2map, name, pre_k);
+    return k != kh_end(lib->symbol2map);
+}
+
+int GetLibFunctionSymbolStartEnd(library_t *lib, const char *name,
+                                 khint_t pre_k, uintptr_t *start,
+                                 uintptr_t *end)
+{
+    khint_t k;
+
+    if (!lib || lib->type != LIB_WRAPPED || !name || !name[0] ||
+        !start || !end || !lib->active) {
+        return 0;
+    }
+    if (!pre_k) pre_k = kh_str_hash_func(name);
+    if (!wrapper_manifest_symbol_is_function(lib, name, pre_k)) {
+        return 0;
+    }
+    k = pre_kh_get(bridgemap, lib->bridgemap, name, pre_k);
+    if (k != kh_end(lib->bridgemap)) {
+        *start = kh_value(lib->bridgemap, k).start;
+        *end = kh_value(lib->bridgemap, k).end;
+        return 1;
+    }
+    if (!getSymbolInSymbolMaps(lib, name, pre_k, 0, start, end)) {
+        return 0;
+    }
+    *end += *start;
+    {
+        char *symbol = box_strdup(name);
+        int ret;
+
+        k = kh_put(bridgemap, lib->bridgemap, symbol, &ret);
+        kh_value(lib->bridgemap, k).name = symbol;
+        kh_value(lib->bridgemap, k).start = *start;
+        kh_value(lib->bridgemap, k).end = *end;
+    }
+    return 1;
 }
 
 int getSymbolInMaps(library_t *lib, const char* name, khint_t pre_k, int noweak, uintptr_t *addr, uintptr_t *size, int version, const char* vername, int local)

@@ -6,7 +6,10 @@
 #include <link.h>
 #include "debug.h"
 #include "kzt_guest_library_binding.h"
+#include "kzt_guest_dl_state.h"
 #include "kzt_guest_registry_context.h"
+#include "kzt_guest_scope_layout.h"
+#include "kzt_lazy_prebind_scope.h"
 #include "kzt_patch_spike_guard.h"
 
 typedef struct elfheader_s elfheader_t;
@@ -44,19 +47,8 @@ void add_dependedlib(needed_libs_t* depended, library_t* lib);
 void free_dependedlib(needed_libs_t* depended);
 
 typedef struct dlprivate_s {
-    library_t   **libs;
-    size_t      *count;
-    size_t      *dlopened;
-    struct link_map  *dlx86handle;
-    size_t      lib_sz;
-    size_t      lib_cap;
-    char*       last_error;
-    void *     x86dlopen;
-    void *     x86dlclose;
-    void *     x86dlsym;
-    void *     x86dladdr1;
-    void *     x86dladdr;
-    void *     x86dlinfo;
+    kzt_guest_dlerror_state_t legacy_error;
+    kzt_guest_dl_entry_state_t guest_dl_entries;
 } dlprivate_t;
 struct latx_kzt_debug {
     char *name;
@@ -352,8 +344,10 @@ typedef struct box64context_s {
 #ifdef CONFIG_LATX_KZT
     kzt_guest_registry_context_t kzt_guest_registry_context;
     kzt_guest_library_access_t kzt_guest_library_access;
+    kzt_guest_scope_layout_t kzt_guest_scope_layout;
+    kzt_lazy_prebind_scope_t *kzt_lazy_prebind_scope;
     kzt_patch_spike_guard_t kzt_patch_spike_guard;
-    pthread_mutex_t kzt_bridge_mutex;
+    uintptr_t kzt_plt_resolver_bridge;
     uintptr_t kzt_lazy_completion_bridge;
 #endif
 } box64context_t;
@@ -370,6 +364,8 @@ int KztGuestLibraryLookupForContext(
     box64context_t *context,
     const kzt_guest_library_binding_key_t *key,
     kzt_guest_library_handle_t *handle);
+kzt_lazy_prebind_scope_t *KztLazyPrebindScopeForContext(
+    box64context_t *context);
 kzt_patch_spike_guard_t *KztPatchSpikeGuardForContext(box64context_t *context);
 #endif
 

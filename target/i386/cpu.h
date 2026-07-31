@@ -25,6 +25,7 @@
 #include "exec/cpu-defs.h"
 #include "qapi/qapi-types-common.h"
 #ifdef CONFIG_LATX_KZT
+#include "kzt_guest_dl_state.h"
 #include "kzt_lazy_binding.h"
 #include "kzt_loader_callback_scope.h"
 #endif
@@ -1412,6 +1413,9 @@ typedef struct CPUX86State {
     kzt_lazy_binding_pending_t kzt_lazy_binding_pending;
     uintptr_t kzt_lazy_original_return;
     kzt_guest_library_loader_scope_t kzt_guest_library_loader_scope;
+#ifdef TARGET_X86_64
+    kzt_guest_dlerror_state_t kzt_guest_dlerror_state;
+#endif
 #endif
     void*  checksum_fail_tb;
     void *ibtc_table_p;

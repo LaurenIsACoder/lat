@@ -34,6 +34,9 @@
 #include "sysemu/xen.h"
 #include "sysemu/whpx.h"
 #include "sev_i386.h"
+#if defined(CONFIG_LATX_KZT) && defined(TARGET_X86_64)
+#include "kzt_guest_dl_api.h"
+#endif
 
 #include "qemu/error-report.h"
 #include "qemu/module.h"
@@ -6308,6 +6311,9 @@ static void x86_cpu_reset(DeviceState *dev)
 #if defined(CONFIG_LATX) && !defined(CONFIG_LATX_FAST_JMPCACHE)
     env->tb_jmp_cache_ptr = s->tb_jmp_cache;
 #endif
+#if defined(CONFIG_LATX_KZT) && defined(TARGET_X86_64)
+    env->kzt_guest_dlerror_state.dlerror_slow_required = 0;
+#endif
 }
 
 #ifndef CONFIG_USER_ONLY
@@ -7011,6 +7017,9 @@ static void x86_cpu_unrealizefn(DeviceState *dev)
         cpu->apic_state = NULL;
     }
 
+#if defined(CONFIG_LATX_KZT) && defined(TARGET_X86_64)
+    kzt_guest_dl_api_free_errors(&cpu->env.kzt_guest_dlerror_state);
+#endif
     xcc->parent_unrealize(dev);
 }
 

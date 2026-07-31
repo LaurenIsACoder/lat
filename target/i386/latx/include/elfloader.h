@@ -2,9 +2,8 @@
 #define __ELF_LOADER_H_
 #include <stdio.h>
 #include "elf.h"
+#include "kzt_guest_dynamic_view.h"
 extern uintptr_t pltResolver;
-extern uintptr_t dl_runtime_resolver;
-extern uintptr_t link_map_obj;
 typedef struct elfheader_s elfheader_t;
 typedef struct lib_s lib_t;
 typedef struct library_s library_t;
@@ -59,6 +58,14 @@ void* GetNativeSymbolUnversionned(void* lib, const char* name);
 
 void AddMainElfToLinkmap(elfheader_t* lib);
 void PltResolver(void);
+uintptr_t KztPltResolverBridge(void);
+int KztPltResolverDispatch(void *cpu_state, uintptr_t pc);
+int KztPrebindTargetTbPrepare(uintptr_t target);
+int KztPerObjectGotPltWrite(uintptr_t link_map_addr,
+                            unsigned long generation,
+                            const kzt_guest_dynamic_view_t *view,
+                            void *opaque);
+void KztPerObjectGotPltRelease(uintptr_t object_head);
 
 int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t* head, int cnt, Elf64_Rela *rela, int* need_resolv);
 uintptr_t loadSoaddrFromMap(char * real_path);

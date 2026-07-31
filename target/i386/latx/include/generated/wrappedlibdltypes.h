@@ -30,4 +30,3 @@ typedef int64_t (*iFpppi_t)(void*, void*, void*, int64_t);
 	GO(dladdr1, iFpppi_t)
 
 #endif // __wrappedlibdlTYPES_H_
-
