@@ -1,5 +1,10 @@
 #include "kzt_guest_probe.h"
 
+#ifdef KZT_GUEST_LOAD_LOCAL_PREEMPTION_GROUP
+extern void *dlopen(const char *path, int flags);
+#define KZT_GUEST_RTLD_NOW 2
+#endif
+
 static long raw_syscall3(long number, long arg1, long arg2, long arg3)
 {
     long result;
@@ -54,6 +59,17 @@ void _start(void)
     char success[256];
     char *cursor = success;
 
+#ifdef KZT_GUEST_LOAD_LOCAL_PREEMPTION_GROUP
+    if (!dlopen("libkzt_local_preempt.so", KZT_GUEST_RTLD_NOW)) {
+        (void)raw_syscall3(1, 2, (long)failure, sizeof(failure) - 1);
+        raw_exit(3);
+    }
+    {
+        static const char ready[] = "KZT_LOCAL_GROUP_READY\n";
+
+        (void)raw_syscall3(1, 2, (long)ready, sizeof(ready) - 1);
+    }
+#endif
     if (kzt_guest_probe(&result) != 0) {
         (void)raw_syscall3(1, 2, (long)failure, sizeof(failure) - 1);
         raw_exit(1);

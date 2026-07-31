@@ -1,15 +1,6 @@
 #include "kzt_guest_probe.h"
 
-struct guest_utsname {
-    char sysname[65];
-    char nodename[65];
-    char release[65];
-    char version[65];
-    char machine[65];
-    char domainname[65];
-};
-
-extern int uname(struct guest_utsname *result);
+extern char *dlerror(void);
 
 struct guest_timespec {
     long seconds;
@@ -33,13 +24,13 @@ static uint64_t monotonic_raw_ns(void)
            (uint64_t)value.nanoseconds;
 }
 
-static uintptr_t *uname_jump_slot(void)
+static uintptr_t *dlerror_jump_slot(void)
 {
     const unsigned char *plt;
     uint32_t raw_displacement;
     int32_t displacement;
 
-    __asm__ volatile("lea uname@PLT(%%rip), %0" : "=r"(plt));
+    __asm__ volatile("lea dlerror@PLT(%%rip), %0" : "=r"(plt));
     if (plt[0] != 0xff || plt[1] != 0x25) {
         return 0;
     }
@@ -53,29 +44,27 @@ static uintptr_t *uname_jump_slot(void)
 
 int kzt_guest_probe(struct kzt_guest_probe_result *result)
 {
-    struct guest_utsname utsname;
     uintptr_t *slot;
     uint64_t before_call;
     uint64_t after_call;
 
-    if (!result || !(slot = uname_jump_slot())) {
+    if (!result || !(slot = dlerror_jump_slot())) {
         return 2;
     }
     result->slot_addr = (uintptr_t)slot;
     result->before = *(volatile uintptr_t *)slot;
 
     before_call = monotonic_raw_ns();
-    if (!before_call || uname(&utsname) != 0 ||
-        utsname.machine[0] == '\0' ||
-        !(after_call = monotonic_raw_ns()) || after_call < before_call) {
+    if (!before_call ||
+        ((void)dlerror(), !(after_call = monotonic_raw_ns())) ||
+        after_call < before_call) {
         return 1;
     }
     result->first_call_ns = after_call - before_call;
     result->after_first = *(volatile uintptr_t *)slot;
 
     before_call = monotonic_raw_ns();
-    if (!before_call || uname(&utsname) != 0 ||
-        utsname.machine[0] == '\0' ||
+    if (!before_call || dlerror() != 0 ||
         !(after_call = monotonic_raw_ns()) || after_call < before_call) {
         return 1;
     }
