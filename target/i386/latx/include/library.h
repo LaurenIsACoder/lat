@@ -36,6 +36,9 @@ void Free1Library(library_t **lib);
 char* GetNameLib(library_t *lib);
 int IsSameLib(library_t* lib, const char* path);    // check if lib is same (path -> name)
 int GetLibSymbolStartEnd(library_t* lib, const char* name, khint_t pre_k, uintptr_t* start, uintptr_t* end, int version, const char* vername, int local);
+int GetLibFunctionSymbolStartEnd(library_t* lib, const char* name,
+                                 khint_t pre_k, uintptr_t* start,
+                                 uintptr_t* end);
 int GetLibNoWeakSymbolStartEnd(library_t* lib, const char* name, khint_t pre_k, uintptr_t* start, uintptr_t* end, int version, const char* vername, int local);
 int GetLibLocalSymbolStartEnd(library_t* lib, const char* name, khint_t pre_k, uintptr_t* start, uintptr_t* end, int version, const char* vername, int local);
 void fillGLProcWrapper(void);

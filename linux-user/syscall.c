@@ -142,6 +142,9 @@
 #include "ioctl/mpt3sas_ctl.h"
 
 #include "qemu.h"
+#if defined(CONFIG_LATX_FAST_JMPCACHE) && defined(CONFIG_LATX_KZT)
+void kzt_tb_steady_diagnostics_snapshot_fast_cache(CPUState *cpu);
+#endif
 #include "signal-common.h"
 #include "qemu/guest-random.h"
 #include "qemu/selfmap.h"
@@ -11528,6 +11531,9 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #ifdef CONFIG_LATX_FAST_JMPCACHE
         {
             CPUX86State *x86env = env;
+#ifdef CONFIG_LATX_KZT
+            kzt_tb_steady_diagnostics_snapshot_fast_cache(cpu);
+#endif
             if (x86env->tb_jmp_cache_ptr) {
                 free(x86env->tb_jmp_cache_ptr);
             }
@@ -13976,6 +13982,11 @@ static abi_long do_syscall1(void *cpu_env, int num, abi_long arg1,
 #ifdef __NR_exit_group
         /* new thread calls */
     case TARGET_NR_exit_group:
+#ifdef CONFIG_LATX_FAST_JMPCACHE
+#ifdef CONFIG_LATX_KZT
+        kzt_tb_steady_diagnostics_snapshot_fast_cache(cpu);
+#endif
+#endif
         preexit_cleanup(cpu_env, arg1);
         /* dump basic block here. TODO */
 #ifdef CONFIG_LATX_AOT

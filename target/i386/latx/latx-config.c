@@ -17,6 +17,9 @@
 #include "translate.h"
 #include "latx-config.h"
 #include "syscall-tunnel.h"
+#if defined(CONFIG_LATX_KZT) && defined(TARGET_X86_64)
+#include "kzt_guest_dl_api.h"
+#endif
 
 #ifdef CONFIG_LATX_TU
 #include "tu.h"
@@ -453,6 +456,9 @@ static __thread TRANSLATION_DATA tr_data_real;
 
 /* global lsenv defined here */
 __thread ENV *lsenv;
+#if defined(CONFIG_LATX_KZT) && defined(TARGET_X86_64)
+__thread uintptr_t kzt_guest_dlerror_fast_result_tls;
+#endif
 
 #ifdef CONFIG_LATX_FAST_JMPCACHE
 void latx_fast_jmp_cache_add(CPUState *cs, int h, struct TranslationBlock *tb)
@@ -615,6 +621,9 @@ void latx_lsenv_init(CPUArchState *env)
     lsenv = &lsenv_real;
     lsenv->cpu_state = env;
     lsenv->tr_data = &tr_data_real;
+#if defined(CONFIG_LATX_KZT) && defined(TARGET_X86_64)
+    kzt_guest_dl_api_bind_current_thread(&env->kzt_guest_dlerror_state);
+#endif
 #ifdef CONFIG_LATX_TU
     tu_control_init();
 #endif

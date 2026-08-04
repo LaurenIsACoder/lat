@@ -102,7 +102,7 @@ GO(XCheckWindowEvent, iFpplp)
 GO(XClearArea, iFppiiuui)
 GO(XClearWindow, iFpp)
 GO(XClipBox, iFpp)
-GO(XCloseDisplay, iFp)
+GOM(XCloseDisplay, iFp)
 GO(XCloseIM, iFp)
 // _XCloseLC
 GO(XCloseOM, iFp)

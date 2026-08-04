@@ -20,10 +20,28 @@
 #include "latx-smc.h"
 #include "jrra.h"
 #include "latx-native-asm.h"
+#include <inttypes.h>
+#include <time.h>
 
 extern void *helper_tb_lookup_ptr(CPUArchState *);
 static int ss_generate_match_fail_native_code(void* code_buf);
 #if defined(CONFIG_LATX_KZT)
+#include "elfloader.h"
+uint64_t kzt_lazy_bridge_translation_ready_ns;
+uintptr_t kzt_lazy_target_bridge_pc;
+uint64_t kzt_lazy_resolver_done_ns;
+
+static uint64_t kzt_lazy_bridge_translation_timing_now(void)
+{
+    struct timespec value;
+
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &value) != 0) {
+        return 0;
+    }
+    return (uint64_t)value.tv_sec * 1000000000ULL +
+           (uint64_t)value.tv_nsec;
+}
+
 uintptr_t kzt_get_alternate_pc(uintptr_t addr)
 {
     if (!option_kzt || addr < reserved_va) {
@@ -2306,6 +2324,36 @@ static int kzt_tr_bridge(struct TranslationBlock *tb)
 #endif
 int tr_translate_tb(struct TranslationBlock *tb)
 {
+#if defined(CONFIG_LATX_KZT)
+    uint64_t kzt_lazy_bridge_timing_start = 0;
+    uint64_t kzt_lazy_target_timing_start = 0;
+    uint64_t kzt_lazy_resolver_done_snapshot = 0;
+    int kzt_lazy_diagnostics_enabled =
+        unlikely(option_kzt_lazy_diagnostics);
+    uintptr_t kzt_lazy_target_snapshot = kzt_lazy_diagnostics_enabled
+        ? __atomic_load_n(
+            &kzt_lazy_target_bridge_pc, __ATOMIC_ACQUIRE)
+        : 0;
+    uintptr_t kzt_plt_resolver_bridge = KztPltResolverBridge();
+    int kzt_lazy_bridge_timing_enabled =
+        kzt_lazy_diagnostics_enabled && kzt_plt_resolver_bridge &&
+        tb->pc == kzt_plt_resolver_bridge;
+    int kzt_lazy_target_timing_enabled =
+        kzt_lazy_diagnostics_enabled &&
+        kzt_lazy_target_snapshot &&
+        tb->pc == kzt_lazy_target_snapshot;
+
+    if (kzt_lazy_bridge_timing_enabled) {
+        kzt_lazy_bridge_timing_start =
+            kzt_lazy_bridge_translation_timing_now();
+    }
+    if (kzt_lazy_target_timing_enabled) {
+        kzt_lazy_resolver_done_snapshot = __atomic_load_n(
+            &kzt_lazy_resolver_done_ns, __ATOMIC_ACQUIRE);
+        kzt_lazy_target_timing_start =
+            kzt_lazy_bridge_translation_timing_now();
+    }
+#endif
     if (CODEIS64) {
         tb->bool_flags |= IS_CODE64;
     }
@@ -2437,6 +2485,45 @@ int tr_translate_tb(struct TranslationBlock *tb)
         option_dump = 0;
     }
 
+#if defined(CONFIG_LATX_KZT)
+    if (kzt_lazy_bridge_timing_enabled) {
+        uint64_t timing_done = kzt_lazy_bridge_translation_timing_now();
+
+        __atomic_store_n(
+            &kzt_lazy_bridge_translation_ready_ns, timing_done,
+            __ATOMIC_RELEASE);
+        fprintf(
+            stderr,
+            "kzt_lazy_bridge_translation_timing schema=1 "
+            "pc=0x%" PRIx64 " code_size=%d total_ns=%" PRIu64 "\n",
+            (uint64_t)tb->pc, code_size,
+            timing_done >= kzt_lazy_bridge_timing_start
+                ? timing_done - kzt_lazy_bridge_timing_start
+                : 0);
+    }
+    if (kzt_lazy_target_timing_enabled) {
+        uint64_t timing_done = kzt_lazy_bridge_translation_timing_now();
+
+        fprintf(
+            stderr,
+            "kzt_lazy_target_bridge_translation_timing schema=1 "
+            "pc=0x%" PRIx64 " code_size=%d "
+            "resolver_to_translation_ns=%" PRIu64
+            " total_ns=%" PRIu64 "\n",
+            (uint64_t)tb->pc, code_size,
+            kzt_lazy_target_timing_start >=
+                    kzt_lazy_resolver_done_snapshot &&
+                kzt_lazy_resolver_done_snapshot
+                ? kzt_lazy_target_timing_start -
+                    kzt_lazy_resolver_done_snapshot
+                : 0,
+            timing_done >= kzt_lazy_target_timing_start
+                ? timing_done - kzt_lazy_target_timing_start
+                : 0);
+        __atomic_store_n(&kzt_lazy_target_bridge_pc, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&kzt_lazy_resolver_done_ns, 0, __ATOMIC_RELEASE);
+    }
+#endif
     return code_size;
 }
 

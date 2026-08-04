@@ -19,6 +19,7 @@ extern int box64_pagesize;
 extern uintptr_t box64_load_addr;
 extern int dlsym_error;    // log dlsym error
 extern int kzt_call_log;
+extern int kzt_registry_diagnostics;
 extern int allow_missing_libs;
 extern int  box64_nogtk;
 extern int box64_prefer_wrapped;
@@ -55,6 +56,19 @@ extern char* libGL;
 #define printf_dump(L, ...)         ((void)0)
 #define printf_dlsym(L, ...)         ((void)0)
 #define printf_kzt_call(L, ...)         ((void)0)
+#endif
+#if defined(CONFIG_LATX_KZT)
+#define kzt_registry_diagnostics_enabled() \
+    (kzt_registry_diagnostics || (LOG_DEBUG <= relocation_log))
+#define printf_kzt_registry_diagnostics(...) \
+    do { \
+        if (kzt_registry_diagnostics_enabled()) { \
+            fprintf(stderr, __VA_ARGS__); \
+        } \
+    } while (0)
+#else
+#define kzt_registry_diagnostics_enabled() 0
+#define printf_kzt_registry_diagnostics(...) ((void)0)
 #endif
 #define EXPORT __attribute__((visibility("default")))
 #define EXPORTDYN 

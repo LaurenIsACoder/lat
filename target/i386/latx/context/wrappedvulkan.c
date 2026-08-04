@@ -602,8 +602,12 @@ EXPORT int my_vkCreateXcbSurfaceKHR(void* instance, void* info, my_VkAllocationC
     my_VkAllocationCallbacks_t my_alloc;
     my_VkXcbSurfaceCreateInfoKHR_t* surfaceinfo = info;
     void* old_conn = surfaceinfo->connection;
-    surfaceinfo->connection = align_xcb_connection(old_conn);
+    void* native_conn = align_xcb_connection(old_conn);
+    if (!native_conn)
+        return -3;
+    surfaceinfo->connection = native_conn;
     int ret = my->vkCreateXcbSurfaceKHR(instance, info, find_VkAllocationCallbacks(&my_alloc, pAllocator), pFence);
+    unalign_xcb_connection(native_conn, old_conn);
     surfaceinfo->connection = old_conn;
     return ret;
 }

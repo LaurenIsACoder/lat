@@ -1,0 +1,8 @@
+WI600_1.0 {
+    global: wi600_versioned_value;
+    local: *;
+};
+
+WI600_2.0 {
+    global: wi600_versioned_value;
+} WI600_1.0;

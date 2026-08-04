@@ -38,10 +38,17 @@ extern  const char *aot_left_file_minsize_optarg;
  * |  code caches |
  * +--------------+
  */
-#ifdef CONFIG_LATX_DEBUG
-#define AOT_VERSION "Version: "LATX_VERSION"-debug"
+#ifdef CONFIG_LATX_KZT
+#define KZT_AOT_VERSION_SUFFIX "-kzt-runtime-entry-v2"
 #else
-#define AOT_VERSION "Version: "LATX_VERSION"-release"
+#define KZT_AOT_VERSION_SUFFIX ""
+#endif
+#ifdef CONFIG_LATX_DEBUG
+#define AOT_VERSION \
+    "Version: "LATX_VERSION"-debug" KZT_AOT_VERSION_SUFFIX
+#else
+#define AOT_VERSION \
+    "Version: "LATX_VERSION"-release" KZT_AOT_VERSION_SUFFIX
 #endif
 typedef struct aot_header {
     uint32_t lib_size;
@@ -260,6 +267,8 @@ typedef enum aot_rel_kind {
     LOAD_HELPER_CVTPH2PS_XMM,
     LOAD_HELPER_CVTPS2PH_YMM,
     LOAD_HELPER_CVTPS2PH_XMM,
+    LOAD_HELPER_KZT_RUNTIME_GUEST_ENTRY,
+    LOAD_HELPER_KZT_XCB_GUARD_ACQUIRE,
 
     LOAD_HELPER_END,
 

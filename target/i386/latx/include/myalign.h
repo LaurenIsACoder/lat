@@ -148,17 +148,33 @@ void AlignEpollEvent(void* dest, void* source, int nbr); // x86 -> Arm
 void* align_xcb_connection(void* src);
 void unalign_xcb_connection(void* src, void* dst);
 void* add_xcb_connection(void* src);
-void del_xcb_connection(void* src);
 int sync_xcb_connection(void* src);
-int kzt_init(char** argv, int argc,char** target_argv, int  target_argc,
-    struct linux_binprm* bprm);
-int collectX86free(elfheader_t* h);
+int begin_xcb_connection_disconnect(
+    void *guest, kzt_xcb_connection_lease_t *lease);
+int begin_xcb_connection_disconnect_native(
+    void *native, kzt_xcb_connection_lease_t *lease);
+void finish_xcb_connection_disconnect(kzt_xcb_connection_lease_t *lease);
+uintptr_t kzt_xcb_guard_acquire_for_bridge(
+    CPUX86State *env, uintptr_t guest);
+int kzt_init(CPUX86State *env, char** argv, int argc, char** target_argv,
+    int target_argc, struct linux_binprm* bprm);
 TranslationBlock * kzt_tb_find_exp(
             CPUState *cpu,
             TranslationBlock *last_tb,
             int tb_exit, uint32_t cflags);
+void kzt_tb_pin_prebind_bridge(CPUState *cpu, target_ulong pc);
+bool kzt_tb_prebind_target_is_prepared(CPUState *cpu, target_ulong pc);
+void kzt_tb_prebind_guest_note_prepared(CPUState *cpu, target_ulong pc);
+void kzt_tb_steady_diagnostics_note_guest_prepare(
+    CPUState *cpu, target_ulong pc);
+void kzt_tb_steady_diagnostics_snapshot_fast_cache(CPUState *cpu);
+void kzt_tb_steady_diagnostics_report(void);
 void kzt_bridge_init(void);
 void kzt_wine_bridge(abi_ulong start, int fd);
 int latx_dpy_xcb_sync(void *v1);
 elfheader_t* loadElfFromFile(const char* name);
+elfheader_t* tryLoadElfFromFile(const char* name);
+elfheader_t* tryLoadElfFromFileForContext(
+    box64context_t *context, const char *name);
+void freeElfFromFile(elfheader_t **header);
 #endif  //__MY_ALIGN__H_

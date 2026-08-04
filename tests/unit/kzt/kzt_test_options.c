@@ -1,0 +1,4 @@
+int option_kzt_patch_spike;
+int option_kzt_patch_spike_write;
+unsigned long option_kzt_patch_spike_budget;
+int option_kzt_lazy_diagnostics;

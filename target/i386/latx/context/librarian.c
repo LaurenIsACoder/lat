@@ -221,12 +221,17 @@ static void MapLibRemoveMapLib(lib_t* dest, lib_t* src)
     }
 }
 
-int AddNeededLib_add(lib_t* maplib, needed_libs_t* neededlibs, library_t* deplib, int local, const char* path, box64context_t* box64)
+static int AddNeededLib_add_exact(lib_t* maplib, needed_libs_t* neededlibs,
+                                 library_t* deplib, int local,
+                                 const char* path, box64context_t* box64,
+                                 library_t **exact_library)
 {
+    if (exact_library) *exact_library = NULL;
     printf_log(LOG_INFO, "Trying to add \"%s\" to maplib%s\n", path, local?" (local)":"");
     // first check if lib is already loaded
     library_t *lib = getLib(my_context->maplib, path);
     if(lib) {
+        if (exact_library) *exact_library = lib;
         add_neededlib(neededlibs, lib);
         if (lib && deplib) add_dependedlib(&lib->depended, deplib);
         printf_log(LOG_INFO, "Already present in maplib => success\n");
@@ -235,6 +240,7 @@ int AddNeededLib_add(lib_t* maplib, needed_libs_t* neededlibs, library_t* deplib
     // check also in the local loaded lib
     lib = getLib(my_context->local_maplib, path);
     if(lib) {
+        if (exact_library) *exact_library = lib;
         printf_log(LOG_INFO, "Already present in local_maplib => success\n");
         if(local) {
             // add lib to maplib...
@@ -304,7 +310,16 @@ int AddNeededLib_add(lib_t* maplib, needed_libs_t* neededlibs, library_t* deplib
         lm->l_name = lib->name;
         lm->l_ld = GetDynamicSection(my_context->elfs[lib->priv.n.elf_index]);
     }
+    if (exact_library) *exact_library = lib;
     return 0;
+}
+
+int AddNeededLib_add(lib_t* maplib, needed_libs_t* neededlibs,
+                     library_t* deplib, int local, const char* path,
+                     box64context_t* box64)
+{
+    return AddNeededLib_add_exact(maplib, neededlibs, deplib, local, path,
+                                  box64, NULL);
 }
 
 int AddNeededLib(lib_t* maplib, needed_libs_t* neededlibs, library_t* deplib, int local, int bindnow, const char** paths, int npath, box64context_t* box64)
@@ -319,6 +334,26 @@ int AddNeededLib(lib_t* maplib, needed_libs_t* neededlibs, library_t* deplib, in
             //return 1;
         }
     }
+    return 0;
+}
+
+int AddNeededLibWithLibrary(lib_t* maplib, needed_libs_t* neededlibs,
+                            library_t* deplib, int local, int bindnow,
+                            const char* path, box64context_t* box64,
+                            library_t **exact_library)
+{
+    library_t *selected = NULL;
+    int add_result;
+    (void)bindnow;
+    if (exact_library) *exact_library = NULL;
+    if (!neededlibs)
+        neededlibs = box_calloc(1, sizeof(needed_libs_t));
+    add_result = AddNeededLib_add_exact(maplib, neededlibs, deplib, local,
+                                        path, box64, &selected);
+    if (!add_result && exact_library)
+        *exact_library = selected;
+    /* Preserve AddNeededLib's historical public return behavior. Exact
+     * callers distinguish failure through the reliably cleared output. */
     return 0;
 }
 
@@ -392,7 +427,7 @@ int GetNoSelfSymbolStartEnd(lib_t *maplib, const char* name, uintptr_t* start, u
     // nope, not found
     return 0;
 }
-static int GetGlobalSymbolStartEnd_internal(lib_t *maplib, const char* name, uintptr_t* start, uintptr_t* end, elfheader_t* self, int version, const char* vername)
+static int GetGlobalSymbolStartEnd_internal(lib_t *maplib, const char* name, uintptr_t* start, uintptr_t* end, elfheader_t* self, int version, const char* vername, library_t **provider)
 {
     khint_t pre_k = kh_str_hash_func(name);
 
@@ -406,24 +441,29 @@ static int GetGlobalSymbolStartEnd_internal(lib_t *maplib, const char* name, uin
     //noweak=0
     for(int i=0; i<maplib->libsz; ++i) {
         if(GetLibSymbolStartEnd(maplib->libraries[i], name, pre_k, start, end, version, vername, isLocal(self, maplib->libraries[i])))    // only weak symbol haven't been found yet
-            if(*start)
+            if(*start) {
+                if(provider)
+                    *provider = maplib->libraries[i];
                 return 1;
+            }
     }
     // nope, not found
     return 0;
 }
 
-int GetGlobalSymbolStartEnd(lib_t *maplib, const char* name, uintptr_t* start, uintptr_t* end, elfheader_t* self, int version, const char* vername)
+int GetGlobalSymbolStartEndWithProvider(lib_t *maplib, const char* name, uintptr_t* start, uintptr_t* end, elfheader_t* self, int version, const char* vername, library_t **provider)
 {
+    if(provider)
+        *provider = NULL;
     if(!maplib)
         return 0;
-    if(GetGlobalSymbolStartEnd_internal(maplib, name, start, end, self, version, vername)) {
+    if(GetGlobalSymbolStartEnd_internal(maplib, name, start, end, self, version, vername, provider)) {
         if(start && end && *end==*start) {  // object is of 0 sized, try to see an "_END" object of null size
             uintptr_t start2, end2;
             char* buff = (char*)box_malloc(strlen(name) + strlen("_END") + 1);
             strcpy(buff, name);
             strcat(buff, "_END");
-            if(GetGlobalSymbolStartEnd_internal(maplib, buff, &start2, &end2, self, version, vername)) {
+            if(GetGlobalSymbolStartEnd_internal(maplib, buff, &start2, &end2, self, version, vername, NULL)) {
                 if(end2>*end && start2==end2)
                     *end = end2;
             }
@@ -446,6 +486,12 @@ int GetGlobalSymbolStartEnd(lib_t *maplib, const char* name, uintptr_t* start, u
     }
     // not found...
     return 0;
+}
+
+int GetGlobalSymbolStartEnd(lib_t *maplib, const char* name, uintptr_t* start, uintptr_t* end, elfheader_t* self, int version, const char* vername)
+{
+    return GetGlobalSymbolStartEndWithProvider(
+        maplib, name, start, end, self, version, vername, NULL);
 }
 
 elfheader_t* GetGlobalSymbolElf(lib_t *maplib, const char* name, int version, const char* vername)

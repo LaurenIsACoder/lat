@@ -379,6 +379,20 @@ struct CPUState {
 
     /* Accessed in parallel; all accesses must be atomic */
     TranslationBlock *tb_jmp_cache[TB_JMP_CACHE_SIZE];
+#ifdef CONFIG_LATX_KZT
+    struct {
+        uintptr_t pc;
+        uint32_t flags;
+        uint32_t cflags;
+        unsigned flush_generation;
+        TranslationBlock *tb;
+    } kzt_pinned_bridge_cache[4];
+    unsigned kzt_pinned_bridge_flush_generation;
+    struct {
+        uintptr_t pc;
+        unsigned flush_generation;
+    } kzt_prebind_prepared_guest[8];
+#endif
 
     struct GDBRegisterState *gdb_regs;
     int gdb_num_regs;
@@ -459,6 +473,17 @@ static inline void cpu_tb_jmp_cache_clear(CPUState *cpu)
     for (i = 0; i < TB_JMP_CACHE_SIZE; i++) {
         qatomic_set(&cpu->tb_jmp_cache[i], NULL);
     }
+#ifdef CONFIG_LATX_KZT
+    ++cpu->kzt_pinned_bridge_flush_generation;
+    for (i = 0; i < ARRAY_SIZE(cpu->kzt_pinned_bridge_cache); i++) {
+        qatomic_set(&cpu->kzt_pinned_bridge_cache[i].tb, NULL);
+        cpu->kzt_pinned_bridge_cache[i].pc = 0;
+    }
+    for (i = 0; i < ARRAY_SIZE(cpu->kzt_prebind_prepared_guest); i++) {
+        cpu->kzt_prebind_prepared_guest[i].pc = 0;
+        cpu->kzt_prebind_prepared_guest[i].flush_generation = 0;
+    }
+#endif
 }
 
 /**
