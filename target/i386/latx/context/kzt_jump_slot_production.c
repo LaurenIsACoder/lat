@@ -15,20 +15,48 @@
 #include "elfload_dump.h"
 #include "elfloader_private.h"
 #include "kzt_guest_dl_api.h"
+#include "kzt_guest_dynsym_lookup.h"
+#include "kzt_guest_library_adapter.h"
 #include "kzt_guest_symbol_scope.h"
 #include "kzt_lifecycle_diagnostics.h"
 #include "kzt_lazy_direct_route.h"
+#include "kzt_loader_event_hook.h"
 #include "kzt_rela_diagnostics.h"
 #include "library.h"
+#include "library_private.h"
 #include "librarian.h"
 #include "kzt_rela_request_enricher.h"
 #include "kzt_rela_runtime_bridge.h"
+#include "kzt_xcb_route_policy.h"
 #include "kzt_rela_stub_detector.h"
 #include "kzt_owner_resolver.h"
 #include "kzt_runtime_candidate_shadow.h"
 #include "kzt_wrapper_probe.h"
 
 extern int option_kzt_lazy_diagnostics;
+
+static int production_symbol_uses_guarded_xcb_bridge(
+    const char *symbol_name)
+{
+    return kzt_xcb_route_is_guarded_consumer(symbol_name);
+}
+
+typedef struct kzt_production_alias_proof {
+    kzt_guest_library_binding_key_t owner_key;
+    kzt_guest_library_binding_key_t provider_key;
+    kzt_guest_library_bindings_t *provider_bindings;
+    void *provider_entry;
+    library_t *provider_library;
+    kzt_guest_field_status_t owner_path_status;
+    kzt_guest_field_status_t owner_soname_status;
+    kzt_guest_field_status_t provider_path_status;
+    kzt_guest_field_status_t provider_soname_status;
+    char owner_path[KZT_GUEST_REGISTRY_ADDRESS_TEXT_LIMIT];
+    char owner_soname[KZT_GUEST_REGISTRY_ADDRESS_TEXT_LIMIT];
+    char provider_path[KZT_GUEST_REGISTRY_ADDRESS_TEXT_LIMIT];
+    char provider_soname[KZT_GUEST_REGISTRY_ADDRESS_TEXT_LIMIT];
+    int valid;
+} kzt_production_alias_proof_t;
 
 typedef struct kzt_production_jump_slot_state {
     box64context_t *context;
@@ -43,13 +71,23 @@ typedef struct kzt_production_jump_slot_state {
     kzt_rela_immediate_writer_result_t writer_result;
     kzt_guest_registry_source_lease_t source_lease;
     const kzt_guest_registry_source_lease_t *held_source_lease;
+    kzt_guest_registry_source_lease_t owner_source_lease;
     kzt_guest_registry_patch_decision_lease_t decision_lease;
     const kzt_guest_registry_patch_decision_lease_t *held_decision_lease;
     const kzt_guest_library_handle_t *retained_provider_handle;
+    kzt_guest_library_binding_key_t exact_provider_key;
+    kzt_guest_library_bindings_t *exact_provider_bindings;
+    void *exact_provider_entry;
+    library_t *exact_provider_library;
     kzt_patch_object_ref_t exact_provider_owner;
     kzt_guest_library_loader_quiescence_lease_t loader_quiescence_lease;
     kzt_guest_symbol_scope_request_t symbol_scope_request;
     kzt_guest_symbol_scope_result_t symbol_scope_proof;
+    kzt_guest_registry_symbol_candidate_t exact_owner_candidate;
+    kzt_production_alias_proof_t alias_proof;
+    int exact_owner_symbol_proof;
+    int exact_owner_without_map_range;
+    int wrapper_alias_borrowed;
     kzt_patch_decision_t prevalidated_decision;
     int prevalidated_decision_valid;
     uintptr_t final_stale_slot_value;
@@ -68,9 +106,29 @@ typedef struct kzt_production_jump_slot_state {
     const char *failure_stage;
 } kzt_production_jump_slot_state_t;
 
+static int production_exact_provider_handle_matches(
+    const kzt_production_jump_slot_state_t *state)
+{
+    const kzt_guest_library_handle_t *handle =
+        state ? state->retained_provider_handle : NULL;
+
+    return handle && handle->bindings && handle->entry && handle->library &&
+           handle->bindings == state->exact_provider_bindings &&
+           handle->entry == state->exact_provider_entry &&
+           handle->library == state->exact_provider_library &&
+           handle->library == state->resolved_provider &&
+           handle->object_type == KZT_GUEST_LIBRARY_OBJECT_WRAPPED &&
+           kzt_guest_library_handle_matches_key(
+               handle, &state->exact_provider_key);
+}
+
 #ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
 void kzt_jump_slot_production_test_before_source_lease_acquire(void);
 void kzt_jump_slot_production_test_before_source_memory_access(void);
+void kzt_jump_slot_production_test_before_owner_memory_access(
+    int source_lease_active, int decision_lease_active,
+    int quiescence_active, int retained_provider_active,
+    int owner_lease_active);
 void kzt_jump_slot_production_test_before_slot_load(void);
 void kzt_jump_slot_production_test_after_slot_load(uintptr_t *value);
 void kzt_jump_slot_production_test_after_slot_cas(int exchanged);
@@ -161,6 +219,540 @@ static int production_symbol_scope_request(
         .reference_visibility = reference.st_other & 0x3,
     };
     return 0;
+}
+
+static int production_exact_owner_symbol_matches(
+    kzt_production_jump_slot_state_t *state,
+    const kzt_patch_object_ref_t *owner, uintptr_t target,
+    const char *symbol, kzt_symbol_version_evidence_t version_evidence,
+    const char *version)
+{
+    kzt_guest_dynamic_view_t owner_view;
+    kzt_guest_dynsym_lookup_result_t lookup = { 0 };
+    kzt_guest_field_status_t dynamic_status;
+    kzt_guest_link_map_reader_ops_t reader_ops = {
+        .read_memory = production_read_guest_memory,
+    };
+    unsigned long dynamic_generation = 0;
+
+    if (!state || !owner || !owner->known || !owner->link_map_addr ||
+        !owner->generation || !target || !symbol || !symbol[0] ||
+        !state->held_source_lease || !state->held_source_lease->active ||
+        !state->held_decision_lease || !state->held_decision_lease->active ||
+        !state->loader_quiescence_lease.bindings ||
+        !state->loader_quiescence_lease.cookie ||
+        !production_exact_provider_handle_matches(state) ||
+        !state->owner_source_lease.active ||
+        state->owner_source_lease.registry !=
+            KztGuestRegistryForContext(state->context) ||
+        state->owner_source_lease.link_map_addr != owner->link_map_addr ||
+        state->owner_source_lease.generation != owner->generation ||
+        state->owner_source_lease.namespace_id != 0 ||
+        (state->exact_owner_without_map_range &&
+         !kzt_loader_lifecycle_runtime_healthy(state->context)) ||
+        !kzt_symbol_version_evidence_valid(version_evidence, version)) {
+        return 0;
+    }
+    if (kzt_guest_registry_find_dynamic_view(
+            KztGuestRegistryForContext(state->context), owner->link_map_addr,
+            &owner_view, &dynamic_status, &dynamic_generation) != 0 ||
+        dynamic_status != KZT_GUEST_FIELD_OK ||
+        dynamic_generation != owner->generation ||
+        owner_view.status != KZT_GUEST_DYNAMIC_COMPLETE ||
+        (state->exact_owner_without_map_range &&
+         (state->exact_owner_candidate.link_map_addr !=
+              owner->link_map_addr ||
+          state->exact_owner_candidate.generation != owner->generation ||
+          state->exact_owner_candidate.dynamic_view_revision == 0 ||
+          kzt_guest_registry_dynamic_view_matches(
+              KztGuestRegistryForContext(state->context),
+              owner->link_map_addr, owner->generation,
+              &state->exact_owner_candidate.dynamic_view) != 0))) {
+        return 0;
+    }
+#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
+    kzt_jump_slot_production_test_before_owner_memory_access(
+        state->held_source_lease && state->held_source_lease->active,
+        state->held_decision_lease && state->held_decision_lease->active,
+        state->loader_quiescence_lease.bindings != NULL &&
+            state->loader_quiescence_lease.cookie != 0,
+        state->retained_provider_handle != NULL &&
+            state->retained_provider_handle->bindings != NULL &&
+            state->retained_provider_handle->entry != NULL,
+        state->owner_source_lease.active);
+#endif
+    if (kzt_guest_dynsym_lookup(
+            &owner_view, &reader_ops, symbol, version_evidence, version,
+            &lookup) != KZT_GUEST_DYNSYM_LOOKUP_FOUND) {
+        return 0;
+    }
+    return lookup.runtime_address == target && lookup.binding == STB_GLOBAL &&
+           lookup.type == STT_FUNC && lookup.visibility == STV_DEFAULT;
+}
+
+static int production_dynamic_view_needs_library(
+    const kzt_guest_dynamic_view_t *view,
+    const kzt_guest_link_map_reader_ops_t *reader_ops,
+    const char *required_name)
+{
+    size_t i;
+
+    if (!view || view->status != KZT_GUEST_DYNAMIC_COMPLETE ||
+        !view->strtab.present ||
+        view->strtab.address_semantics !=
+            KZT_GUEST_DYNAMIC_RUNTIME_ADDRESS ||
+        view->strtab.value > UINTPTR_MAX ||
+        !view->strsz.present ||
+        view->strsz.address_semantics != KZT_GUEST_DYNAMIC_SCALAR ||
+        !view->strsz.value || view->strsz.value > SIZE_MAX ||
+        view->needed_address_semantics !=
+            KZT_GUEST_DYNAMIC_STRING_TABLE_OFFSET ||
+        !view->needed_count ||
+        view->needed_count > KZT_GUEST_DYNAMIC_NEEDED_LIMIT ||
+        !reader_ops || !reader_ops->read_memory || !required_name ||
+        !required_name[0]) {
+        return 0;
+    }
+    for (i = 0; i < view->needed_count; ++i) {
+        char needed[KZT_GUEST_REGISTRY_ADDRESS_TEXT_LIMIT];
+        uint64_t offset = view->needed_offsets[i];
+        size_t remaining;
+        size_t length;
+
+        if (offset >= view->strsz.value ||
+            view->strtab.value > UINTPTR_MAX - offset) {
+            return 0;
+        }
+        remaining = (size_t)(view->strsz.value - offset);
+        for (length = 0;
+             length < remaining && length < sizeof(needed);
+             ++length) {
+            if (reader_ops->read_memory(
+                    (uintptr_t)view->strtab.value + (uintptr_t)offset +
+                        length,
+                    &needed[length], 1, reader_ops->opaque) != 0) {
+                return 0;
+            }
+            if (needed[length] == '\0') {
+                if (strcmp(needed, required_name) == 0) {
+                    return 1;
+                }
+                break;
+            }
+        }
+        if (length == remaining || length == sizeof(needed)) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static int production_custom_dlsym_boundary_proven(
+    const kzt_production_jump_slot_state_t *state, const char *symbol)
+{
+    kzt_guest_link_map_reader_ops_t reader_ops = {
+        .read_memory = production_read_guest_memory,
+    };
+    uintptr_t main_namespace_head = 0;
+
+    if (!symbol || strcmp(symbol, "dlsym") != 0) {
+        return 1;
+    }
+    if (!state || !state->context ||
+        kzt_guest_registry_context_get_main_namespace_head(
+            &state->context->kzt_guest_registry_context,
+            &main_namespace_head) != 0 ||
+        !main_namespace_head) {
+        return 0;
+    }
+    return state->head &&
+           state->head->latx_type != LATX_ELF_TYPE_MAIN &&
+           state->head->self_link_map == state->last_request.source.link_map_addr &&
+           state->last_request.source.link_map_addr != main_namespace_head &&
+           state->wrapper_alias_borrowed && state->runtime_view_valid &&
+           state->owner_namespace_id == 0 &&
+           state->exact_provider_key.namespace_id == 0 &&
+           state->exact_provider_key.namespace_kind ==
+               KZT_GUEST_LIBRARY_NAMESPACE_MAIN &&
+           state->exact_provider_key.link_map_addr !=
+               state->last_request.source.link_map_addr &&
+           state->wrapper_provider.match.custom_wrapper &&
+           state->wrapper_provider.match.resolved_bridge_exact &&
+           state->wrapper_provider.match.resolved_bridge_target != 0 &&
+           production_dynamic_view_needs_library(
+               &state->runtime_view, &reader_ops, "libdl.so.2");
+}
+
+static int production_symbol_candidate_has_exact_name(
+    const kzt_guest_registry_symbol_candidate_t *candidate,
+    const char *required_name)
+{
+    const char *basename;
+
+    if (!candidate || !required_name || !required_name[0] ||
+        candidate->path_status != KZT_GUEST_FIELD_OK ||
+        !candidate->path[0] ||
+        (candidate->soname_status != KZT_GUEST_FIELD_OK &&
+         candidate->soname_status != KZT_GUEST_FIELD_NOT_PARSED)) {
+        return 0;
+    }
+    basename = strrchr(candidate->path, '/');
+    basename = basename ? basename + 1 : candidate->path;
+    return strcmp(basename, required_name) == 0 &&
+           (candidate->soname_status != KZT_GUEST_FIELD_OK ||
+            strcmp(candidate->soname, required_name) == 0);
+}
+
+static int production_exact_owner_candidate_semantics_supported(
+    const kzt_guest_dynsym_lookup_result_t *lookup)
+{
+    if (!lookup || lookup->binding == STB_WEAK) {
+        return 0;
+    }
+    if (lookup->binding == KZT_ELF_STB_GNU_UNIQUE) {
+        return 0;
+    }
+    if (lookup->type == KZT_ELF_STT_GNU_IFUNC) {
+        return 0;
+    }
+    return 1;
+}
+
+static int production_resolve_exact_symbol_owner(
+    kzt_production_jump_slot_state_t *state, uintptr_t target,
+    const char *symbol,
+    kzt_symbol_version_evidence_t version_evidence, const char *version,
+    const char *required_owner_name,
+    kzt_owner_resolution_t *resolution, uintptr_t *resolved_target)
+{
+    kzt_guest_link_map_reader_ops_t reader_ops = {
+        .read_memory = production_read_guest_memory,
+    };
+    kzt_guest_registry_symbol_candidate_t candidate = { 0 };
+    kzt_patch_object_ref_t owner = { 0 };
+    uintptr_t matched_target = 0;
+    size_t match_count = 0;
+    size_t cursor = 0;
+    int candidate_status;
+
+    if (resolved_target) {
+        *resolved_target = 0;
+    }
+    if (!state || !state->context || !symbol || !symbol[0] ||
+        !resolution || !state->held_decision_lease ||
+        !state->held_decision_lease->active ||
+        !state->loader_quiescence_lease.bindings ||
+        !state->loader_quiescence_lease.cookie ||
+        !kzt_loader_lifecycle_runtime_healthy(state->context) ||
+        !kzt_symbol_version_evidence_valid(version_evidence, version) ||
+        state->owner_source_lease.active) {
+        return -1;
+    }
+    kzt_owner_resolver_init(resolution);
+    while ((candidate_status =
+                kzt_guest_registry_symbol_candidate_acquire_next(
+                    state->held_decision_lease, &cursor, &candidate)) == 1) {
+        kzt_guest_dynsym_lookup_result_t lookup = { 0 };
+        kzt_guest_dynsym_lookup_status_t lookup_status;
+        int target_outside_candidate =
+            target && candidate.map_start && candidate.map_end &&
+            (target < candidate.map_start || target >= candidate.map_end);
+
+        if (!target && state->held_source_lease &&
+            candidate.link_map_addr ==
+                state->held_source_lease->link_map_addr &&
+            candidate.generation == state->held_source_lease->generation) {
+            kzt_guest_registry_symbol_candidate_release(&candidate);
+            continue;
+        }
+        if (candidate.dynamic_view_status != KZT_GUEST_FIELD_OK ||
+            candidate.dynamic_view.status != KZT_GUEST_DYNAMIC_COMPLETE ||
+            !candidate.dynamic_view_revision) {
+            kzt_guest_registry_symbol_candidate_release(&candidate);
+            if (target_outside_candidate) {
+                continue;
+            }
+            goto fail;
+        }
+        lookup_status = kzt_guest_dynsym_lookup(
+            &candidate.dynamic_view, &reader_ops, symbol,
+            version_evidence, version, &lookup);
+        if (lookup_status == KZT_GUEST_DYNSYM_LOOKUP_FOUND &&
+            !production_exact_owner_candidate_semantics_supported(&lookup)) {
+            kzt_guest_registry_symbol_candidate_release(&candidate);
+            goto fail;
+        }
+        if (target_outside_candidate) {
+            kzt_guest_registry_symbol_candidate_release(&candidate);
+            continue;
+        }
+        if (lookup_status == KZT_GUEST_DYNSYM_LOOKUP_UNKNOWN) {
+            kzt_guest_registry_symbol_candidate_release(&candidate);
+            goto fail;
+        }
+        if (lookup_status != KZT_GUEST_DYNSYM_LOOKUP_FOUND ||
+            (target && lookup.runtime_address != target) ||
+            lookup.binding != STB_GLOBAL || lookup.type != STT_FUNC ||
+            lookup.visibility != STV_DEFAULT) {
+            kzt_guest_registry_symbol_candidate_release(&candidate);
+            continue;
+        }
+        if (required_owner_name &&
+            !production_symbol_candidate_has_exact_name(
+                &candidate, required_owner_name)) {
+            kzt_guest_registry_symbol_candidate_release(&candidate);
+            goto fail;
+        }
+        owner = (kzt_patch_object_ref_t) {
+            .known = 1,
+            .link_map_addr = candidate.link_map_addr,
+            .map_start = candidate.map_start,
+            .map_end = candidate.map_end,
+            .generation = candidate.generation,
+        };
+        if (++match_count != 1) {
+            kzt_guest_registry_symbol_candidate_release(&candidate);
+            goto fail;
+        }
+        matched_target = lookup.runtime_address;
+        if (candidate.soname_status == KZT_GUEST_FIELD_OK &&
+            candidate.soname[0]) {
+            snprintf(resolution->current_text.soname,
+                     sizeof(resolution->current_text.soname), "%s",
+                     candidate.soname);
+        }
+        if (candidate.path_status == KZT_GUEST_FIELD_OK &&
+            candidate.path[0]) {
+            snprintf(resolution->current_text.path,
+                     sizeof(resolution->current_text.path), "%s",
+                     candidate.path);
+        }
+        state->exact_owner_candidate = candidate;
+        state->owner_source_lease = candidate.lease;
+        memset(&state->exact_owner_candidate.lease, 0,
+               sizeof(state->exact_owner_candidate.lease));
+        memset(&candidate, 0, sizeof(candidate));
+    }
+    if (candidate_status != 0 || match_count != 1) {
+        goto fail;
+    }
+    resolution->status = KZT_OWNER_RESOLVER_RESOLVED;
+    resolution->current_owner = owner;
+    resolution->expected_owner = owner;
+    resolution->current_match_count = 1;
+    resolution->expected_match_count = 1;
+    resolution->owner_match = KZT_PATCH_OWNER_MATCH;
+    resolution->current_owner.soname = resolution->current_text.soname[0]
+                                           ? resolution->current_text.soname
+                                           : NULL;
+    resolution->current_owner.path = resolution->current_text.path[0]
+                                         ? resolution->current_text.path
+                                         : NULL;
+    snprintf(resolution->expected_text.soname,
+             sizeof(resolution->expected_text.soname), "%s",
+             resolution->current_text.soname);
+    snprintf(resolution->expected_text.path,
+             sizeof(resolution->expected_text.path), "%s",
+             resolution->current_text.path);
+    resolution->expected_owner.soname = resolution->expected_text.soname[0]
+                                            ? resolution->expected_text.soname
+                                            : NULL;
+    resolution->expected_owner.path = resolution->expected_text.path[0]
+                                          ? resolution->expected_text.path
+                                          : NULL;
+    state->exact_owner_symbol_proof = 1;
+    state->exact_owner_without_map_range = 1;
+    if (resolved_target) {
+        *resolved_target = matched_target;
+    }
+    return 0;
+fail:
+    kzt_guest_registry_symbol_candidate_release(&candidate);
+    kzt_guest_registry_source_lease_release(&state->owner_source_lease);
+    memset(&state->exact_owner_candidate, 0,
+           sizeof(state->exact_owner_candidate));
+    kzt_owner_resolver_init(resolution);
+    return -1;
+}
+
+static int production_resolve_current_owner(
+    box64context_t *context, uintptr_t current_target,
+    uintptr_t expected_target, const char *symbol,
+    kzt_symbol_version_evidence_t version_evidence, const char *version,
+    kzt_owner_resolution_t *resolution)
+{
+    if (!context || !resolution) {
+        return -1;
+    }
+    kzt_owner_resolver_init(resolution);
+    if (kzt_owner_resolver_resolve_current(
+            KztGuestRegistryForContext(context), current_target,
+            expected_target, resolution) == 0 &&
+        resolution->status == KZT_OWNER_RESOLVER_RESOLVED &&
+        resolution->owner_match == KZT_PATCH_OWNER_MATCH &&
+        resolution->current_owner.known) {
+        return 0;
+    }
+    (void)current_target;
+    (void)expected_target;
+    (void)symbol;
+    (void)version_evidence;
+    (void)version;
+    return -1;
+}
+
+static int production_acquire_wrapper_alias_provider(
+    kzt_production_jump_slot_state_t *state,
+    const kzt_patch_object_ref_t *owner,
+    kzt_guest_library_handle_t *handle)
+{
+    kzt_guest_wrapper_source_proof_t source_proof = { 0 };
+    kzt_guest_library_binding_key_t provider_key = { 0 };
+    kzt_guest_registry_address_match_t owner_match = { 0 };
+    kzt_guest_registry_address_match_t provider_match = { 0 };
+    box64context_t *context = state ? state->context : NULL;
+    const char *guest_name;
+    const char *provider_name;
+    const char *wrapper_name;
+    int status = -1;
+
+    if (handle) {
+        memset(handle, 0, sizeof(*handle));
+    }
+    if (!state || !context || !owner || !owner->known ||
+        !owner->link_map_addr ||
+        !owner->generation || !owner->path || !owner->path[0] || !handle ||
+        !state->held_decision_lease || !state->held_decision_lease->active ||
+        !state->loader_quiescence_lease.bindings ||
+        !state->loader_quiescence_lease.cookie ||
+        !context->libclib || !context->libclib->active ||
+        context->libclib->type != LIB_WRAPPED ||
+        !context->libclib->name || !context->libclib->name[0]) {
+        return -1;
+    }
+    guest_name = strrchr(owner->path, '/');
+    guest_name = guest_name ? guest_name + 1 : owner->path;
+    wrapper_name = kzt_guest_library_wrapper_name_for_guest(guest_name);
+    if (!wrapper_name || strcmp(wrapper_name, guest_name) == 0 ||
+        strcmp(wrapper_name, context->libclib->name) != 0 ||
+        kzt_guest_library_wrapper_source_acquire(
+            context, owner->link_map_addr, owner->path, wrapper_name,
+            &source_proof) != 0 ||
+        source_proof.key.generation != owner->generation ||
+        kzt_guest_library_access_lookup_by_library(
+            &context->kzt_guest_library_access, context->libclib,
+            &provider_key, handle) != 0 ||
+        !handle->library || handle->library != context->libclib ||
+        handle->object_type != KZT_GUEST_LIBRARY_OBJECT_WRAPPED ||
+        provider_key.namespace_kind != KZT_GUEST_LIBRARY_NAMESPACE_MAIN ||
+        provider_key.namespace_id != 0 ||
+        kzt_guest_registry_find_live_object(
+            KztGuestRegistryForContext(context), owner->link_map_addr,
+            &owner_match) != 0 ||
+        owner_match.generation != owner->generation ||
+        owner_match.path_status != KZT_GUEST_FIELD_OK ||
+        (owner_match.soname_status != KZT_GUEST_FIELD_OK &&
+         owner_match.soname_status != KZT_GUEST_FIELD_NOT_PARSED) ||
+        kzt_guest_registry_find_live_object(
+            KztGuestRegistryForContext(context), provider_key.link_map_addr,
+            &provider_match) != 0 ||
+        provider_match.generation != provider_key.generation ||
+        provider_match.namespace_id_status != KZT_GUEST_FIELD_OK ||
+        provider_match.namespace_id != provider_key.namespace_id ||
+        provider_match.path_status != KZT_GUEST_FIELD_OK ||
+        (provider_match.soname_status != KZT_GUEST_FIELD_OK &&
+         provider_match.soname_status != KZT_GUEST_FIELD_NOT_PARSED)) {
+        goto out;
+    }
+    provider_name = strrchr(provider_match.path, '/');
+    provider_name = provider_name ? provider_name + 1 : provider_match.path;
+    if (strcmp(provider_name, wrapper_name) != 0 ||
+        (provider_match.soname_status == KZT_GUEST_FIELD_OK &&
+         strcmp(provider_match.soname, wrapper_name) != 0)) {
+        goto out;
+    }
+    state->alias_proof = (kzt_production_alias_proof_t) {
+        .owner_key = source_proof.key,
+        .provider_key = provider_key,
+        .provider_bindings = handle->bindings,
+        .provider_entry = handle->entry,
+        .provider_library = handle->library,
+        .owner_path_status = owner_match.path_status,
+        .owner_soname_status = owner_match.soname_status,
+        .provider_path_status = provider_match.path_status,
+        .provider_soname_status = provider_match.soname_status,
+        .valid = 1,
+    };
+    snprintf(state->alias_proof.owner_path,
+             sizeof(state->alias_proof.owner_path), "%s", owner_match.path);
+    snprintf(state->alias_proof.owner_soname,
+             sizeof(state->alias_proof.owner_soname), "%s",
+             owner_match.soname);
+    snprintf(state->alias_proof.provider_path,
+             sizeof(state->alias_proof.provider_path), "%s",
+             provider_match.path);
+    snprintf(state->alias_proof.provider_soname,
+             sizeof(state->alias_proof.provider_soname), "%s",
+             provider_match.soname);
+    if (!state->owner_source_lease.active) {
+        state->owner_source_lease = source_proof.lease;
+        memset(&source_proof.lease, 0, sizeof(source_proof.lease));
+    } else if (state->owner_source_lease.link_map_addr !=
+                   source_proof.key.link_map_addr ||
+               state->owner_source_lease.generation !=
+                   source_proof.key.generation) {
+        goto out;
+    }
+    status = 0;
+out:
+    kzt_guest_library_wrapper_source_release(&source_proof);
+    if (status != 0) {
+        memset(&state->alias_proof, 0, sizeof(state->alias_proof));
+        kzt_guest_library_handle_release(handle);
+    }
+    return status;
+}
+
+static int production_wrapper_alias_provider_matches(
+    kzt_production_jump_slot_state_t *state,
+    const kzt_patch_object_ref_t *owner)
+{
+    kzt_guest_registry_address_match_t owner_match = { 0 };
+    kzt_guest_registry_address_match_t provider_match = { 0 };
+    const kzt_production_alias_proof_t *proof =
+        state ? &state->alias_proof : NULL;
+
+    return proof && proof->valid && state->retained_provider_handle &&
+           owner && owner->known &&
+           proof->owner_key.link_map_addr == owner->link_map_addr &&
+           proof->owner_key.generation == owner->generation &&
+           state->owner_source_lease.active &&
+           state->owner_source_lease.link_map_addr == owner->link_map_addr &&
+           state->owner_source_lease.generation == owner->generation &&
+           state->retained_provider_handle->bindings ==
+               proof->provider_bindings &&
+           state->retained_provider_handle->entry == proof->provider_entry &&
+           state->retained_provider_handle->library == proof->provider_library &&
+           state->retained_provider_handle->object_type ==
+               KZT_GUEST_LIBRARY_OBJECT_WRAPPED &&
+           kzt_guest_registry_find_live_object(
+               KztGuestRegistryForContext(state->context),
+               proof->owner_key.link_map_addr, &owner_match) == 0 &&
+           owner_match.generation == proof->owner_key.generation &&
+           owner_match.path_status == proof->owner_path_status &&
+           owner_match.soname_status == proof->owner_soname_status &&
+           strcmp(owner_match.path, proof->owner_path) == 0 &&
+           strcmp(owner_match.soname, proof->owner_soname) == 0 &&
+           kzt_guest_registry_find_live_object(
+               KztGuestRegistryForContext(state->context),
+               proof->provider_key.link_map_addr, &provider_match) == 0 &&
+           provider_match.generation == proof->provider_key.generation &&
+           provider_match.namespace_id_status == KZT_GUEST_FIELD_OK &&
+           provider_match.namespace_id == proof->provider_key.namespace_id &&
+           provider_match.path_status == proof->provider_path_status &&
+           provider_match.soname_status == proof->provider_soname_status &&
+           strcmp(provider_match.path, proof->provider_path) == 0 &&
+           strcmp(provider_match.soname, proof->provider_soname) == 0;
 }
 
 static int production_shadow_expected_target(
@@ -447,15 +1039,6 @@ static int production_slot_end_write(kzt_patch_spike_permission_lease_t *lease,
     return result;
 }
 
-typedef enum kzt_production_slot_transaction_result {
-    KZT_PRODUCTION_SLOT_TRANSACTION_ERROR = -1,
-    KZT_PRODUCTION_SLOT_TRANSACTION_CAS_MISMATCH = 0,
-    KZT_PRODUCTION_SLOT_TRANSACTION_APPLIED = 1,
-    KZT_PRODUCTION_SLOT_TRANSACTION_ROLLED_BACK = 2,
-    KZT_PRODUCTION_SLOT_TRANSACTION_UNRECOVERABLE = 3,
-    KZT_PRODUCTION_SLOT_TRANSACTION_CIRCUIT_OPEN = 4,
-} kzt_production_slot_transaction_result_t;
-
 static const char *production_slot_transaction_result_name(
     kzt_production_slot_transaction_result_t result)
 {
@@ -476,88 +1059,463 @@ static const char *production_slot_transaction_result_name(
     return "UNKNOWN";
 }
 
-static int production_slot_finish_write(
-    kzt_patch_spike_permission_lease_t *permission_lease)
+static int production_mandatory_finish_slot(
+    kzt_patch_spike_permission_lease_t *permission)
 {
-    int result;
-
-    if (!permission_lease) {
+    if (!permission || !permission->mmap_lock_held) {
         return -1;
     }
-    permission_lease->restore_attempted = 1;
-    ++permission_lease->restore_attempts;
-    result = production_slot_end_write(permission_lease, NULL);
-    if (result == 0) {
-        permission_lease->restored = 1;
+    permission->restore_attempted = 1;
+    ++permission->restore_attempts;
+    if (production_slot_end_write(permission, NULL) != 0) {
+        return -1;
     }
+    permission->restored = 1;
+    return 0;
+}
+
+static kzt_production_slot_transaction_result_t
+production_mandatory_slot_transaction(
+    uintptr_t slot_addr, uintptr_t expected, uintptr_t replacement,
+    uintptr_t *final_value)
+{
+    kzt_patch_spike_permission_lease_t permission = { 0 };
+    uintptr_t observed = expected;
+    uintptr_t compare;
+    int wrote = 0;
+
+    if (final_value) {
+        *final_value = expected;
+    }
+    if (!slot_addr || !replacement ||
+        production_slot_begin_write(slot_addr, &permission, NULL) != 0) {
+        if (permission.mmap_lock_held) {
+            (void)production_mandatory_finish_slot(&permission);
+            if (permission.mmap_lock_held) {
+                (void)production_mandatory_finish_slot(&permission);
+            }
+        }
+        return KZT_PRODUCTION_SLOT_TRANSACTION_ERROR;
+    }
+    if (production_slot_load(slot_addr, &observed, NULL) != 0) {
+        goto fail_before_write;
+    }
+    if (observed != expected) {
+        if (final_value) {
+            *final_value = observed;
+        }
+        if (production_mandatory_finish_slot(&permission) != 0 &&
+            permission.mmap_lock_held) {
+            (void)production_mandatory_finish_slot(&permission);
+        }
+        return permission.mmap_lock_held ?
+            KZT_PRODUCTION_SLOT_TRANSACTION_UNRECOVERABLE :
+            KZT_PRODUCTION_SLOT_TRANSACTION_CAS_MISMATCH;
+    }
+    compare = expected;
+    if (production_slot_cas(slot_addr, &compare, replacement, NULL) != 1) {
+        observed = compare;
+        goto fail_before_write;
+    }
+    wrote = 1;
+    if (production_slot_load(slot_addr, &observed, NULL) != 0 ||
+        observed != replacement) {
+        goto rollback;
+    }
+    if (production_mandatory_finish_slot(&permission) == 0) {
+        if (final_value) {
+            *final_value = replacement;
+        }
+        return KZT_PRODUCTION_SLOT_TRANSACTION_APPLIED;
+    }
+
+rollback:
+    compare = replacement;
+    if (!wrote ||
+        production_slot_cas(slot_addr, &compare, expected, NULL) != 1 ||
+        production_slot_load(slot_addr, &observed, NULL) != 0 ||
+        observed != expected) {
+        if (permission.mmap_lock_held) {
+            (void)production_mandatory_finish_slot(&permission);
+        }
+        if (final_value) {
+            *final_value = __atomic_load_n(
+                (uintptr_t *)slot_addr, __ATOMIC_ACQUIRE);
+        }
+        return KZT_PRODUCTION_SLOT_TRANSACTION_UNRECOVERABLE;
+    }
+    if (permission.mmap_lock_held &&
+        production_mandatory_finish_slot(&permission) != 0) {
+        if (permission.mmap_lock_held) {
+            (void)production_mandatory_finish_slot(&permission);
+        }
+        if (final_value) {
+            *final_value = expected;
+        }
+        return KZT_PRODUCTION_SLOT_TRANSACTION_UNRECOVERABLE;
+    }
+    if (final_value) {
+        *final_value = expected;
+    }
+    return KZT_PRODUCTION_SLOT_TRANSACTION_ROLLED_BACK;
+
+fail_before_write:
+    if (production_mandatory_finish_slot(&permission) != 0 &&
+        permission.mmap_lock_held) {
+        (void)production_mandatory_finish_slot(&permission);
+    }
+    if (final_value) {
+        *final_value = observed;
+    }
+    return permission.mmap_lock_held ?
+        KZT_PRODUCTION_SLOT_TRANSACTION_UNRECOVERABLE :
+        KZT_PRODUCTION_SLOT_TRANSACTION_CAS_MISMATCH;
+}
+
+kzt_production_slot_transaction_result_t
+kzt_production_guest_relocation_write(
+    box64context_t *context, uintptr_t source_link_map,
+    kzt_patch_relocation_type_t reloc_type, uintptr_t slot_addr,
+    uintptr_t expected, uintptr_t replacement, const char *symbol_name,
+    kzt_symbol_version_evidence_t version_evidence, const char *version,
+    uintptr_t *final_value)
+{
+    kzt_guest_registry_t *registry;
+    kzt_guest_registry_address_match_t source_match;
+    kzt_guest_registry_source_lease_t source_lease = { 0 };
+    kzt_production_slot_transaction_result_t result =
+        KZT_PRODUCTION_SLOT_TRANSACTION_ERROR;
+
+    if (final_value) {
+        *final_value = expected;
+    }
+    if (!context || !source_link_map || !slot_addr || !replacement ||
+        !symbol_name || !symbol_name[0] ||
+        (reloc_type != KZT_PATCH_RELOCATION_GLOB_DAT &&
+         reloc_type != KZT_PATCH_RELOCATION_JUMP_SLOT) ||
+        !kzt_symbol_version_evidence_valid(version_evidence, version)) {
+        return result;
+    }
+    registry = KztGuestRegistryForContext(context);
+    if (!registry ||
+        kzt_guest_registry_find_live_object(
+            registry, source_link_map, &source_match) != 0 ||
+        !source_match.generation ||
+        source_match.namespace_id_status != KZT_GUEST_FIELD_OK ||
+        source_match.namespace_id != 0 ||
+        kzt_guest_registry_source_lease_acquire(
+            registry, source_link_map, source_match.generation,
+            source_match.namespace_id, &source_lease) != 0) {
+        return result;
+    }
+    result = production_mandatory_slot_transaction(
+        slot_addr, expected, replacement, final_value);
+    kzt_guest_registry_source_lease_release(&source_lease);
     return result;
+}
+
+typedef struct kzt_production_eager_write_state {
+    const kzt_guest_registry_patch_decision_lease_t *decision_lease;
+    uintptr_t expected;
+    uintptr_t replacement;
+    uintptr_t observed;
+    int cas_mismatch;
+} kzt_production_eager_write_state_t;
+
+static int production_eager_write_validate(
+    const kzt_patch_decision_t *decision, void *opaque)
+{
+    kzt_production_eager_write_state_t *state = opaque;
+    const kzt_guest_registry_patch_decision_lease_t *lease =
+        state ? state->decision_lease : NULL;
+
+    return state && decision && lease && lease->active &&
+           decision->source.link_map_addr == lease->link_map_addr &&
+           decision->source.generation == lease->generation &&
+           decision->slot_current_value == state->expected &&
+           decision->bridge_target == state->replacement ? 0 : -1;
+}
+
+static int production_eager_write_cas(uintptr_t slot_addr, uintptr_t value,
+                                      void *opaque)
+{
+    kzt_production_eager_write_state_t *state = opaque;
+    uintptr_t expected;
+    int exchanged;
+
+    if (!state || !slot_addr) {
+        return -1;
+    }
+    expected = value == state->replacement ? state->expected :
+                                              state->replacement;
+    exchanged = __atomic_compare_exchange_n(
+        (uintptr_t *)slot_addr, &expected, value, 0,
+        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) ? 1 : 0;
+    state->observed = expected;
+    state->cas_mismatch = !exchanged;
+#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
+    kzt_jump_slot_production_test_after_slot_cas(exchanged);
+#endif
+    return exchanged ? 0 : -1;
+}
+
+kzt_production_slot_transaction_result_t
+kzt_production_eager_relocation_write(
+    box64context_t *context, uintptr_t source_link_map,
+    const kzt_patch_object_ref_t *owner,
+    kzt_patch_relocation_type_t reloc_type, uintptr_t slot_addr,
+    uintptr_t expected, uintptr_t replacement, const char *symbol_name,
+    kzt_symbol_version_evidence_t version_evidence, const char *version,
+    uintptr_t *final_value)
+{
+    kzt_guest_registry_t *registry;
+    kzt_guest_registry_address_match_t source_match;
+    kzt_guest_registry_source_lease_t source_lease = { 0 };
+    kzt_guest_registry_patch_decision_lease_t decision_lease = { 0 };
+    kzt_patch_object_ref_t current_owner;
+    kzt_patch_decision_t decision;
+    kzt_patch_spike_record_t record;
+    kzt_production_eager_write_state_t state;
+    kzt_patch_spike_slot_ops_t slot_ops;
+    kzt_production_slot_transaction_result_t result =
+        KZT_PRODUCTION_SLOT_TRANSACTION_ERROR;
+
+    if (final_value) {
+        *final_value = expected;
+    }
+    if (!context || !source_link_map || !slot_addr || !replacement ||
+        !symbol_name || !symbol_name[0] ||
+        (reloc_type != KZT_PATCH_RELOCATION_GLOB_DAT &&
+         reloc_type != KZT_PATCH_RELOCATION_JUMP_SLOT) ||
+        !kzt_symbol_version_evidence_valid(version_evidence, version)) {
+        return result;
+    }
+    registry = KztGuestRegistryForContext(context);
+    if (!registry ||
+        kzt_guest_registry_find_live_object(
+            registry, source_link_map, &source_match) != 0 ||
+        !source_match.generation ||
+        source_match.namespace_id_status != KZT_GUEST_FIELD_OK ||
+        source_match.namespace_id != 0 ||
+        kzt_guest_registry_source_lease_acquire(
+            registry, source_link_map, source_match.generation,
+            source_match.namespace_id, &source_lease) != 0 ||
+        kzt_guest_registry_patch_decision_lease_acquire(
+            &source_lease, &decision_lease) != 0) {
+        kzt_guest_registry_source_lease_release(&source_lease);
+        return result;
+    }
+    current_owner = owner && owner->known && owner->link_map_addr &&
+                            owner->generation ? *owner :
+        (kzt_patch_object_ref_t) {
+            .known = 1,
+            .link_map_addr = source_lease.link_map_addr,
+            .generation = source_lease.generation,
+        };
+    decision = (kzt_patch_decision_t) {
+        .kind = KZT_PATCH_DECISION_APPROVED,
+        .reason = KZT_PATCH_REASON_APPROVED_NATIVE_BRIDGE,
+        .allow_native_bridge = 1,
+        .source = {
+            .known = 1,
+            .link_map_addr = source_lease.link_map_addr,
+            .generation = source_lease.generation,
+        },
+        .dynamic_view_generation = source_lease.generation,
+        .dynamic_view_available = 1,
+        .table_kind = reloc_type == KZT_PATCH_RELOCATION_JUMP_SLOT ?
+            KZT_PATCH_TABLE_PLT_RELA : KZT_PATCH_TABLE_RELA,
+        .reloc_type = reloc_type,
+        .slot_addr = slot_addr,
+        .slot_current_value_present = 1,
+        .slot_current_value = expected,
+        .symbol_name = symbol_name,
+        .version_evidence = version_evidence,
+        .version = version,
+        .current_owner = current_owner,
+        .owner_match = KZT_PATCH_OWNER_MATCH,
+        .bridge_target = replacement,
+    };
+    state = (kzt_production_eager_write_state_t) {
+        .decision_lease = &decision_lease,
+        .expected = expected,
+        .replacement = replacement,
+        .observed = expected,
+    };
+    slot_ops = (kzt_patch_spike_slot_ops_t) {
+        .read_slot = production_slot_load,
+        .write_slot = production_eager_write_cas,
+        .begin_write = production_slot_begin_write,
+        .end_write = production_slot_end_write,
+        .validate_generation = production_eager_write_validate,
+        .opaque = &state,
+    };
+    if (kzt_patch_spike_writer_try_apply_with_slot_ops(
+            KztPatchSpikeGuardForContext(context), &decision,
+            &slot_ops, &record) == 0) {
+        if (record.result == KZT_PATCH_SPIKE_RESULT_APPLIED) {
+            result = KZT_PRODUCTION_SLOT_TRANSACTION_APPLIED;
+        } else if (record.result == KZT_PATCH_SPIKE_RESULT_ROLLED_BACK) {
+            result = KZT_PRODUCTION_SLOT_TRANSACTION_ROLLED_BACK;
+        } else if (record.result == KZT_PATCH_SPIKE_RESULT_UNRECOVERABLE) {
+            result = KZT_PRODUCTION_SLOT_TRANSACTION_UNRECOVERABLE;
+        } else if (record.result == KZT_PATCH_SPIKE_RESULT_CIRCUIT_OPEN) {
+            result = KZT_PRODUCTION_SLOT_TRANSACTION_CIRCUIT_OPEN;
+        } else if (state.cas_mismatch) {
+            result = KZT_PRODUCTION_SLOT_TRANSACTION_CAS_MISMATCH;
+        }
+    }
+    if (final_value) {
+        *final_value = __atomic_load_n(
+            (uintptr_t *)slot_addr, __ATOMIC_ACQUIRE);
+    }
+    kzt_guest_registry_patch_decision_lease_release(&decision_lease);
+    kzt_guest_registry_source_lease_release(&source_lease);
+    return result;
+}
+
+typedef struct kzt_production_prebind_write_state {
+    const kzt_lazy_prebind_lease_t *lease;
+    uintptr_t expected;
+    uintptr_t replacement;
+    uintptr_t observed;
+    int cas_mismatch;
+} kzt_production_prebind_write_state_t;
+
+static int production_lazy_prebind_guard_validate(
+    const kzt_patch_decision_t *decision, void *opaque)
+{
+    kzt_production_prebind_write_state_t *state = opaque;
+    const kzt_lazy_prebind_lease_t *lease = state ? state->lease : NULL;
+    const kzt_lazy_prebind_record_t *record = lease ? &lease->record : NULL;
+
+    if (!state || !decision || !lease || !lease->active || !record ||
+        (lease->operation != KZT_LAZY_PREBIND_LEASE_PUBLISH &&
+         lease->operation != KZT_LAZY_PREBIND_LEASE_REVOKE) ||
+        decision->source.link_map_addr != record->source.link_map_addr ||
+        decision->source.generation != record->source.generation ||
+        decision->slot_addr != record->slot_addr ||
+        decision->slot_current_value != state->expected ||
+        decision->bridge_target != state->replacement) {
+        return -1;
+    }
+    return lease->operation == KZT_LAZY_PREBIND_LEASE_REVOKE ||
+           kzt_lazy_prebind_scope_lease_valid(lease) ? 0 : -1;
+}
+
+static int production_lazy_prebind_guard_write(
+    uintptr_t slot_addr, uintptr_t value, void *opaque)
+{
+    kzt_production_prebind_write_state_t *state = opaque;
+    uintptr_t expected;
+    int exchanged;
+
+    if (!state || !slot_addr || !value) {
+        return -1;
+    }
+    expected = value == state->replacement ? state->expected :
+                                              state->replacement;
+    exchanged = __atomic_compare_exchange_n(
+        (uintptr_t *)slot_addr, &expected, value, 0,
+        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) ? 1 : 0;
+    state->observed = expected;
+    state->cas_mismatch = !exchanged;
+#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
+    kzt_jump_slot_production_test_after_slot_cas(exchanged);
+#endif
+    return exchanged ? 0 : -1;
 }
 
 static kzt_production_slot_transaction_result_t
 production_lazy_prebind_slot_cas(
-    box64context_t *context, uintptr_t slot_addr, uintptr_t expected,
-    uintptr_t replacement, uintptr_t *observed)
+    box64context_t *context, const kzt_lazy_prebind_lease_t *lease,
+    uintptr_t expected, uintptr_t replacement, uintptr_t *observed)
 {
-    kzt_patch_spike_permission_lease_t permission_lease = { 0 };
-    uintptr_t current = expected;
-    uintptr_t rollback_expected = replacement;
-    int exchanged;
-    int rollback_succeeded = 1;
-    int restore_succeeded;
+    const kzt_lazy_prebind_record_t *record = lease ? &lease->record : NULL;
+    const kzt_lazy_prebind_identity_t *owner_identity;
+    kzt_patch_decision_t decision;
+    kzt_patch_spike_record_t writer_record;
+    kzt_production_prebind_write_state_t state;
+    kzt_patch_spike_slot_ops_t slot_ops;
+    kzt_production_slot_transaction_result_t result =
+        KZT_PRODUCTION_SLOT_TRANSACTION_ERROR;
 
     if (observed) {
-        *observed = 0;
+        *observed = expected;
     }
-    if (!context || !slot_addr || !expected || !replacement) {
-        return KZT_PRODUCTION_SLOT_TRANSACTION_ERROR;
+    if (!context || !lease || !lease->active || !record ||
+        !record->source.link_map_addr || !record->source.generation ||
+        !record->slot_addr || !expected || !replacement ||
+        !record->symbol[0]) {
+        return result;
     }
-    if (kzt_patch_spike_guard_circuit_open(
-            KztPatchSpikeGuardForContext(context))) {
-        return KZT_PRODUCTION_SLOT_TRANSACTION_CIRCUIT_OPEN;
-    }
-    if (
-        production_slot_begin_write(slot_addr, &permission_lease, NULL) != 0) {
-        if (permission_lease.mmap_lock_held &&
-            production_slot_finish_write(&permission_lease) != 0 &&
-            production_slot_finish_write(&permission_lease) != 0) {
-            kzt_patch_spike_guard_trip(KztPatchSpikeGuardForContext(context));
-            return KZT_PRODUCTION_SLOT_TRANSACTION_UNRECOVERABLE;
+    owner_identity = replacement == record->bridge_target ?
+        &record->provider : &record->source;
+    decision = (kzt_patch_decision_t) {
+        .kind = KZT_PATCH_DECISION_APPROVED,
+        .reason = KZT_PATCH_REASON_APPROVED_NATIVE_BRIDGE,
+        .allow_native_bridge = 1,
+        .source = {
+            .known = 1,
+            .link_map_addr = record->source.link_map_addr,
+            .generation = record->source.generation,
+        },
+        .dynamic_view_generation = record->source.generation,
+        .dynamic_view_available = 1,
+        .table_kind = KZT_PATCH_TABLE_PLT_RELA,
+        .entry_index = record->relocation_index,
+        .reloc_type = KZT_PATCH_RELOCATION_JUMP_SLOT,
+        .slot_addr = record->slot_addr,
+        .slot_current_value_present = 1,
+        .slot_current_value = expected,
+        .symbol_name = record->symbol,
+        .version_evidence = record->version_evidence,
+        .version = record->version[0] ? record->version : NULL,
+        .current_owner = {
+            .known = 1,
+            .link_map_addr = owner_identity->link_map_addr,
+            .generation = owner_identity->generation,
+        },
+        .owner_match = KZT_PATCH_OWNER_MATCH,
+        .bridge_target = replacement,
+    };
+    state = (kzt_production_prebind_write_state_t) {
+        .lease = lease,
+        .expected = expected,
+        .replacement = replacement,
+        .observed = expected,
+    };
+    slot_ops = (kzt_patch_spike_slot_ops_t) {
+        .read_slot = production_slot_load,
+        .write_slot = production_lazy_prebind_guard_write,
+        .begin_write = production_slot_begin_write,
+        .end_write = production_slot_end_write,
+        .validate_generation = production_lazy_prebind_guard_validate,
+        .opaque = &state,
+    };
+    if (kzt_patch_spike_writer_try_apply_with_slot_ops(
+            KztPatchSpikeGuardForContext(context), &decision,
+            &slot_ops, &writer_record) == 0) {
+        if (writer_record.result == KZT_PATCH_SPIKE_RESULT_APPLIED) {
+            result = KZT_PRODUCTION_SLOT_TRANSACTION_APPLIED;
+        } else if (writer_record.result ==
+                   KZT_PATCH_SPIKE_RESULT_ROLLED_BACK) {
+            result = KZT_PRODUCTION_SLOT_TRANSACTION_ROLLED_BACK;
+        } else if (writer_record.result ==
+                   KZT_PATCH_SPIKE_RESULT_UNRECOVERABLE) {
+            result = KZT_PRODUCTION_SLOT_TRANSACTION_UNRECOVERABLE;
+        } else if (writer_record.result ==
+                   KZT_PATCH_SPIKE_RESULT_CIRCUIT_OPEN) {
+            result = KZT_PRODUCTION_SLOT_TRANSACTION_CIRCUIT_OPEN;
+        } else if (state.cas_mismatch) {
+            result = KZT_PRODUCTION_SLOT_TRANSACTION_CAS_MISMATCH;
         }
-        return KZT_PRODUCTION_SLOT_TRANSACTION_ERROR;
     }
-    exchanged = __atomic_compare_exchange_n(
-        (uintptr_t *)slot_addr, &current, replacement, 0,
-        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) ? 1 : 0;
-#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
-    kzt_jump_slot_production_test_after_slot_cas(exchanged);
-#endif
     if (observed) {
-        *observed = current;
+        *observed = __atomic_load_n(
+            (uintptr_t *)record->slot_addr, __ATOMIC_ACQUIRE);
     }
-    if (production_slot_finish_write(&permission_lease) == 0) {
-        return exchanged ? KZT_PRODUCTION_SLOT_TRANSACTION_APPLIED :
-                           KZT_PRODUCTION_SLOT_TRANSACTION_CAS_MISMATCH;
-    }
-
-    if (exchanged) {
-        rollback_succeeded = __atomic_compare_exchange_n(
-            (uintptr_t *)slot_addr, &rollback_expected, expected, 0,
-            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) ? 1 : 0;
-#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
-        kzt_jump_slot_production_test_after_slot_cas(rollback_succeeded);
-#endif
-        if (observed) {
-            *observed = rollback_succeeded ? expected : rollback_expected;
-        }
-    }
-    restore_succeeded = production_slot_finish_write(&permission_lease) == 0;
-    if (rollback_succeeded && restore_succeeded) {
-        return exchanged ? KZT_PRODUCTION_SLOT_TRANSACTION_ROLLED_BACK :
-                           KZT_PRODUCTION_SLOT_TRANSACTION_CAS_MISMATCH;
-    }
-
-    kzt_patch_spike_guard_trip(KztPatchSpikeGuardForContext(context));
-    return KZT_PRODUCTION_SLOT_TRANSACTION_UNRECOVERABLE;
+    return result;
 }
 
 static int production_prevalidate_write_evidence(
@@ -599,10 +1557,24 @@ static int production_prevalidate_write_evidence(
             decision->source.link_map_addr ||
         state->held_decision_lease->generation != decision->source.generation ||
         state->held_decision_lease->namespace_id != 0 ||
-        !state->retained_provider_handle ||
-        !state->retained_provider_handle->bindings ||
-        !state->retained_provider_handle->entry ||
-        state->retained_provider_handle->library != state->resolved_provider ||
+        !production_exact_provider_handle_matches(state) ||
+        !state->loader_quiescence_lease.bindings ||
+        !state->loader_quiescence_lease.cookie ||
+        (state->wrapper_alias_borrowed &&
+         (!state->alias_proof.valid ||
+          !kzt_guest_library_wrapper_alias_symbol_allowed(
+              decision->symbol_name))) ||
+        (state->wrapper_alias_borrowed &&
+         !production_wrapper_alias_provider_matches(
+             state, &state->exact_provider_owner)) ||
+        (!state->wrapper_alias_borrowed &&
+         (state->exact_provider_key.link_map_addr !=
+              decision->current_owner.link_map_addr ||
+          state->exact_provider_key.generation !=
+              decision->current_owner.generation ||
+          state->exact_provider_key.namespace_id != state->owner_namespace_id ||
+          state->exact_provider_key.namespace_kind !=
+              KZT_GUEST_LIBRARY_NAMESPACE_MAIN)) ||
         !state->exact_provider_owner.known ||
         state->exact_provider_owner.link_map_addr !=
             decision->current_owner.link_map_addr ||
@@ -640,19 +1612,30 @@ static int production_prevalidate_write_evidence(
                         __ATOMIC_ACQUIRE) != decision->slot_current_value) {
         goto out;
     }
-    kzt_owner_resolver_init(&owner_resolution);
-    if (kzt_owner_resolver_resolve_current(
-            KztGuestRegistryForContext(state->context),
-            decision->slot_current_value, decision->slot_current_value,
-            &owner_resolution) != 0 ||
-        owner_resolution.status != KZT_OWNER_RESOLVER_RESOLVED ||
-        owner_resolution.owner_match != KZT_PATCH_OWNER_MATCH ||
-        !owner_resolution.current_owner.known ||
-        owner_resolution.current_owner.link_map_addr !=
-            decision->current_owner.link_map_addr ||
-        owner_resolution.current_owner.generation !=
-            decision->current_owner.generation) {
-        goto out;
+    if (state->exact_owner_symbol_proof) {
+        if (!production_exact_owner_symbol_matches(
+                state, &decision->current_owner,
+                decision->slot_current_value,
+                state->initial_request.symbol_name,
+                state->initial_request.version_evidence,
+                state->initial_request.version)) {
+            goto out;
+        }
+    } else {
+        kzt_owner_resolver_init(&owner_resolution);
+        if (kzt_owner_resolver_resolve_current(
+                KztGuestRegistryForContext(state->context),
+                decision->slot_current_value, decision->slot_current_value,
+                &owner_resolution) != 0 ||
+            owner_resolution.status != KZT_OWNER_RESOLVER_RESOLVED ||
+            owner_resolution.owner_match != KZT_PATCH_OWNER_MATCH ||
+            !owner_resolution.current_owner.known ||
+            owner_resolution.current_owner.link_map_addr !=
+                decision->current_owner.link_map_addr ||
+            owner_resolution.current_owner.generation !=
+                decision->current_owner.generation) {
+            goto out;
+        }
     }
     valid = 1;
 out:
@@ -675,6 +1658,12 @@ static int production_decision_matches_prevalidated(
            decision->slot_addr == prevalidated->slot_addr &&
            decision->slot_current_value_present &&
            decision->slot_current_value == prevalidated->slot_current_value &&
+           decision->symbol_index == prevalidated->symbol_index &&
+           decision->symbol_name && prevalidated->symbol_name &&
+           strcmp(decision->symbol_name, prevalidated->symbol_name) == 0 &&
+           kzt_symbol_version_evidence_matches(
+               decision->version_evidence, decision->version,
+               prevalidated->version_evidence, prevalidated->version) &&
            decision->current_owner.known == prevalidated->current_owner.known &&
            decision->current_owner.link_map_addr ==
                prevalidated->current_owner.link_map_addr &&
@@ -693,18 +1682,46 @@ static int production_validate_prevalidated_write(
         .read_memory = production_read_guest_memory,
     };
     kzt_guest_symbol_scope_result_t revalidated;
-
     if (!state || !decision || !state->prevalidated_decision_valid ||
+        !state->held_source_lease || !state->held_source_lease->active ||
         !state->held_decision_lease || !state->held_decision_lease->active ||
-        !state->retained_provider_handle ||
-        state->retained_provider_handle->library != state->resolved_provider ||
+        !state->loader_quiescence_lease.bindings ||
+        !state->loader_quiescence_lease.cookie ||
+        !production_exact_provider_handle_matches(state) ||
+        (state->wrapper_alias_borrowed &&
+         (!state->alias_proof.valid ||
+          !kzt_guest_library_wrapper_alias_symbol_allowed(
+              decision->symbol_name))) ||
+        (!state->wrapper_alias_borrowed &&
+         (state->exact_provider_key.link_map_addr !=
+              decision->current_owner.link_map_addr ||
+          state->exact_provider_key.generation !=
+              decision->current_owner.generation ||
+          state->exact_provider_key.namespace_id != state->owner_namespace_id ||
+          state->exact_provider_key.namespace_kind !=
+              KZT_GUEST_LIBRARY_NAMESPACE_MAIN)) ||
         !production_decision_matches_prevalidated(
             decision, &state->prevalidated_decision) ||
-        kzt_guest_symbol_scope_revalidate(
-            &state->symbol_scope_proof, &state->symbol_scope_request,
-            &reader_ops, &revalidated) != KZT_GUEST_SYMBOL_SCOPE_SAFE ||
         __atomic_load_n((uintptr_t *)decision->slot_addr,
                         __ATOMIC_ACQUIRE) != decision->slot_current_value) {
+        return -1;
+    }
+    if (state->wrapper_alias_borrowed &&
+        !production_wrapper_alias_provider_matches(
+            state, &decision->current_owner)) {
+        return -1;
+    }
+    if (state->exact_owner_symbol_proof) {
+        if (!production_exact_owner_symbol_matches(
+                state, &decision->current_owner,
+                decision->slot_current_value, decision->symbol_name,
+                decision->version_evidence, decision->version)) {
+            return -1;
+        }
+    } else if (kzt_guest_symbol_scope_revalidate(
+                   &state->symbol_scope_proof, &state->symbol_scope_request,
+                   &reader_ops, &revalidated) !=
+               KZT_GUEST_SYMBOL_SCOPE_SAFE) {
         return -1;
     }
     return 0;
@@ -724,11 +1741,13 @@ static int production_enrich(
                                                NULL,
         .bridge_ops = wrapper_provider ? &wrapper_provider->bridge_ops : NULL,
     };
+    int status;
 #ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
     kzt_jump_slot_production_test_full_enrich();
 #endif
-    return kzt_rela_immediate_request_enrich(request, &enrich_input,
-                                             enrich_result);
+    status = kzt_rela_immediate_request_enrich(
+        request, &enrich_input, enrich_result);
+    return status;
 }
 
 static int production_enrich_wrapper_only(
@@ -880,7 +1899,6 @@ typedef struct kzt_lazy_direct_production_state {
     kzt_guest_library_binding_key_t provider_key;
     kzt_guest_library_handle_t provider_handle;
     int provider_handle_owned;
-    kzt_guest_library_loader_quiescence_lease_t loader_quiescence_lease;
     kzt_wrapper_bridge_provider_t wrapper_provider;
     kzt_wrapper_probe_result_t wrapper_probe;
     kzt_guest_symbol_scope_request_t symbol_scope_request;
@@ -889,6 +1907,14 @@ typedef struct kzt_lazy_direct_production_state {
     kzt_lazy_direct_timing_t *timing;
     int timing_enabled;
     int prebind_hit;
+    int exact_symbol_provider;
+    const kzt_lazy_direct_route_input_t *guard_input;
+    const kzt_lazy_direct_route_provider_t *guard_provider;
+    const kzt_lazy_direct_route_bridge_t *guard_bridge;
+    const kzt_lazy_direct_route_lease_t *guard_lease;
+    uintptr_t guard_expected;
+    uintptr_t guard_replacement;
+    int guard_cas_mismatch;
 } kzt_lazy_direct_production_state_t;
 
 struct kzt_lazy_direct_timing {
@@ -999,7 +2025,7 @@ static int production_lazy_prebind_publish_record(
         return 0;
     }
     writer_result = production_lazy_prebind_slot_cas(
-        context, record->slot_addr, record->expected_slot,
+        context, &lease, record->expected_slot,
         record->bridge_target, &observed);
     committed = writer_result == KZT_PRODUCTION_SLOT_TRANSACTION_APPLIED;
     kzt_lazy_prebind_scope_publish_finish(&lease, committed);
@@ -1024,6 +2050,47 @@ static int production_lazy_prebind_publish_record(
     return committed ? 1 : 0;
 }
 
+static size_t production_lazy_prebind_find_symbol_index(
+    const kzt_guest_dynamic_view_t *view,
+    const kzt_guest_link_map_reader_ops_t *reader_ops,
+    const kzt_patch_object_ref_t *source,
+    unsigned long dynamic_view_generation,
+    size_t relocation_count, const char *symbol_name)
+{
+    size_t index;
+
+    if (!view || !reader_ops || !source || !dynamic_view_generation ||
+        !symbol_name || !symbol_name[0]) {
+        return relocation_count;
+    }
+    for (index = 0; index < relocation_count; ++index) {
+        kzt_patch_candidate_t candidate = { 0 };
+        char candidate_strings[512] = { 0 };
+        kzt_runtime_got_plt_candidate_result_t result;
+        kzt_runtime_got_plt_candidate_request_t request = {
+            .view = view,
+            .reader_ops = reader_ops,
+            .source = source,
+            .dynamic_view_generation = dynamic_view_generation,
+            .only_entry = 1,
+            .only_table_kind = KZT_PATCH_TABLE_PLT_RELA,
+            .only_entry_index = index,
+            .candidates = &candidate,
+            .candidate_capacity = 1,
+            .string_storage = candidate_strings,
+            .string_storage_size = sizeof(candidate_strings),
+        };
+
+        if (kzt_runtime_got_plt_candidates_collect(&request, &result) == 0 &&
+            result.status == KZT_RUNTIME_GOT_PLT_CANDIDATE_OK &&
+            result.candidate_count == 1 && candidate.symbol_name &&
+            strcmp(candidate.symbol_name, symbol_name) == 0) {
+            return index;
+        }
+    }
+    return relocation_count;
+}
+
 /* This runs under kzt_per_object_got_plt_apply's exact source and decision
  * leases.  It records already-proven facts only and deliberately has no slot
  * writer: the resolver retains the final Registry, fingerprint, and CAS gate. */
@@ -1045,7 +2112,10 @@ static int production_lazy_prebind_object_prepare(
     uintptr_t namespace_head = 0;
     size_t relocation_count;
     size_t index;
+    size_t iteration;
+    size_t dlerror_index;
     size_t prepared = 0;
+    int source_dlerror_native = 0;
     kzt_patch_object_ref_t source_ref;
 
     if (!context || !head || !head->self_link_map || !source_generation ||
@@ -1093,7 +2163,10 @@ static int production_lazy_prebind_object_prepare(
         .soname = head->name,
         .path = head->path,
     };
-    for (index = 0; index < relocation_count; ++index) {
+    dlerror_index = production_lazy_prebind_find_symbol_index(
+        source_dynamic_view, &reader_ops, &source_ref, source_generation,
+        relocation_count, "dlerror");
+    for (iteration = 0; iteration < relocation_count; ++iteration) {
         kzt_runtime_got_plt_candidate_request_t collector_request;
         kzt_runtime_got_plt_candidate_result_t collector_result;
         kzt_patch_candidate_t candidate;
@@ -1107,6 +2180,21 @@ static int production_lazy_prebind_object_prepare(
         kzt_wrapper_probe_result_t wrapper_probe;
         kzt_wrapper_probe_request_t wrapper_request;
         kzt_lazy_prebind_record_t record;
+        int provider_status;
+        int published;
+
+        if (dlerror_index < relocation_count) {
+            if (iteration == 0) {
+                index = dlerror_index;
+            } else {
+                index = iteration - 1;
+                if (index >= dlerror_index) {
+                    ++index;
+                }
+            }
+        } else {
+            index = iteration;
+        }
 
         memset(&candidate, 0, sizeof(candidate));
         memset(candidate_strings, 0, sizeof(candidate_strings));
@@ -1139,6 +2227,9 @@ static int production_lazy_prebind_object_prepare(
                 head->gotplt_end) ||
             !candidate.symbol_name || !candidate.symbol_name[0] ||
             kzt_patch_symbol_must_stay_guest(candidate.symbol_name) ||
+            (kzt_patch_symbol_requires_dlerror_prebind(
+                 candidate.symbol_name) &&
+             !source_dlerror_native) ||
             production_symbol_scope_request(
                 context, head, source_generation, namespace_head,
                 source_dynamic_view, &reader_ops, candidate.symbol_index,
@@ -1165,11 +2256,26 @@ static int production_lazy_prebind_object_prepare(
         if (kzt_guest_library_access_lookup(
                 &context->kzt_guest_library_access, &provider_key,
                 &provider_handle) != 0 || !provider_handle.library ||
-            provider_handle.object_type != KZT_GUEST_LIBRARY_OBJECT_WRAPPED ||
-            kzt_rela_runtime_wrapper_provider_discover_retained_with_version_evidence(
-                context, &provider_handle, candidate.symbol_name,
-                candidate.version_evidence, candidate.version,
-                &wrapper_provider) <= 0) {
+            provider_handle.object_type != KZT_GUEST_LIBRARY_OBJECT_WRAPPED) {
+            kzt_guest_library_handle_release(&provider_handle);
+            continue;
+        }
+        if (production_symbol_uses_guarded_xcb_bridge(
+                candidate.symbol_name)) {
+            provider_status =
+                kzt_rela_runtime_wrapper_provider_discover_guarded_retained_with_version_evidence(
+                    context, &provider_handle, candidate.symbol_name,
+                    candidate.version_evidence, candidate.version,
+                    scope_proof.selected_provider_address,
+                    KZT_BRIDGE_GUARD_XCB_CONNECTION, &wrapper_provider);
+        } else {
+            provider_status =
+                kzt_rela_runtime_wrapper_provider_discover_retained_with_version_evidence(
+                    context, &provider_handle, candidate.symbol_name,
+                    candidate.version_evidence, candidate.version,
+                    &wrapper_provider);
+        }
+        if (provider_status <= 0) {
             kzt_guest_library_handle_release(&provider_handle);
             continue;
         }
@@ -1204,6 +2310,10 @@ static int production_lazy_prebind_object_prepare(
         record.bridge_target = wrapper_probe.bridge_target;
         record.bridge_generation = provider_key.generation;
         record.bridge_custom_wrapper = wrapper_provider.match.custom_wrapper;
+        record.loader_mutation_invariant =
+            record.bridge_custom_wrapper &&
+            kzt_patch_symbol_is_loader_route_family(record.symbol) &&
+            record.source.link_map_addr == namespace_head;
         record.scope_proof = scope_proof;
         kzt_lazy_prebind_claim_result_t claim =
             kzt_lazy_prebind_scope_claim(scope, &record);
@@ -1213,10 +2323,16 @@ static int production_lazy_prebind_object_prepare(
         }
         if (claim == KZT_LAZY_PREBIND_CLAIM_CREATED ||
             claim == KZT_LAZY_PREBIND_CLAIM_REUSED) {
-            (void)production_lazy_prebind_publish_record(context, scope,
-                                                          &record,
-                                                          target_prepare,
-                                                          target_prepare_opaque);
+            published = production_lazy_prebind_publish_record(
+                context, scope, &record, target_prepare,
+                target_prepare_opaque);
+            if (strcmp(record.symbol, "dlerror") == 0 &&
+                (published ||
+                 __atomic_load_n(
+                     (uintptr_t *)record.slot_addr, __ATOMIC_ACQUIRE) ==
+                     record.bridge_target)) {
+                source_dlerror_native = 1;
+            }
         }
         kzt_guest_library_handle_release(&provider_handle);
     }
@@ -1271,8 +2387,8 @@ static int production_lazy_prebind_revoke_closed(
             return -1;
         }
         record = lease.record;
-        writer_result = production_lazy_prebind_slot_cas(
-            context, record.slot_addr, record.bridge_target,
+        writer_result = production_mandatory_slot_transaction(
+            record.slot_addr, record.bridge_target,
             record.expected_slot, &observed);
         revoked =
             writer_result == KZT_PRODUCTION_SLOT_TRANSACTION_APPLIED ||
@@ -1281,8 +2397,11 @@ static int production_lazy_prebind_revoke_closed(
         kzt_lazy_prebind_scope_revoke_finish(&lease, revoked);
         printf_kzt_registry_diagnostics(
             "kzt_lazy_prebind_revoke schema=1 source=%p generation=%lu "
-            "slot=%p bridge=%p stub=%p result=%s writer=%s observed=%p\n",
+            "provider=%p provider_generation=%lu slot=%p bridge=%p stub=%p "
+            "result=%s writer=%s observed=%p\n",
             (void *)record.source.link_map_addr, record.source.generation,
+            (void *)record.provider.link_map_addr,
+            record.provider.generation,
             (void *)record.slot_addr, (void *)record.bridge_target,
             (void *)record.expected_slot,
             writer_result == KZT_PRODUCTION_SLOT_TRANSACTION_APPLIED ?
@@ -1326,8 +2445,10 @@ int kzt_production_lazy_prebind_retire(
 {
     kzt_lazy_prebind_scope_t *scope;
 
-    if (!context || !identity ||
-        !(scope = KztLazyPrebindScopeForContext(context)) ||
+    if (!context || !identity) {
+        return -1;
+    }
+    if (!(scope = KztLazyPrebindScopeForContext(context)) ||
         kzt_lazy_prebind_scope_retire(scope, identity) != 0) {
         return -1;
     }
@@ -1364,7 +2485,6 @@ void kzt_production_lazy_prebind_refresh(
             object->dynamic_view_status != KZT_GUEST_FIELD_OK ||
             object->dynamic_view.status != KZT_GUEST_DYNAMIC_COMPLETE ||
             !object->lazy_resolver.valid ||
-            !object->lazy_resolver.registry_owned_head ||
             !object->lazy_resolver.object_head ||
             object->state == KZT_GUEST_OBJECT_UNLOADING ||
             object->state == KZT_GUEST_OBJECT_DEAD ||
@@ -1419,8 +2539,8 @@ static int production_lazy_direct_acquire_provider(
     kzt_lazy_direct_production_state_t *state = opaque;
 
     if (!state || !input || !provider || !state->provider_handle_owned ||
-        !state->provider_handle.bindings || !state->provider_handle.entry ||
-        state->provider_handle.library != state->resolved_provider ||
+        state->evidence.retained_provider_handle != &state->provider_handle ||
+        !production_exact_provider_handle_matches(&state->evidence) ||
         state->provider_key.link_map_addr != input->provider.link_map_addr ||
         state->provider_key.generation != input->provider.generation) {
         return -1;
@@ -1487,6 +2607,7 @@ static int production_lazy_direct_find_bridge(
         state->wrapper_provider.match.resolved_bridge_target =
             record->bridge_target;
         state->wrapper_provider.match.resolved_bridge_exact = 1;
+        state->evidence.wrapper_provider = state->wrapper_provider;
         state->wrapper_probe = (kzt_wrapper_probe_result_t) {
             .wrapper_match = input->version_evidence ==
                              KZT_SYMBOL_VERSION_CONFIRMED_UNVERSIONED ?
@@ -1501,7 +2622,12 @@ static int production_lazy_direct_find_bridge(
             .target = record->bridge_target,
             .version_evidence = record->version_evidence,
             .version = record->version[0] ? record->version : NULL,
+            .transient_safe = record->bridge_custom_wrapper,
         };
+        if (!production_custom_dlsym_boundary_proven(
+                &state->evidence, input->symbol)) {
+            return -1;
+        }
         if (state->timing_enabled) {
             state->timing->bridge_discover_done =
                 production_lazy_direct_timing_now();
@@ -1511,14 +2637,25 @@ static int production_lazy_direct_find_bridge(
         return 0;
     }
     memset(&state->wrapper_provider, 0, sizeof(state->wrapper_provider));
-    status =
-        kzt_rela_runtime_wrapper_provider_discover_retained_with_version_evidence(
-            state->context, &state->provider_handle, input->symbol,
-            input->version_evidence, input->version,
-            &state->wrapper_provider);
+    if (production_symbol_uses_guarded_xcb_bridge(input->symbol)) {
+        status =
+            kzt_rela_runtime_wrapper_provider_discover_guarded_retained_with_version_evidence(
+                state->context, &state->provider_handle, input->symbol,
+                input->version_evidence, input->version,
+                state->preemption_proof.selected_provider_address,
+                KZT_BRIDGE_GUARD_XCB_CONNECTION,
+                &state->wrapper_provider);
+    } else {
+        status =
+            kzt_rela_runtime_wrapper_provider_discover_retained_with_version_evidence(
+                state->context, &state->provider_handle, input->symbol,
+                input->version_evidence, input->version,
+                &state->wrapper_provider);
+    }
     if (status <= 0) {
         return -1;
     }
+    state->evidence.wrapper_provider = state->wrapper_provider;
     if (state->timing_enabled) {
         state->timing->bridge_discover_done =
             production_lazy_direct_timing_now();
@@ -1539,10 +2676,15 @@ static int production_lazy_direct_find_bridge(
         !state->wrapper_probe.bridge_target) {
         return -1;
     }
+    if (!production_custom_dlsym_boundary_proven(
+            &state->evidence, input->symbol)) {
+        return -1;
+    }
     *bridge = (kzt_lazy_direct_route_bridge_t) {
         .target = state->wrapper_probe.bridge_target,
         .version_evidence = state->wrapper_probe.wrapper_version_evidence,
         .version = state->wrapper_probe.wrapper_symbol_version,
+        .transient_safe = state->wrapper_provider.match.custom_wrapper,
     };
     if (state->timing_enabled) {
         state->timing->bridge_done = production_lazy_direct_timing_now();
@@ -1558,11 +2700,21 @@ static int production_lazy_direct_acquire_decision_lease(
     kzt_lazy_direct_production_state_t *state = opaque;
 
     if (!state || !input || !provider || !lease ||
-        provider->handle != &state->provider_handle ||
+        provider->handle != &state->provider_handle) {
+        return -1;
+    }
+#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
+    kzt_jump_slot_production_test_before_patch_decision_lease_acquire();
+#endif
+    if (!state->decision_lease.active &&
         kzt_guest_registry_patch_decision_lease_acquire(
             &state->source_lease, &state->decision_lease) != 0) {
         return -1;
     }
+#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
+    kzt_jump_slot_production_test_after_patch_decision_lease_acquire();
+#endif
+    state->evidence.held_decision_lease = &state->decision_lease;
     lease->handle = &state->decision_lease;
     lease->active = state->decision_lease.active;
     if (state->timing_enabled) {
@@ -1577,8 +2729,12 @@ static void production_lazy_direct_release_decision_lease(
     kzt_lazy_direct_production_state_t *state = opaque;
 
     if (state && state->decision_lease.active) {
+#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
+        kzt_jump_slot_production_test_before_patch_decision_lease_release();
+#endif
         kzt_guest_registry_patch_decision_lease_release(
             &state->decision_lease);
+        state->evidence.held_decision_lease = NULL;
     }
     if (lease) {
         memset(lease, 0, sizeof(*lease));
@@ -1598,8 +2754,15 @@ static int production_lazy_direct_validate_final(
         .read_memory = production_read_guest_memory,
     };
     kzt_guest_symbol_scope_result_t revalidated;
+    uintptr_t slot_value = 0;
     int valid = 0;
 
+    if (state) {
+        state->guard_input = input;
+        state->guard_provider = provider;
+        state->guard_bridge = bridge;
+        state->guard_lease = lease;
+    }
     if (!state || !input || !provider || !bridge || !lease ||
         !lease->active || lease->handle != &state->decision_lease ||
         !state->decision_lease.active ||
@@ -1612,10 +2775,11 @@ static int production_lazy_direct_validate_final(
          !kzt_lazy_prebind_scope_lease_valid(&state->prebind_lease)) ||
         !state->provider_handle_owned ||
         provider->handle != &state->provider_handle ||
-        state->provider_handle.library != state->resolved_provider ||
-        state->loader_quiescence_lease.bindings !=
+        state->evidence.retained_provider_handle != &state->provider_handle ||
+        !production_exact_provider_handle_matches(&state->evidence) ||
+        state->evidence.loader_quiescence_lease.bindings !=
             state->provider_handle.bindings ||
-        !state->loader_quiescence_lease.cookie ||
+        !state->evidence.loader_quiescence_lease.cookie ||
         state->wrapper_provider.match.retained_provider_handle !=
             &state->provider_handle ||
         bridge->target != state->wrapper_probe.bridge_target ||
@@ -1634,21 +2798,99 @@ static int production_lazy_direct_validate_final(
         kzt_guest_registry_dynamic_view_matches(
             state->registry, input->source.link_map_addr,
             input->source.generation,
-            input->source_dynamic_view) != 0 ||
-        kzt_guest_symbol_scope_revalidate(
-            &state->preemption_proof, &state->symbol_scope_request,
-            &reader_ops, &revalidated) !=
-            KZT_GUEST_SYMBOL_SCOPE_SAFE) {
+            input->source_dynamic_view) != 0) {
         goto out;
     }
-    valid = __atomic_load_n((uintptr_t *)input->slot_addr,
-                            __ATOMIC_ACQUIRE) ==
-            input->expected_current_slot;
+    if (state->exact_symbol_provider) {
+        const kzt_patch_object_ref_t *owner =
+            &state->evidence.base_enrich_result.owner_resolution.current_owner;
+
+        if (!kzt_loader_lifecycle_runtime_healthy(state->context) ||
+            (state->evidence.wrapper_alias_borrowed
+                 ? (!kzt_guest_library_wrapper_alias_symbol_allowed(
+                        input->symbol) ||
+                    !production_wrapper_alias_provider_matches(
+                        &state->evidence, owner))
+                 : (state->provider_key.link_map_addr !=
+                        owner->link_map_addr ||
+                    state->provider_key.generation != owner->generation)) ||
+            !production_exact_owner_symbol_matches(
+                &state->evidence, owner,
+                state->preemption_proof.selected_provider_address,
+                input->symbol, input->version_evidence, input->version)) {
+            goto out;
+        }
+    } else if (kzt_guest_symbol_scope_revalidate(
+                   &state->preemption_proof, &state->symbol_scope_request,
+                   &reader_ops, &revalidated) !=
+               KZT_GUEST_SYMBOL_SCOPE_SAFE) {
+        goto out;
+    }
+    valid = production_slot_load(input->slot_addr, &slot_value, state) == 0 &&
+            slot_value == input->expected_current_slot;
 out:
     if (state && state->timing_enabled) {
         state->timing->final_done = production_lazy_direct_timing_now();
     }
     return valid;
+}
+
+static int production_lazy_direct_guard_validate(
+    const kzt_patch_decision_t *decision, void *opaque)
+{
+    kzt_lazy_direct_production_state_t *state = opaque;
+
+    if (!state || !decision || !state->guard_input ||
+        !state->guard_provider || !state->guard_bridge ||
+        !state->guard_lease ||
+        decision->source.link_map_addr !=
+            state->guard_input->source.link_map_addr ||
+        decision->source.generation !=
+            state->guard_input->source.generation ||
+        decision->slot_addr != state->guard_input->slot_addr ||
+        decision->slot_current_value != state->guard_expected ||
+        decision->bridge_target != state->guard_replacement ||
+        !decision->symbol_name || !state->guard_input->symbol ||
+        strcmp(decision->symbol_name, state->guard_input->symbol) != 0) {
+        return -1;
+    }
+    return production_lazy_direct_validate_final(
+               state->guard_input, state->guard_provider,
+               state->guard_bridge, state->guard_lease, state) > 0 ? 0 : -1;
+}
+
+static int production_lazy_direct_guard_write(uintptr_t slot_addr,
+                                               uintptr_t value,
+                                               void *opaque)
+{
+    kzt_lazy_direct_production_state_t *state = opaque;
+    uintptr_t expected;
+    int exchanged;
+
+    if (!state || !slot_addr || !value) {
+        return -1;
+    }
+    expected = value == state->guard_replacement ? state->guard_expected :
+                                                   state->guard_replacement;
+    if (value == state->guard_replacement &&
+        state->wrapper_provider.match.custom_wrapper &&
+        strcmp(state->evidence.runtime_candidate.symbol_name,
+               "dlerror") == 0 &&
+        kzt_guest_dl_api_publish_dlerror_entry(
+            state->context->dlprivate,
+            state->evidence.runtime_candidate.symbol_name,
+            state->preemption_proof.selected_provider_address,
+            state->wrapper_provider.match.custom_wrapper) != 0) {
+        return -1;
+    }
+    exchanged = __atomic_compare_exchange_n(
+        (uintptr_t *)slot_addr, &expected, value, 0,
+        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    state->guard_cas_mismatch = !exchanged;
+#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
+    kzt_jump_slot_production_test_after_slot_cas(exchanged);
+#endif
+    return exchanged ? 0 : -1;
 }
 
 static kzt_lazy_direct_route_cas_status_t
@@ -1657,49 +2899,95 @@ production_lazy_direct_cas_slot(
     const kzt_lazy_direct_route_lease_t *lease, void *opaque)
 {
     kzt_lazy_direct_production_state_t *state = opaque;
-    uintptr_t observed = expected;
-    int exchanged;
+    kzt_patch_decision_t decision = { 0 };
+    kzt_patch_spike_record_t record;
+    kzt_patch_spike_slot_ops_t slot_ops = {
+        .read_slot = production_slot_load,
+        .write_slot = production_lazy_direct_guard_write,
+        .begin_write = production_slot_begin_write,
+        .end_write = production_slot_end_write,
+        .validate_generation = production_lazy_direct_guard_validate,
+        .opaque = state,
+    };
 
     if (!state || !lease || !lease->active ||
         lease->handle != &state->decision_lease ||
-        !state->decision_lease.active || !slot_addr || !replacement) {
+        !state->decision_lease.active || !state->guard_input ||
+        !state->guard_provider || !state->guard_bridge ||
+        !slot_addr || !replacement) {
         return KZT_LAZY_DIRECT_ROUTE_CAS_ERROR;
     }
-    if (kzt_patch_spike_guard_circuit_open(
-            KztPatchSpikeGuardForContext(state->context))) {
+    state->guard_lease = lease;
+    state->guard_expected = expected;
+    state->guard_replacement = replacement;
+    state->guard_cas_mismatch = 0;
+    decision = (kzt_patch_decision_t) {
+        .kind = KZT_PATCH_DECISION_APPROVED,
+        .reason = KZT_PATCH_REASON_APPROVED_NATIVE_BRIDGE,
+        .allow_native_bridge = 1,
+        .source = {
+            .known = 1,
+            .link_map_addr = state->guard_input->source.link_map_addr,
+            .generation = state->guard_input->source.generation,
+        },
+        .dynamic_view_generation =
+            state->guard_input->source_dynamic_view_generation,
+        .dynamic_view_available = 1,
+        .table_kind = KZT_PATCH_TABLE_PLT_RELA,
+        .reloc_type = KZT_PATCH_RELOCATION_JUMP_SLOT,
+        .slot_addr = slot_addr,
+        .slot_current_value_present = 1,
+        .slot_current_value = expected,
+        .symbol_name = state->guard_input->symbol,
+        .version_evidence = state->guard_input->version_evidence,
+        .version = state->guard_input->version,
+        .current_owner = state->evidence.exact_provider_owner,
+        .owner_match = KZT_PATCH_OWNER_MATCH,
+        .wrapper_match = state->wrapper_probe.wrapper_match,
+        .wrapper_name = state->wrapper_provider.entry.wrapper_name ?
+                            state->wrapper_provider.entry.wrapper_name :
+                            state->resolved_provider->name,
+        .wrapper_version_evidence =
+            state->wrapper_probe.wrapper_version_evidence,
+        .wrapper_symbol_version =
+            state->wrapper_probe.wrapper_symbol_version,
+        .bridge_target = replacement,
+    };
+    if (kzt_patch_spike_writer_try_apply_with_slot_ops(
+            KztPatchSpikeGuardForContext(state->context), &decision,
+            &slot_ops, &record) != 0) {
         return KZT_LAZY_DIRECT_ROUTE_CAS_ERROR;
     }
-    if (state->wrapper_provider.match.custom_wrapper &&
-        strcmp(state->evidence.runtime_candidate.symbol_name,
-               "dlerror") == 0 &&
-        kzt_guest_dl_api_publish_dlerror_entry(
-            state->context->dlprivate,
-            state->evidence.runtime_candidate.symbol_name,
-            state->preemption_proof.selected_provider_address,
-            state->wrapper_provider.match.custom_wrapper) != 0) {
-        return KZT_LAZY_DIRECT_ROUTE_CAS_ERROR;
-    }
-    exchanged = __atomic_compare_exchange_n(
-        (uintptr_t *)slot_addr, &observed, replacement, 0,
-        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
     if (state->timing_enabled) {
         state->timing->cas_done = production_lazy_direct_timing_now();
     }
-#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
-    kzt_jump_slot_production_test_after_slot_cas(exchanged);
-#endif
-    return exchanged ? KZT_LAZY_DIRECT_ROUTE_CAS_APPLIED :
-                       KZT_LAZY_DIRECT_ROUTE_CAS_MISMATCH;
+    if (record.result == KZT_PATCH_SPIKE_RESULT_APPLIED) {
+        return KZT_LAZY_DIRECT_ROUTE_CAS_APPLIED;
+    }
+    if (record.result == KZT_PATCH_SPIKE_RESULT_BUDGET_EXHAUSTED) {
+        return KZT_LAZY_DIRECT_ROUTE_CAS_BUDGET_EXHAUSTED;
+    }
+    if (record.result == KZT_PATCH_SPIKE_RESULT_ROLLED_BACK) {
+        return KZT_LAZY_DIRECT_ROUTE_CAS_ROLLED_BACK;
+    }
+    if (record.result == KZT_PATCH_SPIKE_RESULT_UNRECOVERABLE) {
+        return KZT_LAZY_DIRECT_ROUTE_CAS_UNRECOVERABLE;
+    }
+    return state->guard_cas_mismatch ? KZT_LAZY_DIRECT_ROUTE_CAS_MISMATCH :
+                                      KZT_LAZY_DIRECT_ROUTE_CAS_ERROR;
 }
 
 static int production_enrich_base(
     kzt_rela_immediate_candidate_request_t *request, void *opaque)
 {
     kzt_production_jump_slot_state_t *state = opaque;
+    kzt_patch_object_ref_t address_owner = { 0 };
+    int exact_symbol_scan_required;
+    int status;
 
     state->failure_stage = "BASE_EVIDENCE";
-    int status = production_enrich(request, NULL, &state->base_enrich_result,
-                                  state);
+    status = production_enrich(request, NULL, &state->base_enrich_result,
+                               state);
 
     if (status == 0 &&
         production_request_is_main_namespace(state, request) != 0) {
@@ -1725,8 +3013,86 @@ static int production_enrich_base(
             state->held_source_lease = &state->source_lease;
         }
     }
+    if (status == 0 && (!state->held_source_lease ||
+                        !state->held_source_lease->active)) {
+        status = -1;
+    }
+    if (status == 0 && !state->held_decision_lease) {
+#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
+        kzt_jump_slot_production_test_before_patch_decision_lease_acquire();
+#endif
+        status = kzt_guest_registry_patch_decision_lease_acquire(
+            state->held_source_lease, &state->decision_lease);
+        if (status == 0) {
+            state->held_decision_lease = &state->decision_lease;
+#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
+            kzt_jump_slot_production_test_after_patch_decision_lease_acquire();
+#endif
+        }
+    }
+    if (status == 0 &&
+        kzt_guest_library_loader_quiescence_try_acquire(
+            KztGuestLibraryBindingsForContext(state->context),
+            &state->loader_quiescence_lease) != 0) {
+        status = -1;
+    }
+    if (status == 0) {
+        kzt_guest_dynamic_view_t current_view;
+        kzt_guest_field_status_t current_status;
+        unsigned long current_generation = 0;
+
+        if (kzt_guest_registry_find_dynamic_view(
+                KztGuestRegistryForContext(state->context),
+                request->source.link_map_addr, &current_view,
+                &current_status, &current_generation) != 0 ||
+            current_status != KZT_GUEST_FIELD_OK ||
+            current_generation != request->dynamic_view_generation ||
+            current_view.dynamic_addr != request->dynamic_addr ||
+            current_view.load_bias != request->load_bias) {
+            status = -1;
+        }
+    }
     if (status == 0) {
         status = production_collect_runtime_candidate(state, request);
+    }
+    exact_symbol_scan_required =
+        status == 0 &&
+        (state->context->kzt_guest_scope_layout ==
+             KZT_GUEST_SCOPE_LAYOUT_UNSUPPORTED ||
+         (state->lazy_completion &&
+          (request->owner_match != KZT_PATCH_OWNER_MATCH ||
+           !request->current_owner.known)));
+    if (exact_symbol_scan_required) {
+        address_owner = request->current_owner;
+        if ((state->lazy_completion &&
+             request->slot_current_value !=
+                 request->expected_guest_target) ||
+            production_resolve_exact_symbol_owner(
+                state, request->slot_current_value, request->symbol_name,
+                request->version_evidence, request->version,
+                NULL,
+                &state->base_enrich_result.owner_resolution, NULL) != 0) {
+            status = -1;
+        } else {
+            request->current_owner =
+                state->base_enrich_result.owner_resolution.current_owner;
+            request->owner_match =
+                state->base_enrich_result.owner_resolution.owner_match;
+            state->base_enrich_result.owner_present =
+                request->current_owner.known;
+            if (address_owner.known &&
+                (address_owner.link_map_addr !=
+                     request->current_owner.link_map_addr ||
+                 address_owner.generation !=
+                     request->current_owner.generation)) {
+                status = -1;
+            }
+        }
+    }
+    if (status == 0 &&
+        (request->owner_match != KZT_PATCH_OWNER_MATCH ||
+         !request->current_owner.known)) {
+        status = -1;
     }
     if (status == 0) {
         state->last_request = *request;
@@ -1764,17 +3130,35 @@ static int production_acquire_exact(
         .namespace_kind = KZT_GUEST_LIBRARY_NAMESPACE_MAIN,
     };
     if (KztGuestLibraryLookupForContext(state->context, &key, handle) != 0) {
-        goto out;
+        if (production_acquire_wrapper_alias_provider(
+                state, owner, handle) != 0) {
+            goto out;
+        }
+        state->wrapper_alias_borrowed = 1;
+        key = state->alias_proof.provider_key;
     }
-    if (!handle->library ||
+    if ((state->wrapper_alias_borrowed &&
+         (!state->alias_proof.valid ||
+          !kzt_guest_library_wrapper_alias_symbol_allowed(
+              state->last_request.symbol_name))) ||
+        !handle->library ||
         (resolved_provider && handle->library != resolved_provider)) {
         kzt_guest_library_handle_release(handle);
         goto out;
     }
     state->resolved_provider = handle->library;
     state->retained_provider_handle = handle;
+    state->exact_provider_key = key;
+    state->exact_provider_bindings = handle->bindings;
+    state->exact_provider_entry = handle->entry;
+    state->exact_provider_library = handle->library;
     state->exact_provider_owner = *owner;
     state->owner_namespace_id = match.namespace_id;
+    if (!production_exact_provider_handle_matches(state)) {
+        state->retained_provider_handle = NULL;
+        kzt_guest_library_handle_release(handle);
+        goto out;
+    }
     result = 0;
     state->failure_stage = "BRIDGE_EVIDENCE";
 out:
@@ -1817,17 +3201,12 @@ static int production_acquire_and_validate_bridge_evidence(
     if (!state || !request || !state->held_source_lease) {
         return -1;
     }
-#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
-    kzt_jump_slot_production_test_before_patch_decision_lease_acquire();
-#endif
-    if (kzt_guest_registry_patch_decision_lease_acquire(
-            state->held_source_lease, &state->decision_lease) != 0) {
+    if (!state->held_decision_lease ||
+        !state->held_decision_lease->active ||
+        !state->loader_quiescence_lease.bindings ||
+        !state->loader_quiescence_lease.cookie) {
         return -1;
     }
-    state->held_decision_lease = &state->decision_lease;
-#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
-    kzt_jump_slot_production_test_after_patch_decision_lease_acquire();
-#endif
     prepared_value = state->lazy_completion ? state->resolved_target :
                                               request->slot_current_value;
     if (!prepared_value ||
@@ -1843,24 +3222,52 @@ static int production_acquire_and_validate_bridge_evidence(
     }
     request->slot_current_value_present = 1;
     request->slot_current_value = fresh_value;
-    kzt_owner_resolver_init(&owner_resolution);
-    if (kzt_owner_resolver_resolve_current(
-            KztGuestRegistryForContext(state->context), fresh_value,
-            request->expected_guest_target, &owner_resolution) != 0 ||
-        owner_resolution.status != KZT_OWNER_RESOLVER_RESOLVED ||
-        owner_resolution.owner_match != KZT_PATCH_OWNER_MATCH) {
+    if (state->exact_owner_without_map_range) {
+        owner_resolution = state->base_enrich_result.owner_resolution;
+        if (fresh_value != request->expected_guest_target ||
+            owner_resolution.status != KZT_OWNER_RESOLVER_RESOLVED ||
+            owner_resolution.owner_match != KZT_PATCH_OWNER_MATCH ||
+            !owner_resolution.current_owner.known) {
+            production_release_decision_lease(state);
+            return -1;
+        }
+    } else if (production_resolve_current_owner(
+                   state->context, fresh_value,
+                   request->expected_guest_target, request->symbol_name,
+                   request->version_evidence, request->version,
+                   &owner_resolution) != 0) {
         production_release_decision_lease(state);
         return -1;
     }
     request->current_owner = owner_resolution.current_owner;
     request->owner_match = owner_resolution.owner_match;
-    if (kzt_guest_library_loader_quiescence_try_acquire(
-            KztGuestLibraryBindingsForContext(state->context),
-            &state->loader_quiescence_lease) != 0 ||
+    if (!state->runtime_view_valid) {
+        production_release_decision_lease(state);
+        return -1;
+    }
+    if (state->context->kzt_guest_scope_layout ==
+        KZT_GUEST_SCOPE_LAYOUT_UNSUPPORTED) {
+        if (!state->owner_source_lease.active &&
+            kzt_guest_registry_source_lease_acquire(
+                KztGuestRegistryForContext(state->context),
+                owner_resolution.current_owner.link_map_addr,
+                owner_resolution.current_owner.generation, 0,
+                &state->owner_source_lease) != 0) {
+            production_release_decision_lease(state);
+            return -1;
+        }
+        if (!production_exact_owner_symbol_matches(
+                state, &owner_resolution.current_owner, fresh_value,
+                request->symbol_name, request->version_evidence,
+                request->version)) {
+            production_release_decision_lease(state);
+            return -1;
+        }
+        state->exact_owner_symbol_proof = 1;
+    } else if (
         kzt_guest_registry_context_get_main_namespace_head(
             &state->context->kzt_guest_registry_context,
             &namespace_head) != 0 ||
-        !state->runtime_view_valid ||
         production_symbol_scope_request(
             state->context, state->head, request->source.generation,
             namespace_head, &state->runtime_view, &reader_ops,
@@ -1882,6 +3289,10 @@ static int production_acquire_and_validate_bridge_evidence(
     decision.dynamic_view_generation = request->dynamic_view_generation;
     decision.slot_addr = request->slot_addr;
     decision.slot_current_value = request->slot_current_value;
+    decision.symbol_index = request->symbol_index;
+    decision.symbol_name = request->symbol_name;
+    decision.version_evidence = request->version_evidence;
+    decision.version = request->version;
     decision.current_owner = request->current_owner;
     decision.owner_match = request->owner_match;
     if (production_prevalidate_write_evidence(&decision, state) != 0) {
@@ -1913,16 +3324,31 @@ static int production_enrich_bridge(
     int status;
     int provider_prepared;
 
+    if (!request ||
+        kzt_patch_symbol_must_stay_guest(request->symbol_name)) {
+        return -1;
+    }
     if (production_acquire_and_validate_bridge_evidence(state, request) != 0) {
         return -1;
     }
 
     state->failure_stage = "BRIDGE_EVIDENCE";
     memset(&state->wrapper_provider, 0, sizeof(state->wrapper_provider));
-    status = kzt_rela_runtime_wrapper_provider_discover_with_version_evidence(
-        state->context, held_provider, request->symbol_name,
-        request->version_evidence, request->version,
-        &state->wrapper_provider);
+    if (production_symbol_uses_guarded_xcb_bridge(request->symbol_name)) {
+        status =
+            kzt_rela_runtime_wrapper_provider_discover_guarded_with_version_evidence(
+                state->context, held_provider, request->symbol_name,
+                request->version_evidence, request->version,
+                request->slot_current_value,
+                KZT_BRIDGE_GUARD_XCB_CONNECTION,
+                &state->wrapper_provider);
+    } else {
+        status =
+            kzt_rela_runtime_wrapper_provider_discover_with_version_evidence(
+                state->context, held_provider, request->symbol_name,
+                request->version_evidence, request->version,
+                &state->wrapper_provider);
+    }
     provider_prepared = status > 0;
     if (provider_prepared &&
         kzt_rela_runtime_wrapper_provider_bind_retained_handle(
@@ -1942,6 +3368,11 @@ static int production_enrich_bridge(
         return -1;
     }
     state->last_request = *request;
+    if (!production_custom_dlsym_boundary_proven(
+            state, request->symbol_name)) {
+        production_release_decision_lease(state);
+        return -1;
+    }
     state->failure_stage = "SOURCE_IDENTITY";
     production_shadow_runtime_candidate(
         state, request,
@@ -2007,6 +3438,10 @@ static kzt_jump_slot_route_writer_status_t production_try_writer(
     if (state->writer_result.record.action ==
         KZT_PATCH_SPIKE_ACTION_PRESERVE_GUEST) {
         return KZT_JUMP_SLOT_ROUTE_WRITER_PRESERVE;
+    }
+    if (state->writer_result.record.result ==
+        KZT_PATCH_SPIKE_RESULT_APPLIED) {
+        return KZT_JUMP_SLOT_ROUTE_WRITER_APPLIED;
     }
     if (!state->writer_result.writer_called) {
         return KZT_JUMP_SLOT_ROUTE_WRITER_DECLINED;
@@ -2171,12 +3606,16 @@ static int production_jump_slot_route(
     if (status != 0) {
         kzt_guest_library_loader_quiescence_release(
             &state.loader_quiescence_lease);
+        kzt_guest_registry_source_lease_release(
+            &state.owner_source_lease);
         kzt_guest_registry_source_lease_release(&state.source_lease);
         return -1;
     }
     production_emit_diagnostic(&state, route_result);
     kzt_guest_library_loader_quiescence_release(
         &state.loader_quiescence_lease);
+    kzt_guest_registry_source_lease_release(
+        &state.owner_source_lease);
     kzt_guest_registry_source_lease_release(&state.source_lease);
 
     printf_log(LOG_DEBUG,
@@ -2258,6 +3697,9 @@ int kzt_production_lazy_direct_route(
     unsigned long cached_view_generation;
     int quiescence_status;
     int timing_enabled;
+    int scope_supported;
+    int loader_route_family;
+    int loader_write_enabled;
 
     if (!result) {
         return -1;
@@ -2296,8 +3738,19 @@ int kzt_production_lazy_direct_route(
             KZT_LAZY_DIRECT_ROUTE_REASON_GUEST_OWNED_SYMBOL;
         return 0;
     }
+    loader_route_family =
+        kzt_patch_symbol_is_loader_route_family(symbol_name);
+    loader_write_enabled = loader_route_family &&
+        KztPatchSpikeGuardForContext(context) &&
+        KztPatchSpikeGuardForContext(context)->config.write_enabled;
+    if (!kzt_patch_spike_guard_should_plan(
+            KztPatchSpikeGuardForContext(context))) {
+        result->reason = KZT_LAZY_DIRECT_ROUTE_REASON_DISABLED;
+        return 0;
+    }
 
     memset(&state, 0, sizeof(state));
+    state.preemption_proof.status = KZT_GUEST_SYMBOL_SCOPE_GUEST_REQUIRED;
     timing_enabled = unlikely(option_kzt_lazy_diagnostics);
     if (timing_enabled) {
         timing.start = production_lazy_direct_timing_now();
@@ -2307,7 +3760,16 @@ int kzt_production_lazy_direct_route(
     state.timing = &timing;
     state.timing_enabled = timing_enabled;
     state.evidence.context = context;
+    state.evidence.head = head;
     state.evidence.slot_current_value_is_unresolved_stub = 1;
+    scope_supported = context->kzt_guest_scope_layout !=
+                      KZT_GUEST_SCOPE_LAYOUT_UNSUPPORTED;
+    if (!scope_supported &&
+        head->DynSym[symbol_index].st_shndx != SHN_UNDEF) {
+        result->reason =
+            KZT_LAZY_DIRECT_ROUTE_REASON_UNSUPPORTED_SYMBOL_BINDING;
+        return 0;
+    }
     if (!state.registry ||
         kzt_guest_registry_find_lazy_source(
             state.registry, head->self_link_map, &source) != 0 ||
@@ -2318,17 +3780,31 @@ int kzt_production_lazy_direct_route(
         result->reason = KZT_LAZY_DIRECT_ROUTE_REASON_SOURCE_REJECTED;
         return 0;
     }
+    state.evidence.held_source_lease = &state.source_lease;
     if (timing_enabled) {
         timing.source = production_lazy_direct_timing_now();
     }
-    if (kzt_guest_registry_context_get_main_namespace_head(
+    if (scope_supported &&
+        kzt_guest_registry_context_get_main_namespace_head(
             &context->kzt_guest_registry_context, &namespace_head) != 0) {
         result->reason = KZT_LAZY_DIRECT_ROUTE_REASON_PREEMPTION_UNPROVEN;
         goto done;
     }
 
     state.prebind_scope = KztLazyPrebindScopeForContext(context);
-    if (production_lazy_prebind_record_key(
+    if (kzt_patch_symbol_requires_dlerror_prebind(symbol_name) &&
+        !kzt_lazy_prebind_scope_has_native_dlerror(
+            state.prebind_scope,
+            &(const kzt_lazy_prebind_identity_t) {
+                .link_map_addr = head->self_link_map,
+                .generation = source.generation,
+                .namespace_id = source.namespace_id,
+            })) {
+        result->reason =
+            KZT_LAZY_DIRECT_ROUTE_REASON_DLERROR_PREBIND_REQUIRED;
+        goto done;
+    }
+    if (scope_supported && production_lazy_prebind_record_key(
             &prebind_key, head->self_link_map, source.generation,
             entry_index, (uintptr_t)slot, slot_current_value, symbol_name,
             version_evidence, version) == 0 &&
@@ -2336,7 +3812,9 @@ int kzt_production_lazy_direct_route(
             state.prebind_scope, &prebind_key, &state.prebind_lease) == 0) {
         cached_view_status = KZT_GUEST_FIELD_NOT_PARSED;
         cached_view_generation = 0;
-        if (kzt_guest_registry_find_dynamic_view(
+        if (kzt_lazy_prebind_scope_lease_published(
+                &state.prebind_lease) &&
+            kzt_guest_registry_find_dynamic_view(
                 state.registry, head->self_link_map, &cached_view,
                 &cached_view_status, &cached_view_generation) == 0 &&
             cached_view_status == KZT_GUEST_FIELD_OK &&
@@ -2386,14 +3864,31 @@ int kzt_production_lazy_direct_route(
             goto done;
         }
     }
+    state.evidence.last_request.symbol_index = symbol_index;
+    state.evidence.last_request.source = (kzt_patch_object_ref_t) {
+        .known = 1,
+        .link_map_addr = head->self_link_map,
+        .generation = source.generation,
+        .map_start = (uintptr_t)head->memory,
+        .map_end = (uintptr_t)head->memory + head->memsz,
+        .soname = head->name,
+        .path = head->path,
+    };
+    state.evidence.last_request.symbol_name =
+        state.evidence.runtime_candidate.symbol_name;
+    state.evidence.last_request.version_evidence =
+        state.evidence.runtime_candidate.version_evidence;
+    state.evidence.last_request.version =
+        state.evidence.runtime_candidate.version;
+    state.evidence.initial_request = state.evidence.last_request;
     if (!state.evidence.runtime_view_valid ||
-        production_symbol_scope_request(
+        (scope_supported && production_symbol_scope_request(
             context, head, source.generation, namespace_head,
             &state.evidence.runtime_view, &reader_ops, symbol_index,
             state.evidence.runtime_candidate.symbol_name,
             state.evidence.runtime_candidate.version_evidence,
             state.evidence.runtime_candidate.version,
-            &state.symbol_scope_request) != 0) {
+            &state.symbol_scope_request) != 0)) {
         result->reason = KZT_LAZY_DIRECT_ROUTE_REASON_PREEMPTION_UNPROVEN;
         goto done;
     }
@@ -2402,12 +3897,12 @@ int kzt_production_lazy_direct_route(
     }
     quiescence_status = kzt_guest_library_loader_quiescence_try_acquire(
             KztGuestLibraryBindingsForContext(context),
-            &state.loader_quiescence_lease);
+            &state.evidence.loader_quiescence_lease);
     if (timing_enabled) {
         timing.quiescence = production_lazy_direct_timing_now();
     }
     if (quiescence_status != 0) {
-        if (!state.prebind_hit) {
+        if (scope_supported && !state.prebind_hit) {
             (void)kzt_guest_symbol_scope_discover(
                 &state.symbol_scope_request, &reader_ops,
                 &state.preemption_proof);
@@ -2420,7 +3915,54 @@ int kzt_production_lazy_direct_route(
         goto preemption_diagnostic;
     }
 
-    if (!state.prebind_hit) {
+    if (!scope_supported) {
+        uintptr_t provider_address = 0;
+        kzt_owner_resolution_t *owner_resolution =
+            &state.evidence.base_enrich_result.owner_resolution;
+
+        if (!kzt_guest_library_wrapper_alias_symbol_allowed(
+                state.evidence.runtime_candidate.symbol_name) ||
+            !production_dynamic_view_needs_library(
+                &state.evidence.runtime_view, &reader_ops,
+                "libdl.so.2")) {
+            result->reason =
+                KZT_LAZY_DIRECT_ROUTE_REASON_PREEMPTION_UNPROVEN;
+            goto preemption_diagnostic;
+        }
+        if (kzt_guest_registry_patch_decision_lease_acquire(
+                &state.source_lease, &state.decision_lease) != 0) {
+            result->reason =
+                KZT_LAZY_DIRECT_ROUTE_REASON_PREEMPTION_UNPROVEN;
+            goto preemption_diagnostic;
+        }
+        state.evidence.held_decision_lease = &state.decision_lease;
+        if (production_resolve_exact_symbol_owner(
+                &state.evidence, 0,
+                state.evidence.runtime_candidate.symbol_name,
+                state.evidence.runtime_candidate.version_evidence,
+                state.evidence.runtime_candidate.version,
+                "libdl.so.2",
+                owner_resolution, &provider_address) != 0 ||
+            !provider_address) {
+            result->reason =
+                KZT_LAZY_DIRECT_ROUTE_REASON_PREEMPTION_UNPROVEN;
+            goto preemption_diagnostic;
+        }
+        state.exact_symbol_provider = 1;
+        state.preemption_proof = (kzt_guest_symbol_scope_result_t) {
+            .status = KZT_GUEST_SYMBOL_SCOPE_SAFE,
+            .reason = KZT_GUEST_SYMBOL_SCOPE_REASON_SELECTED_PROVIDER,
+            .candidate_count = 1,
+            .scope_complete = 1,
+            .lookup_order_known = 1,
+            .selected_provider_link_map =
+                owner_resolution->current_owner.link_map_addr,
+            .selected_provider_address = provider_address,
+            .selected_provider_binding = STB_GLOBAL,
+            .selected_provider_type = STT_FUNC,
+            .selected_provider_visibility = STV_DEFAULT,
+        };
+    } else if (!state.prebind_hit) {
         if (kzt_guest_symbol_scope_discover(
                 &state.symbol_scope_request, &reader_ops,
                 &state.preemption_proof) != KZT_GUEST_SYMBOL_SCOPE_SAFE) {
@@ -2479,10 +4021,26 @@ preemption_diagnostic:
         .namespace_id = provider_match.namespace_id,
         .namespace_kind = KZT_GUEST_LIBRARY_NAMESPACE_MAIN,
     };
-    if (kzt_guest_library_access_lookup(
-            &context->kzt_guest_library_access, &state.provider_key,
-            &state.provider_handle) != 0 ||
-        !state.provider_handle.library ||
+    if (state.exact_symbol_provider) {
+        const kzt_patch_object_ref_t *owner =
+            &state.evidence.base_enrich_result.owner_resolution.current_owner;
+        int acquire_status;
+
+        acquire_status = production_acquire_exact(
+            owner, NULL, &state.provider_handle, &state.evidence);
+        if (acquire_status != 0) {
+            result->reason =
+                KZT_LAZY_DIRECT_ROUTE_REASON_PROVIDER_UNAVAILABLE;
+            goto done;
+        }
+        state.provider_key = state.evidence.exact_provider_key;
+    } else if (kzt_guest_library_access_lookup(
+                   &context->kzt_guest_library_access, &state.provider_key,
+                   &state.provider_handle) != 0) {
+        result->reason = KZT_LAZY_DIRECT_ROUTE_REASON_PROVIDER_UNAVAILABLE;
+        goto done;
+    }
+    if (!state.provider_handle.library ||
         state.provider_handle.object_type !=
             KZT_GUEST_LIBRARY_OBJECT_WRAPPED) {
         kzt_guest_library_handle_release(&state.provider_handle);
@@ -2493,6 +4051,24 @@ preemption_diagnostic:
     state.provider_handle_owned = 1;
     state.resolved_provider = state.provider_handle.library;
     state.evidence.resolved_provider = state.resolved_provider;
+    if (!state.exact_symbol_provider) {
+        state.evidence.retained_provider_handle = &state.provider_handle;
+        state.evidence.exact_provider_key = state.provider_key;
+        state.evidence.exact_provider_bindings =
+            state.provider_handle.bindings;
+        state.evidence.exact_provider_entry = state.provider_handle.entry;
+        state.evidence.exact_provider_library = state.provider_handle.library;
+        state.evidence.exact_provider_owner = (kzt_patch_object_ref_t) {
+            .known = 1,
+            .link_map_addr = state.provider_key.link_map_addr,
+            .generation = state.provider_key.generation,
+        };
+        state.evidence.owner_namespace_id = state.provider_key.namespace_id;
+    }
+    if (!production_exact_provider_handle_matches(&state.evidence)) {
+        result->reason = KZT_LAZY_DIRECT_ROUTE_REASON_PROVIDER_UNAVAILABLE;
+        goto done;
+    }
     if (timing_enabled) {
         timing.provider = production_lazy_direct_timing_now();
     }
@@ -2520,6 +4096,7 @@ preemption_diagnostic:
         .slot_addr = (uintptr_t)slot,
         .guest_unresolved_slot = slot_current_value,
         .expected_current_slot = slot_current_value,
+        .allow_budget_transient_native = loader_write_enabled,
     };
     ops = (kzt_lazy_direct_route_ops_t) {
         .validate_source = production_lazy_direct_validate_source,
@@ -2541,14 +4118,20 @@ preemption_diagnostic:
     if (timing_enabled) {
         timing.route = production_lazy_direct_timing_now();
     }
-    if (result->status == KZT_LAZY_DIRECT_ROUTE_NATIVE_APPLIED) {
+    if (result->status == KZT_LAZY_DIRECT_ROUTE_NATIVE_APPLIED ||
+        result->status == KZT_LAZY_DIRECT_ROUTE_NATIVE_TRANSIENT) {
         uintptr_t slot_after =
             __atomic_load_n((uintptr_t *)slot, __ATOMIC_ACQUIRE);
         printf_kzt_registry_diagnostics(
             "kzt_lazy_direct schema=1 symbol=%s "
-            "route_status=NATIVE_APPLIED writer_result=APPLIED "
+            "route_status=%s writer_result=%s "
             "slot_before=%p slot_after=%p selected_target=%p\n",
-            input.symbol, (void *)slot_current_value, (void *)slot_after,
+            input.symbol,
+            result->status == KZT_LAZY_DIRECT_ROUTE_NATIVE_APPLIED ?
+                "NATIVE_APPLIED" : "NATIVE_TRANSIENT",
+            result->status == KZT_LAZY_DIRECT_ROUTE_NATIVE_APPLIED ?
+                "APPLIED" : "NOT_WRITTEN",
+            (void *)slot_current_value, (void *)slot_after,
             (void *)result->selected_target);
     }
 
@@ -2556,13 +4139,18 @@ done:
     if (state.decision_lease.active) {
         kzt_guest_registry_patch_decision_lease_release(
             &state.decision_lease);
+        state.evidence.held_decision_lease = NULL;
     }
     if (state.provider_handle_owned) {
         kzt_guest_library_handle_release(&state.provider_handle);
     }
     kzt_lazy_prebind_scope_release(&state.prebind_lease);
     kzt_guest_library_loader_quiescence_release(
-        &state.loader_quiescence_lease);
+        &state.evidence.loader_quiescence_lease);
+    kzt_guest_registry_symbol_candidate_release(
+        &state.evidence.exact_owner_candidate);
+    kzt_guest_registry_source_lease_release(
+        &state.evidence.owner_source_lease);
     kzt_guest_registry_source_lease_release(&state.source_lease);
     if (timing_enabled) {
         timing.done = production_lazy_direct_timing_now();
@@ -2612,312 +4200,6 @@ done:
             result->status, result->reason);
     }
     return 0;
-}
-
-static elfheader_t *production_find_source_head(
-    box64context_t *context, uintptr_t link_map)
-{
-    int i;
-
-    if (!context || !link_map) {
-        return NULL;
-    }
-    for (i = 0; i < context->elfsize; ++i) {
-        if (context->elfs[i] && context->elfs[i]->self_link_map == link_map) {
-            return context->elfs[i];
-        }
-    }
-    return NULL;
-}
-
-int kzt_production_lazy_route_guest_target_leased(
-    box64context_t *context,
-    const kzt_lazy_binding_pending_t *pending,
-    uintptr_t guest_target,
-    const kzt_guest_registry_source_lease_t *source_lease,
-    kzt_lazy_binding_route_result_t *result)
-{
-    kzt_jump_slot_route_result_t route_result;
-    elfheader_t *head;
-    Elf64_Rela *rela;
-    Elf64_Sym *sym;
-    const char *symbol_name;
-    const char *version_name;
-    kzt_symbol_version_evidence_t version_evidence;
-    kzt_owner_resolution_t owner_resolution;
-    kzt_guest_library_binding_key_t provider_key;
-    kzt_guest_library_handle_t provider_handle;
-    library_t *resolved_provider = NULL;
-    unsigned long symbol_index;
-    int version;
-    size_t count;
-
-    if (!result) {
-        return -1;
-    }
-    memset(result, 0, sizeof(*result));
-    result->status = KZT_LAZY_BINDING_ROUTE_GUEST_PRESERVED;
-    result->selected_target = guest_target;
-    result->final_value = guest_target;
-    if (!context || !pending || !pending->armed || !guest_target ||
-        !pending->symbol ||
-        !kzt_symbol_version_evidence_valid(pending->version_evidence,
-                                           pending->version)) {
-        return 0;
-    }
-    if (!source_lease || !source_lease->active ||
-        source_lease->registry != KztGuestRegistryForContext(context) ||
-        source_lease->link_map_addr != pending->source_link_map ||
-        source_lease->generation != pending->source_generation ||
-        source_lease->namespace_id != pending->namespace_id ||
-        pending->namespace_kind != KZT_GUEST_LIBRARY_NAMESPACE_MAIN ||
-        pending->namespace_id != 0) {
-        return 0;
-    }
-#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
-    kzt_jump_slot_production_test_before_source_memory_access();
-#endif
-    head = production_find_source_head(context, pending->source_link_map);
-    if (!head || !head->jmprel || !head->pltent || !head->DynSym) {
-        return 0;
-    }
-    count = head->pltsz / head->pltent;
-    if (pending->relocation_index >= count) {
-        return 0;
-    }
-    rela = (Elf64_Rela *)(head->jmprel + head->delta) +
-           pending->relocation_index;
-    if (ELF64_R_TYPE(rela->r_info) != R_X86_64_JUMP_SLOT ||
-        rela->r_offset + head->delta != pending->slot_addr) {
-        return 0;
-    }
-    symbol_index = ELF64_R_SYM(rela->r_info);
-    sym = &head->DynSym[symbol_index];
-    symbol_name = SymName(head, sym);
-    version = head->VerSym ?
-        ((Elf64_Half *)((uintptr_t)head->VerSym + head->delta))[symbol_index] :
-        -1;
-    if (version == -1 || (version & 0x7fff) < 2) {
-        version_evidence = KZT_SYMBOL_VERSION_CONFIRMED_UNVERSIONED;
-        version_name = NULL;
-    } else {
-        version &= 0x7fff;
-        version_evidence = KZT_SYMBOL_VERSION_VERSIONED;
-        version_name = GetSymbolVersion(head, version);
-    }
-    if (!symbol_name || strcmp(symbol_name, pending->symbol) != 0 ||
-        !kzt_symbol_version_evidence_matches(
-            version_evidence, version_name, pending->version_evidence,
-            pending->version)) {
-        return 0;
-    }
-
-    kzt_owner_resolver_init(&owner_resolution);
-    if (kzt_owner_resolver_resolve_current(
-            KztGuestRegistryForContext(context), guest_target, guest_target,
-            &owner_resolution) != 0 ||
-        owner_resolution.status != KZT_OWNER_RESOLVER_RESOLVED ||
-        owner_resolution.owner_match != KZT_PATCH_OWNER_MATCH ||
-        !owner_resolution.current_owner.known) {
-        return 0;
-    }
-    provider_key = (kzt_guest_library_binding_key_t) {
-        .link_map_addr = owner_resolution.current_owner.link_map_addr,
-        .generation = owner_resolution.current_owner.generation,
-        .namespace_id = 0,
-        .namespace_kind = KZT_GUEST_LIBRARY_NAMESPACE_MAIN,
-    };
-    memset(&provider_handle, 0, sizeof(provider_handle));
-    if (KztGuestLibraryLookupForContext(context, &provider_key,
-                                        &provider_handle) != 0 ||
-        !provider_handle.library) {
-        kzt_guest_library_handle_release(&provider_handle);
-        return 0;
-    }
-    resolved_provider = provider_handle.library;
-    /* guest_target is only the guest loader's observed bridge/CAS evidence.
-     * Bridge enrichment resolves and verifies the provider's native symbol
-     * independently with dlvsym. */
-    if (production_jump_slot_route(
-            context, resolved_provider, guest_target, head, 1,
-            pending->relocation_index, rela,
-            (uint64_t *)pending->slot_addr, guest_target, 0, symbol_index,
-            symbol_name, version_evidence, version_name, 1, guest_target,
-            guest_target, 1,
-            pending->source_link_map, pending->source_generation,
-            1, source_lease,
-            &route_result) != 0) {
-        kzt_guest_library_handle_release(&provider_handle);
-        result->status = KZT_LAZY_BINDING_ROUTE_ERROR;
-        return -1;
-    }
-    kzt_guest_library_handle_release(&provider_handle);
-    result->selected_target = route_result.selected_target;
-    result->final_value = route_result.final_value;
-    switch (route_result.status) {
-    case KZT_JUMP_SLOT_ROUTE_NATIVE_APPLIED:
-        result->status = KZT_LAZY_BINDING_ROUTE_NATIVE_APPLIED;
-        break;
-    case KZT_JUMP_SLOT_ROUTE_CAS_MISMATCH:
-        result->status = KZT_LAZY_BINDING_ROUTE_CAS_MISMATCH;
-        break;
-    case KZT_JUMP_SLOT_ROUTE_WRITE_ROLLED_BACK:
-        result->status = KZT_LAZY_BINDING_ROUTE_WRITE_ROLLED_BACK;
-        break;
-    case KZT_JUMP_SLOT_ROUTE_UNRECOVERABLE:
-        result->status = KZT_LAZY_BINDING_ROUTE_UNRECOVERABLE;
-        break;
-    case KZT_JUMP_SLOT_ROUTE_GUEST_PRESERVED:
-    default:
-        result->status = KZT_LAZY_BINDING_ROUTE_GUEST_PRESERVED;
-        break;
-    }
-    return 0;
-}
-
-int kzt_production_lazy_source_lease_acquire(
-    box64context_t *context,
-    const kzt_lazy_binding_pending_t *pending,
-    kzt_guest_registry_source_lease_t *source_lease)
-{
-    kzt_guest_registry_t *registry;
-
-    if (!context || !pending || !source_lease || !pending->armed ||
-        !pending->source_link_map || !pending->source_generation ||
-        pending->namespace_kind != KZT_GUEST_LIBRARY_NAMESPACE_MAIN ||
-        pending->namespace_id != 0) {
-        return -1;
-    }
-    memset(source_lease, 0, sizeof(*source_lease));
-    registry = KztGuestRegistryForContext(context);
-    if (!registry) {
-        return -1;
-    }
-#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
-    kzt_jump_slot_production_test_before_source_lease_acquire();
-#endif
-    return kzt_guest_registry_source_lease_acquire(
-        registry, pending->source_link_map,
-        pending->source_generation, pending->namespace_id, source_lease);
-}
-
-int kzt_production_lazy_load_slot_with_lease(
-    box64context_t *context,
-    const kzt_lazy_binding_pending_t *pending,
-    uintptr_t slot_addr,
-    uintptr_t *value,
-    kzt_guest_registry_source_lease_t *source_lease)
-{
-    if (!slot_addr || !value || !source_lease ||
-        kzt_production_lazy_source_lease_acquire(
-            context, pending, source_lease) != 0) {
-        return -1;
-    }
-#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
-    kzt_jump_slot_production_test_before_slot_load();
-#endif
-    *value = __atomic_load_n((uintptr_t *)slot_addr, __ATOMIC_ACQUIRE);
-#ifdef KZT_JUMP_SLOT_PRODUCTION_TEST
-    kzt_jump_slot_production_test_after_slot_load(value);
-#endif
-    return 0;
-}
-
-int kzt_production_lazy_route_guest_target(
-    box64context_t *context,
-    const kzt_lazy_binding_pending_t *pending,
-    uintptr_t guest_target,
-    kzt_lazy_binding_route_result_t *result)
-{
-    kzt_guest_registry_source_lease_t source_lease = { 0 };
-    int status;
-
-    if (!result) {
-        return -1;
-    }
-    memset(result, 0, sizeof(*result));
-    result->status = KZT_LAZY_BINDING_ROUTE_GUEST_PRESERVED;
-    result->selected_target = guest_target;
-    result->final_value = guest_target;
-    if (!context || !pending || !pending->armed || !guest_target ||
-        kzt_production_lazy_source_lease_acquire(
-            context, pending, &source_lease) != 0) {
-        return 0;
-    }
-    status = kzt_production_lazy_route_guest_target_leased(
-        context, pending, guest_target, &source_lease, result);
-    kzt_guest_registry_source_lease_release(&source_lease);
-    return status;
-}
-
-typedef struct kzt_lazy_completion_production_state {
-    box64context_t *context;
-    const kzt_lazy_binding_pending_t *pending;
-    kzt_guest_registry_source_lease_t source_lease;
-} kzt_lazy_completion_production_state_t;
-
-static int kzt_lazy_production_load_slot(uintptr_t slot_addr,
-                                         uintptr_t *value, void *opaque)
-{
-    kzt_lazy_completion_production_state_t *state = opaque;
-
-    return state ? kzt_production_lazy_load_slot_with_lease(
-                       state->context, state->pending, slot_addr, value,
-                       &state->source_lease) :
-                   -1;
-}
-
-static int kzt_lazy_production_validate(
-    const kzt_lazy_binding_pending_t *pending, uintptr_t guest_target,
-    void *opaque)
-{
-    kzt_lazy_completion_production_state_t *state = opaque;
-    box64context_t *context = state ? state->context : NULL;
-    kzt_guest_lazy_resolver_t resolver;
-
-    if (!pending || !context || pending->context_id != (uintptr_t)context ||
-        !guest_target || !state->source_lease.active ||
-        state->source_lease.namespace_id != pending->namespace_id ||
-        kzt_guest_registry_find_lazy_resolver(
-            KztGuestRegistryForContext(context), pending->source_link_map,
-            pending->source_generation, pending->namespace_id,
-            &resolver) != 0) {
-        return 0;
-    }
-    return resolver.guest_link_map == pending->source_link_map &&
-           resolver.guest_resolver == pending->guest_resolver;
-}
-
-static int kzt_lazy_production_route(
-    const kzt_lazy_binding_pending_t *pending, uintptr_t guest_target,
-    kzt_lazy_binding_route_result_t *result, void *opaque)
-{
-    kzt_lazy_completion_production_state_t *state = opaque;
-
-    return state ? kzt_production_lazy_route_guest_target_leased(
-                       state->context, pending, guest_target,
-                       &state->source_lease, result) :
-                   -1;
-}
-
-int kzt_production_lazy_complete(
-    box64context_t *context, kzt_lazy_binding_pending_t *pending,
-    kzt_lazy_binding_result_t *result)
-{
-    kzt_lazy_completion_production_state_t state = {
-        .context = context,
-        .pending = pending,
-    };
-    kzt_lazy_binding_ops_t ops = {
-        .load_slot = kzt_lazy_production_load_slot,
-        .validate_post_bind = kzt_lazy_production_validate,
-        .route_guest_target = kzt_lazy_production_route,
-        .opaque = &state,
-    };
-    int status = kzt_lazy_binding_complete(pending, &ops, result);
-
-    kzt_guest_registry_source_lease_release(&state.source_lease);
-    return status;
 }
 
 #endif

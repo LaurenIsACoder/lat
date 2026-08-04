@@ -58,6 +58,12 @@ typedef struct observation_trace {
     int dynamic_reader_calls_at_legacy;
 } observation_trace_t;
 
+typedef struct per_object_trace {
+    int calls;
+    int return_value;
+    uintptr_t link_map_addr;
+} per_object_trace_t;
+
 typedef struct fake_callback_event {
     struct link_map_x64 link_map;
     char guest_name[64];
@@ -241,6 +247,15 @@ static int fake_legacy_flow(uintptr_t link_map_addr, void *opaque)
         pthread_mutex_unlock(&event->barrier->lock);
     }
     return trace->legacy_return;
+}
+
+static int fake_per_object_flow(uintptr_t link_map_addr, void *opaque)
+{
+    per_object_trace_t *trace = opaque;
+
+    ++trace->calls;
+    trace->link_map_addr = link_map_addr;
+    return trace->return_value;
 }
 
 static void fake_diagnostic(
@@ -2528,6 +2543,61 @@ static void test_disabled_adapter_diagnostics_are_throttled(void)
     kzt_guest_registry_destroy(&registry);
 }
 
+static void test_per_object_failure_is_propagated(void)
+{
+    fake_callback_event_t event;
+    per_object_trace_t per_object = {
+        .return_value = -1,
+    };
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_observation_adapter_result_t result = KZT_OBSERVATION_ADAPTER_DISABLED;
+    kzt_guest_registry_diagnostic_config_t config = {
+        .enabled = 1,
+        .throttle_limit = 4,
+    };
+
+    check_true("per-object.registry-init", registry != NULL);
+    if (!registry) {
+        return;
+    }
+    init_fake_callback_event(&event, "/guest/libper-object-failure.so",
+                             0x730000);
+    check_int("per-object.configure",
+              kzt_guest_registry_configure_diagnostics(registry, &config), 0);
+
+    kzt_observation_adapter_request_t request = {
+        .enabled = 1,
+        .diagnostics_enabled = 1,
+        .link_map_addr = (uintptr_t)&event.link_map,
+        .registry = registry,
+        .reader_ops = &event.ops,
+        .namespace_id_present = event.namespace_id_present,
+        .namespace_id = event.namespace_id,
+        .map_range_present = event.map_range_present,
+        .map_start = event.map_start,
+        .map_end = event.map_end,
+        .per_object_flow = fake_per_object_flow,
+        .per_object_opaque = &per_object,
+        .diagnostic = fake_diagnostic,
+        .diagnostic_opaque = &event.trace,
+    };
+
+    check_int("per-object.adapter-return",
+              kzt_observe_guest_object_from_callback(&request, &result), 0);
+    check_int("per-object.result", result,
+              KZT_OBSERVATION_ADAPTER_PER_OBJECT_FAILED);
+    check_int("per-object.calls", per_object.calls, 1);
+    check_uintptr("per-object.link-map", per_object.link_map_addr,
+                  (uintptr_t)&event.link_map);
+    check_int("per-object.diagnostic-calls", event.trace.diagnostic_calls, 1);
+    check_int("per-object.diagnostic-result", event.trace.diagnostic_result,
+              KZT_OBSERVATION_ADAPTER_PER_OBJECT_FAILED);
+    check_ulong("per-object.registry-object-count",
+                registry_object_count(registry), 1);
+
+    kzt_guest_registry_destroy(&registry);
+}
+
 int main(void)
 {
     test_active_observation_adds_object_and_preserves_old_flow();
@@ -2564,6 +2634,7 @@ int main(void)
     test_enabled_diagnostics_are_throttled_and_fail_open();
     test_reader_failures_are_throttled();
     test_disabled_adapter_diagnostics_are_throttled();
+    test_per_object_failure_is_propagated();
 
     if (failures) {
         fprintf(stderr, "kzt-observation-adapter: %d failure(s)\n", failures);

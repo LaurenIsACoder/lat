@@ -154,7 +154,8 @@ static int kzt_patch_spike_writer_decision_supported(
     return decision && decision->kind == KZT_PATCH_DECISION_APPROVED &&
            decision->reason == KZT_PATCH_REASON_APPROVED_NATIVE_BRIDGE &&
            decision->allow_native_bridge &&
-           decision->reloc_type == KZT_PATCH_RELOCATION_JUMP_SLOT &&
+           (decision->reloc_type == KZT_PATCH_RELOCATION_JUMP_SLOT ||
+            decision->reloc_type == KZT_PATCH_RELOCATION_GLOB_DAT) &&
            decision->slot_addr && decision->slot_current_value_present &&
            decision->bridge_target && decision->source.known &&
            decision->source.link_map_addr && decision->source.generation &&
@@ -327,7 +328,7 @@ static void kzt_patch_spike_record_finish(
     record->previous_value = outcome->previous_value;
 }
 
-int kzt_patch_spike_writer_try_apply_with_slot_ops(
+static int kzt_patch_spike_writer_try_apply_internal(
     kzt_patch_spike_guard_t *guard,
     const kzt_patch_decision_t *decision,
     const kzt_patch_spike_slot_ops_t *slot_ops,
@@ -367,13 +368,23 @@ int kzt_patch_spike_writer_try_apply_with_slot_ops(
     writer_ops.finish_slot = kzt_patch_spike_writer_finish_slot;
     writer_ops.opaque = &state;
 
-    if (kzt_patch_spike_guard_try_write(guard, decision, &writer_ops,
-                                        &outcome) != 0) {
+    if (kzt_patch_spike_guard_try_write(
+            guard, decision, &writer_ops, &outcome) != 0) {
         return -1;
     }
 
     kzt_patch_spike_record_finish(record, &outcome);
     return 0;
+}
+
+int kzt_patch_spike_writer_try_apply_with_slot_ops(
+    kzt_patch_spike_guard_t *guard,
+    const kzt_patch_decision_t *decision,
+    const kzt_patch_spike_slot_ops_t *slot_ops,
+    kzt_patch_spike_record_t *record)
+{
+    return kzt_patch_spike_writer_try_apply_internal(
+        guard, decision, slot_ops, record);
 }
 
 int kzt_patch_spike_writer_try_apply(kzt_patch_spike_guard_t *guard,

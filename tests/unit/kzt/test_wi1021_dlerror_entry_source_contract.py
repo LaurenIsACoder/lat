@@ -70,6 +70,26 @@ for required in (
     if required not in publish:
         fail(f"publisher is missing {required}")
 
+write_start = production.find(
+    "production_lazy_direct_guard_write("
+)
+write_end = production.find(
+    "\n}", write_start
+)
+if write_start < 0 or write_end < 0:
+    fail("cannot locate guarded production lazy slot writer")
+write = production[write_start:write_end]
+publish_call = write.find("kzt_guest_dl_api_publish_dlerror_entry(")
+slot_cas = write.find("__atomic_compare_exchange_n(")
+if publish_call < 0 or slot_cas < 0 or publish_call > slot_cas:
+    fail("guest dlerror entry must be published before the final slot CAS")
+for required in (
+    "state->preemption_proof.selected_provider_address",
+    "state->wrapper_provider.match.custom_wrapper",
+):
+    if required not in write:
+        fail(f"production publication is missing {required}")
+
 cas_start = production.find(
     "production_lazy_direct_cas_slot("
 )
@@ -79,16 +99,12 @@ cas_end = production.find(
 if cas_start < 0 or cas_end < 0:
     fail("cannot locate production lazy CAS")
 cas = production[cas_start:cas_end]
-publish_call = cas.find("kzt_guest_dl_api_publish_dlerror_entry(")
-slot_cas = cas.find("__atomic_compare_exchange_n(")
-if publish_call < 0 or slot_cas < 0 or publish_call > slot_cas:
-    fail("guest dlerror entry must be published before the final slot CAS")
 for required in (
-    "state->preemption_proof.selected_provider_address",
-    "state->wrapper_provider.match.custom_wrapper",
+    ".write_slot = production_lazy_direct_guard_write",
+    "kzt_patch_spike_writer_try_apply_with_slot_ops(",
 ):
     if required not in cas:
-        fail(f"production publication is missing {required}")
+        fail(f"production lazy CAS bypasses the global guard via {required}")
 
 for name, source in (
     ("wrappedlibdl", wrapped_dl),
@@ -110,7 +126,8 @@ for name, source in (
         fail(f"cannot locate {name} dlerror state slow path")
     state_slow = source[state_start:state_end]
     for required in (
-        "kzt_guest_dl_api_dlerror(error_state, guest_dlerror)",
+        "kzt_guest_dl_api_dlerror(",
+        "guest_route_may_have_pending_error",
         "kzt_guest_dl_api_load_dlerror_hint(",
         "kzt_guest_dlerror_entry_slow(context)",
         "error_state->guest_dlerror_entry = guest_dlerror",
@@ -123,7 +140,7 @@ for name, source in (
     if function_start < 0 or function_end < 0:
         fail(f"cannot locate {name} my_dlerror")
     function = source[function_start:function_end]
-    state_check = function.find("if (fast_result)")
+    state_check = function.find("if (fast_result || guest_loader_route)")
     slow = function.find("kzt_guest_dlerror_slow_path(")
     fast_return = function.find("return fast_result;")
     if min(state_check, slow, fast_return) < 0 or not (
@@ -131,6 +148,10 @@ for name, source in (
         fail(f"{name} does not isolate the clean dlerror fast path")
     if "char *fast_result" not in function:
         fail(f"{name} materializes the clean dlerror result")
+    if "kzt_guest_loader_route_present" not in function:
+        fail(f"{name} loses the process-wide guest loader route")
+    if "guest_loader_route);" not in function:
+        fail(f"{name} does not pass the guest loader route to the slow path")
     if "kzt_guest_dl_entries_t fallback" in function:
         fail(f"{name} hot dlerror wrapper retains the cold fallback frame")
     if "kzt_guest_dl_api_dlerror(error_state" in function:

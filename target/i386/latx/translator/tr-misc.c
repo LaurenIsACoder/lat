@@ -93,14 +93,34 @@ static void* mmm_realloc(void *mem, size_t len) {
 }
 
 #include "box64context.h"
+#include "kzt_guest_runtime_entry.h"
 extern void my___libc_free(void* m);
 extern void my_cfree(void* m);
 extern void my_free(void* m);
 extern void my___free(void* m);
 extern void my_realloc(void* m, void *old, uintptr_t len);
 extern char *my_dlerror(void);
-extern void* x86free;
-extern void* x86realloc;
+extern uintptr_t kzt_xcb_guard_acquire_for_bridge(
+    CPUX86State *env, uintptr_t guest);
+void kzt_native_to_wrapper(void);
+void kzt_wrapper_to_native(void);
+
+uintptr_t kzt_runtime_guest_entry_or_abort(
+    CPUX86State *env, kzt_guest_runtime_entry_id_t entry)
+{
+    box64context_t *context = env ? env->kzt_runtime_context : NULL;
+    uintptr_t address = kzt_guest_runtime_entry_for_guest_branch(
+        context, entry);
+
+    if (!address) {
+        printf_log(LOG_NONE,
+                   "KZT: required guest runtime entry %d is unavailable\n",
+                   entry);
+        abort();
+    }
+    return address;
+}
+
 static void kzt_helper_ptr(ADDR func, IR2_OPND ptr)
 {
     IR2_OPND func_addr_opnd = ra_alloc_dbt_arg2();
@@ -120,7 +140,29 @@ static void kzt_helper_pFpL(ADDR func, IR2_OPND ptr, IR2_OPND L)
     la_st_d(a0_ir2_opnd, env_ir2_opnd, lsenv_offset_of_gpr(lsenv, R_EAX));
 }
 
-void kzt_native_to_wrapper(void);
+static void kzt_generate_guest_runtime_branch(
+    kzt_guest_runtime_entry_id_t entry)
+{
+    IR2_OPND helper = ra_alloc_dbt_arg2();
+
+    kzt_native_to_wrapper();
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    li_d(a1_ir2_opnd, entry);
+    aot_load_host_addr(
+        helper, (ADDR)kzt_runtime_guest_entry_or_abort,
+        LOAD_HELPER_KZT_RUNTIME_GUEST_ENTRY, 0);
+    tr_set_running_of_cs(false);
+    la_jirl(ra_ir2_opnd, helper, 0);
+    tr_set_running_of_cs(true);
+    lsassert(lsenv_offset_of_eip(lsenv) >= -2048 &&
+             lsenv_offset_of_eip(lsenv) <= 2047);
+    la_mov64(helper, a0_ir2_opnd);
+    la_store_addrx(
+        helper, env_ir2_opnd, lsenv_offset_of_eip(lsenv));
+    kzt_wrapper_to_native();
+    tr_generate_exit_tb_for_bridge();
+}
+
 void kzt_native_to_wrapper(void)
 {
     tr_save_registers_to_env(0xff, 0xff, option_save_xmm, options_to_save());
@@ -133,7 +175,6 @@ void kzt_native_to_wrapper(void)
                           lsenv_offset_of_fcsr(lsenv));
 
 }
-void kzt_wrapper_to_native(void);
 void kzt_wrapper_to_native(void)
 {
     /* save dbt FCSR */
@@ -156,15 +197,29 @@ static void do_translate_dlerror_brick_tb(onebridge_t *bridge)
 {
     const int fast_result_offset = offsetof(
         CPUX86State, kzt_guest_dlerror_state.dlerror_fast_result);
+    const int context_offset = offsetof(CPUX86State, kzt_runtime_context);
+    const int guest_route_offset = offsetof(
+        box64context_t, kzt_guest_loader_route_present);
     IR2_OPND esp_ir2_opnd = ra_alloc_gpr(esp_index);
     IR2_OPND fast_result = ra_alloc_itemp();
+    IR2_OPND context = ra_alloc_itemp();
+    IR2_OPND guest_route = ra_alloc_itemp();
     IR2_OPND slow_path = ra_alloc_label();
+    IR2_OPND fast_null = ra_alloc_label();
     IR2_OPND finish = ra_alloc_label();
 
     lsassert(fast_result_offset >= -2048 && fast_result_offset <= 2047);
+    lsassert(context_offset >= -2048 && context_offset <= 2047);
+    lsassert(guest_route_offset >= -2048 && guest_route_offset <= 2047);
     kzt_native_to_wrapper();
     la_ld_d(fast_result, env_ir2_opnd, fast_result_offset);
     la_bne(fast_result, zero_ir2_opnd, slow_path);
+    la_ld_d(context, env_ir2_opnd, context_offset);
+    la_beq(context, zero_ir2_opnd, fast_null);
+    la_ld_w(guest_route, context, guest_route_offset);
+    la_bne(guest_route, zero_ir2_opnd, slow_path);
+
+    la_label(fast_null);
     la_st_d(zero_ir2_opnd, env_ir2_opnd,
             lsenv_offset_of_gpr(lsenv, R_EAX));
     la_b(finish);
@@ -178,6 +233,8 @@ static void do_translate_dlerror_brick_tb(onebridge_t *bridge)
 
     la_label(finish);
     ra_free_temp(fast_result);
+    ra_free_temp(context);
+    ra_free_temp(guest_route);
     kzt_wrapper_to_native();
     gen_set_next_tb_code(&esp_ir2_opnd);
     tr_generate_exit_tb_for_bridge();
@@ -185,53 +242,82 @@ static void do_translate_dlerror_brick_tb(onebridge_t *bridge)
 
 static void do_translate_realloc_brick_tb(void)
 {
-    uintptr_t realloc_pc = (uint64_t)&x86realloc;
     IR2_OPND reserved_va_opnd = ra_alloc_itemp();
     IR2_OPND gpr_rdi_opnd = ra_alloc_gpr(edi_index);
-    IR2_OPND back_to_x86realloc_opnd = ra_alloc_label();
+    IR2_OPND back_to_guest_realloc_opnd = ra_alloc_label();
     IR2_OPND esp_ir2_opnd = ra_alloc_gpr(esp_index);
-    lsassert(realloc_pc);
     li_d(reserved_va_opnd, (ADDR)reserved_va);
-    la_bltu(gpr_rdi_opnd, reserved_va_opnd, back_to_x86realloc_opnd);
+    la_bltu(gpr_rdi_opnd, reserved_va_opnd, back_to_guest_realloc_opnd);
     kzt_native_to_wrapper();
     kzt_helper_pFpL((ADDR)mmm_realloc, gpr_rdi_opnd, ra_alloc_gpr(esi_index));
     kzt_wrapper_to_native();
     gen_set_next_tb_code(&esp_ir2_opnd);
     tr_generate_exit_tb_for_bridge();
-    la_label(back_to_x86realloc_opnd);
-    IR2_OPND eip_opnd = ra_alloc_dbt_arg2();
-    li_d(eip_opnd, (ADDR)realloc_pc);
-    la_ld_d(eip_opnd,eip_opnd, 0);
-    lsassert(lsenv_offset_of_eip(lsenv) >= -2048 &&
-            lsenv_offset_of_eip(lsenv) <= 2047);
-    la_store_addrx(eip_opnd, env_ir2_opnd,
-                            lsenv_offset_of_eip(lsenv));
-    tr_generate_exit_tb_for_bridge();
+    la_label(back_to_guest_realloc_opnd);
+    kzt_generate_guest_runtime_branch(KZT_GUEST_RUNTIME_REALLOC);
 }
 
 static void do_translate_free_brick_tb(void)
 {
-    uintptr_t free_pc = (uint64_t)&x86free;
     IR2_OPND reserved_va_opnd = ra_alloc_itemp();
     IR2_OPND gpr_rdi_opnd = ra_alloc_gpr(edi_index);
-    IR2_OPND back_to_x86free_opnd = ra_alloc_label();
+    IR2_OPND back_to_guest_free_opnd = ra_alloc_label();
     IR2_OPND esp_ir2_opnd = ra_alloc_gpr(esp_index);
-    lsassert(free_pc);
     li_d(reserved_va_opnd, (ADDR)reserved_va);
-    la_bltu(gpr_rdi_opnd, reserved_va_opnd, back_to_x86free_opnd);
+    la_bltu(gpr_rdi_opnd, reserved_va_opnd, back_to_guest_free_opnd);
     kzt_native_to_wrapper();
     kzt_helper_ptr((ADDR)mmm_free, gpr_rdi_opnd);
     kzt_wrapper_to_native();
     gen_set_next_tb_code(&esp_ir2_opnd);
     tr_generate_exit_tb_for_bridge();
-    la_label(back_to_x86free_opnd);
-    IR2_OPND eip_opnd = ra_alloc_dbt_arg2();
-    li_d(eip_opnd, (ADDR)free_pc);
-    la_ld_d(eip_opnd,eip_opnd, 0);
-    lsassert(lsenv_offset_of_eip(lsenv) >= -2048 &&
-            lsenv_offset_of_eip(lsenv) <= 2047);
-    la_store_addrx(eip_opnd, env_ir2_opnd,
-                            lsenv_offset_of_eip(lsenv));
+    la_label(back_to_guest_free_opnd);
+    kzt_generate_guest_runtime_branch(KZT_GUEST_RUNTIME_FREE);
+}
+
+static void do_translate_xcb_guarded_brick_tb(onebridge_t *bridge)
+{
+    IR2_OPND helper = ra_alloc_dbt_arg2();
+    IR2_OPND fallback = ra_alloc_label();
+    IR2_OPND esp_ir2_opnd = ra_alloc_gpr(esp_index);
+
+    lsassert(bridge->guest_fallback_target != 0);
+    kzt_native_to_wrapper();
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_ld_d(a1_ir2_opnd, env_ir2_opnd,
+            lsenv_offset_of_gpr(lsenv, R_EDI));
+    aot_load_host_addr(
+        helper, (ADDR)kzt_xcb_guard_acquire_for_bridge,
+        LOAD_HELPER_KZT_XCB_GUARD_ACQUIRE, 0);
+    tr_set_running_of_cs(false);
+    la_jirl(ra_ir2_opnd, helper, 0);
+    tr_set_running_of_cs(true);
+    la_beq(a0_ir2_opnd, zero_ir2_opnd, fallback);
+
+    wrapper_gpr_trans((ADDR)bridge->f);
+    tr_set_running_of_cs(false);
+    li_d(ra_ir2_opnd, (ADDR)bridge->w);
+    la_jirl(ra_ir2_opnd, ra_ir2_opnd, 0);
+    tr_set_running_of_cs(true);
+
+    /* A correctly classified wrapper consumes the prepared lease.  Calling
+     * the helper with a null guest also releases it if the wrapper did not. */
+    la_mov64(a0_ir2_opnd, env_ir2_opnd);
+    la_mov64(a1_ir2_opnd, zero_ir2_opnd);
+    aot_load_host_addr(
+        helper, (ADDR)kzt_xcb_guard_acquire_for_bridge,
+        LOAD_HELPER_KZT_XCB_GUARD_ACQUIRE, 0);
+    tr_set_running_of_cs(false);
+    la_jirl(ra_ir2_opnd, helper, 0);
+    tr_set_running_of_cs(true);
+    kzt_wrapper_to_native();
+    gen_set_next_tb_code(&esp_ir2_opnd);
+    tr_generate_exit_tb_for_bridge();
+
+    la_label(fallback);
+    li_d(helper, bridge->guest_fallback_target);
+    la_store_addrx(
+        helper, env_ir2_opnd, lsenv_offset_of_eip(lsenv));
+    kzt_wrapper_to_native();
     tr_generate_exit_tb_for_bridge();
 }
 
@@ -239,7 +325,10 @@ static void do_translate_brick_tb(onebridge_t *bridge, struct cpu_state_info *st
 {
     tb = lsenv->tr_data->curr_tb;
     IR2_OPND esp_ir2_opnd = ra_alloc_gpr(esp_index);
-    if (bridge->f == (uintptr_t)my_free ||bridge->f == (uintptr_t)my___libc_free ||bridge->f == (uintptr_t)my___free ||bridge->f == (uintptr_t)my_cfree ) {
+    if (bridge->guard_kind == KZT_BRIDGE_GUARD_XCB_CONNECTION) {
+        do_translate_xcb_guarded_brick_tb(bridge);
+        return;
+    } else if (bridge->f == (uintptr_t)my_free ||bridge->f == (uintptr_t)my___libc_free ||bridge->f == (uintptr_t)my___free ||bridge->f == (uintptr_t)my_cfree ) {
         do_translate_free_brick_tb();
         return;
     } else if (bridge->f == (uintptr_t)my_realloc) {

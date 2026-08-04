@@ -9,6 +9,7 @@
 #include "target/i386/latx/include/elfloader.h"
 #include "target/i386/latx/include/kzt_guest_dl_api.h"
 #include "target/i386/latx/include/kzt_guest_dl_init.h"
+#include "target/i386/latx/include/kzt_guest_runtime_entry.h"
 #include "target/i386/latx/include/kzt_guest_library_adapter.h"
 #include "target/i386/latx/include/kzt_guest_registry.h"
 #include "target/i386/latx/include/kzt_jump_slot_production.h"
@@ -20,9 +21,9 @@ __thread uintptr_t kzt_guest_dlerror_fast_result_tls;
 
 int option_kzt = 1;
 int wine_option_kzt;
-elfheader_t *tryLoadElfFromFile(const char *name);
+elfheader_t *tryLoadElfFromFileForContext(
+    box64context_t *context, const char *name);
 void freeElfFromFile(elfheader_t **header);
-void kzt_wine_init_x86(box64context_t *context, uintptr_t guest_dlsym);
 
 #define CHECK(label, condition)                                              \
     do {                                                                     \
@@ -62,6 +63,7 @@ static uintptr_t dlopen_result;
 static int dlclose_result;
 static uintptr_t guest_result;
 static uintptr_t selected_result;
+static uintptr_t seen_dlsym_function;
 static char guest_error[] = "guest error";
 static int wrapper_known;
 static int attach_result;
@@ -83,6 +85,7 @@ static int registry_identity_resident_calls;
 static uintptr_t registry_identity_handle;
 static uintptr_t registry_identity_link_map;
 static uintptr_t registry_identity_namespace;
+static int selector_identity_required = -1;
 static int registry_close_complete_calls;
 static kzt_guest_loader_close_result_t registry_close_result;
 static int registry_close_identity_missing_calls;
@@ -125,15 +128,34 @@ static int entry_destroy_done;
 static int default_entry_pause;
 static int default_entry_libc_calls;
 static int default_entry_libdl_calls;
-static int default_entry_wine_calls;
 static int default_entry_path_calls;
 static int default_entry_header_frees;
-static int default_entry_path_present;
+static box64context_t *default_entry_contexts[2];
+static int default_entry_context_calls[2];
+static int default_entry_context_path_present[2];
+static int runtime_dlsym_error_model;
+static int runtime_dlsym_error_pending;
 static int default_entry_incomplete;
-static int default_wine_pause;
-static int default_wine_paused;
-static int default_wine_release;
 const char *interp_prefix = "/guest-root";
+
+typedef struct runtime_entry_resolver_state {
+    pthread_mutex_t mutex;
+    pthread_cond_t ready;
+    const char *expected_symbol;
+    uintptr_t result;
+    int failures;
+    int calls;
+    int pause;
+    int paused;
+    int release;
+} runtime_entry_resolver_state_t;
+
+typedef struct runtime_entry_race {
+    dlprivate_t *dl;
+    kzt_guest_runtime_entry_id_t entry;
+    runtime_entry_resolver_state_t *resolver;
+    uintptr_t result;
+} runtime_entry_race_t;
 
 typedef struct dlerror_publish_race {
     dlprivate_t *dl;
@@ -231,7 +253,7 @@ static void *isolate_guest_dlerror(void *opaque)
     }
     result = kzt_guest_dl_api_dlerror(
         &race->error_state,
-        kzt_guest_dl_api_load_dlerror_entry(race->dl));
+        kzt_guest_dl_api_load_dlerror_entry(race->dl), 0);
     race->forward_to_guest_caller = result.forward_to_guest_caller;
     snprintf(race->observed, sizeof(race->observed), "%s",
              result.value ? result.value : "<empty>");
@@ -375,20 +397,94 @@ static void *destroy_guest_dl_entries(void *opaque)
     dlentry_destroy_race_t *race = opaque;
 
     __atomic_store_n(&entry_destroy_started, 1, __ATOMIC_RELEASE);
-    kzt_guest_dl_api_entry_state_destroy(race->dl);
+    kzt_guest_dl_api_entry_state_begin_teardown(race->dl);
     __atomic_store_n(&entry_destroy_done, 1, __ATOMIC_RELEASE);
     return NULL;
 }
 
-elfheader_t* tryLoadElfFromFile(const char *name)
+static uintptr_t resolve_runtime_entry(const char *symbol, void *opaque)
 {
+    runtime_entry_resolver_state_t *state = opaque;
+    int call;
+
+    CHECK("runtime resolver exact symbol",
+          strcmp(symbol, state->expected_symbol) == 0);
+    pthread_mutex_lock(&state->mutex);
+    call = ++state->calls;
+    if (state->pause) {
+        state->paused = 1;
+        pthread_cond_broadcast(&state->ready);
+        while (!state->release) {
+            pthread_cond_wait(&state->ready, &state->mutex);
+        }
+    }
+    pthread_mutex_unlock(&state->mutex);
+    return call <= state->failures ? 0 : state->result;
+}
+
+static void *resolve_runtime_entry_in_thread(void *opaque)
+{
+    runtime_entry_race_t *race = opaque;
+
+    race->result = kzt_guest_runtime_entry_ensure(
+        race->dl, race->entry, resolve_runtime_entry, race->resolver);
+    return NULL;
+}
+
+static int wait_for_runtime_slow_users(
+    dlprivate_t *dl, unsigned int minimum)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 100000; ++attempt) {
+        unsigned int users;
+
+        pthread_mutex_lock(&dl->guest_dl_entries.mutex);
+        users = dl->guest_dl_entries.slow_users;
+        pthread_mutex_unlock(&dl->guest_dl_entries.mutex);
+        if (users >= minimum) {
+            return 0;
+        }
+        sched_yield();
+    }
+    return -1;
+}
+
+static void runtime_entry_resolver_state_init(
+    runtime_entry_resolver_state_t *state, const char *symbol,
+    uintptr_t result)
+{
+    memset(state, 0, sizeof(*state));
+    CHECK("runtime resolver mutex initializes",
+          pthread_mutex_init(&state->mutex, NULL) == 0);
+    CHECK("runtime resolver condition initializes",
+          pthread_cond_init(&state->ready, NULL) == 0);
+    state->expected_symbol = symbol;
+    state->result = result;
+}
+
+static void runtime_entry_resolver_state_destroy(
+    runtime_entry_resolver_state_t *state)
+{
+    pthread_cond_destroy(&state->ready);
+    pthread_mutex_destroy(&state->mutex);
+}
+
+elfheader_t* tryLoadElfFromFileForContext(
+    box64context_t *context, const char *name)
+{
+    int context_index = context == default_entry_contexts[0] ? 0 : 1;
+
+    CHECK("default resolver receives owning context",
+          context == default_entry_contexts[context_index]);
+    ++default_entry_context_calls[context_index];
     if (strcmp(name, "libc.so.6") == 0) {
         ++default_entry_libc_calls;
-        return (elfheader_t *)(uintptr_t)1;
+        return (elfheader_t *)(uintptr_t)(1 + context_index * 2);
     }
     CHECK("default resolver requests libdl", strcmp(name, "libdl.so.2") == 0);
     ++default_entry_libdl_calls;
-    return (elfheader_t *)(uintptr_t)2;
+    return (elfheader_t *)(uintptr_t)(2 + context_index * 2);
 }
 
 void freeElfFromFile(elfheader_t **header)
@@ -402,21 +498,28 @@ void ResetSpecialCaseElf(
     elfheader_t *header, const char **names, int name_count,
     void **resolved, int *resolved_count)
 {
-    int begin = header == (elfheader_t *)(uintptr_t)1 ? 0 : 4;
-    int end = header == (elfheader_t *)(uintptr_t)1 ? 4 : name_count;
+    uintptr_t header_id = (uintptr_t)header;
+    int second_context = header_id >= 3;
+    int is_libc = header_id == 1 || header_id == 3;
+    int begin = is_libc ? 0 : 4;
+    int end = is_libc ? name_count : 9;
+    uintptr_t base = second_context ? 0xa000 : 0x9000;
 
-    CHECK("default resolver symbol count", name_count == 9);
+    CHECK("default resolver symbol count", name_count == 12);
     for (int i = begin; i < end; ++i) {
+        if (is_libc && i >= 4 && i < 9) {
+            continue;
+        }
         CHECK("default resolver symbol name", names[i] && names[i][0]);
-        if (default_entry_incomplete && i == name_count - 1) {
+        if (default_entry_incomplete && i == 8) {
             continue;
         }
         if (!resolved[i]) {
-            resolved[i] = (void *)(uintptr_t)(0x9000 + i * 0x10);
+            resolved[i] = (void *)(base + i * 0x10);
             ++*resolved_count;
         }
     }
-    if (header == (elfheader_t *)(uintptr_t)1 && default_entry_pause) {
+    if (is_libc && default_entry_pause) {
         pthread_mutex_lock(&entry_init_lock);
         entry_init_paused = 1;
         pthread_cond_broadcast(&entry_init_ready);
@@ -429,34 +532,28 @@ void ResetSpecialCaseElf(
 
 void PrependList(path_collection_t *collection, const char *list, int folder)
 {
+    int context_index =
+        collection == &default_entry_contexts[0]->box64_ld_lib ? 0 : 1;
+
     CHECK("default resolver path collection", collection != NULL);
+    CHECK("default resolver owns path collection",
+          collection == &default_entry_contexts[context_index]->box64_ld_lib);
     CHECK("default resolver hwcap path", strstr(list, "x86-64-v2") != NULL);
     CHECK("default resolver path kind", folder == 1);
     ++default_entry_path_calls;
-    default_entry_path_present = 1;
+    default_entry_context_path_present[context_index] = 1;
 }
 
 int FindInCollection(const char *path, path_collection_t *collection)
 {
-    CHECK("default resolver path lookup collection", collection != NULL);
-    CHECK("default resolver path lookup", strstr(path, "x86-64-v2") != NULL);
-    return default_entry_path_present;
-}
+    int context_index =
+        collection == &default_entry_contexts[0]->box64_ld_lib ? 0 : 1;
 
-void kzt_wine_init_x86(box64context_t *context, uintptr_t guest_dlsym)
-{
-    CHECK("default resolver wine context", context != NULL);
-    CHECK("default resolver wine dlsym", guest_dlsym == 0x9020);
-    ++default_entry_wine_calls;
-    if (default_wine_pause) {
-        pthread_mutex_lock(&entry_init_lock);
-        default_wine_paused = 1;
-        pthread_cond_broadcast(&entry_init_ready);
-        while (!default_wine_release) {
-            pthread_cond_wait(&entry_init_ready, &entry_init_lock);
-        }
-        pthread_mutex_unlock(&entry_init_lock);
-    }
+    CHECK("default resolver path lookup collection", collection != NULL);
+    CHECK("default resolver path lookup owner",
+          collection == &default_entry_contexts[context_index]->box64_ld_lib);
+    CHECK("default resolver path lookup", strstr(path, "x86-64-v2") != NULL);
+    return default_entry_context_path_present[context_index];
 }
 
 static void *initialize_default_guest_dl_entries(void *opaque)
@@ -626,10 +723,14 @@ void kzt_guest_library_wrapper_source_release(
 uint64_t kzt_guest_library_run_dlsym(
     uintptr_t function, void *handle, void *symbol)
 {
+    seen_dlsym_function = function;
     seen_function = function;
     seen_handle = handle;
     seen_symbol = symbol;
     ++dlsym_calls;
+    if (runtime_dlsym_error_model) {
+        runtime_dlsym_error_pending = guest_result == 0;
+    }
     return guest_result;
 }
 
@@ -646,6 +747,14 @@ uint64_t kzt_guest_library_run_dlvsym(
 
 uint64_t kzt_guest_library_run_dlerror(uintptr_t function)
 {
+    if (runtime_dlsym_error_model) {
+        int pending = runtime_dlsym_error_pending;
+
+        runtime_dlsym_error_pending = 0;
+        seen_function = function;
+        ++dlerror_calls;
+        return pending ? (uintptr_t)guest_error : 0;
+    }
     if (thread_guest_error) {
         __atomic_add_fetch(&dlerror_calls, 1, __ATOMIC_RELAXED);
         return (uintptr_t)thread_guest_error;
@@ -743,6 +852,27 @@ uintptr_t kzt_guest_library_select_symbol_result(
     CHECK("selector symbol", symbol == (const char *)seen_symbol);
     CHECK("selector version", version == seen_version);
     return selected_result;
+}
+
+uintptr_t kzt_guest_library_select_symbol_result_with_identity(
+    box64context_t *context, uintptr_t guest_handle,
+    const kzt_guest_loader_identity_t *queried_identity,
+    uintptr_t actual_guest_result, const char *symbol, const char *version)
+{
+    if (selector_identity_required >= 0) {
+        CHECK("selector exact identity presence",
+              (queried_identity != NULL) == selector_identity_required);
+    }
+    if (queried_identity) {
+        CHECK("selector exact identity handle",
+              queried_identity->handle == guest_handle);
+        CHECK("selector exact identity link map",
+              queried_identity->link_map_addr == dlinfo_link_map);
+        CHECK("selector exact identity namespace",
+              queried_identity->namespace_id == dlinfo_lmid);
+    }
+    return kzt_guest_library_select_symbol_result(
+        context, guest_handle, actual_guest_result, symbol, version);
 }
 
 kzt_guest_registry_t *KztGuestRegistryForContext(box64context_t *context)
@@ -1075,6 +1205,7 @@ void KztPerObjectGotPltRelease(uintptr_t object_head)
 static void reset_calls(void)
 {
     seen_function = 0;
+    seen_dlsym_function = 0;
     seen_handle = NULL;
     seen_symbol = NULL;
     seen_version = NULL;
@@ -1126,6 +1257,7 @@ static void reset_calls(void)
     registry_identity_handle = 0;
     registry_identity_link_map = 0;
     registry_identity_namespace = 0;
+    selector_identity_required = -1;
     registry_close_complete_calls = 0;
     registry_close_result = KZT_GUEST_LOADER_CLOSE_UNLOAD_UNPROVEN;
     registry_close_identity_missing_calls = 0;
@@ -1145,6 +1277,8 @@ static void reset_calls(void)
     close_race_wait_calls = 0;
     error_race_enabled = 0;
     error_race_phase = 0;
+    runtime_dlsym_error_model = 0;
+    runtime_dlsym_error_pending = 0;
 }
 
 static void set_exact_match(uintptr_t link_map_addr, uintptr_t namespace_id)
@@ -1175,11 +1309,25 @@ int main(void)
     dlentry_init_race_t entry_races[2] = { 0 };
     pthread_t entry_threads[2];
     dlprivate_t destroy_dl = { 0 };
+    dlprivate_t runtime_dl_a = { 0 };
+    dlprivate_t runtime_dl_b = { 0 };
     dlentry_destroy_race_t destroy_race = { .dl = &destroy_dl };
     dlentry_init_race_t destroy_init_race = { .dl = &destroy_dl };
     pthread_t destroy_threads[2];
+    pthread_t runtime_threads[2];
+    runtime_entry_resolver_state_t runtime_resolver_a;
+    runtime_entry_resolver_state_t runtime_resolver_b;
+    runtime_entry_race_t runtime_races[2];
+    kzt_guest_runtime_entry_scope_t runtime_scope = { 0 };
+    box64context_t runtime_context_a = { .dlprivate = &runtime_dl_a };
+    box64context_t runtime_context_b = { .dlprivate = &runtime_dl_b };
+    uintptr_t runtime_entries[KZT_GUEST_RUNTIME_ENTRY_COUNT] = {
+        0xa610, 0xa620, 0xa630,
+    };
     dlprivate_t default_dl = { 0 };
+    dlprivate_t default_dl_b = { 0 };
     box64context_t default_context = { .dlprivate = &default_dl };
+    box64context_t default_context_b = { .dlprivate = &default_dl_b };
     default_dlentry_race_t default_races[2] = {
         { .context = &default_context },
         { .context = &default_context },
@@ -1204,6 +1352,9 @@ int main(void)
         .dladdr = 0x1080,
         .dladdr1 = 0x1090,
     };
+
+    default_entry_contexts[0] = &default_context;
+    default_entry_contexts[1] = &default_context_b;
 
     fast_error_state.dlerror_fast_result_mirror = &fast_error_mirror;
     fast_error_state.dlerror_slow_required = 1;
@@ -1419,16 +1570,25 @@ int main(void)
           finish_calls == 1 && !finish_publish && finish_link_map == 0);
     CHECK("guest failure captures guest error", dlerror_calls == 1);
     error_result = kzt_guest_dl_api_dlerror(
-        &error_state, kzt_guest_dl_api_load_dlerror_entry(&dl));
+        &error_state, kzt_guest_dl_api_load_dlerror_entry(&dl), 0);
     CHECK("captured guest error returned",
           error_result.value &&
               strcmp(error_result.value, guest_error) == 0 &&
               !error_result.forward_to_guest_caller);
     error_result = kzt_guest_dl_api_dlerror(
-        &error_state, kzt_guest_dl_api_load_dlerror_entry(&dl));
+        &error_state, kzt_guest_dl_api_load_dlerror_entry(&dl), 0);
     CHECK("captured guest error is one-shot",
           !error_result.value && !error_result.forward_to_guest_caller);
     CHECK("consumed guest error stays on clean path", dlerror_calls == 1);
+    error_state.last_error_returned = strdup("prior wrapper error");
+    CHECK("cached error test allocation",
+          error_state.last_error_returned != NULL);
+    error_state.last_error_guest_consumed = 1;
+    error_state.dlerror_slow_required = 1;
+    error_result = kzt_guest_dl_api_dlerror(
+        &error_state, kzt_guest_dl_api_load_dlerror_entry(&dl), 1);
+    CHECK("guest route can report an error after a cached error was consumed",
+          !error_result.value && error_result.forward_to_guest_caller);
     kzt_guest_dl_api_clear_error(&error_state);
 
     reset_calls();
@@ -1505,6 +1665,10 @@ int main(void)
     reset_calls();
     guest_result = 0x2010;
     selected_result = 0x3010;
+    registry_match_enabled = 1;
+    registry_match.link_map_addr = 0x9000;
+    registry_match.generation = 1;
+    registry_match.namespace_id = 0;
     symbol_result = kzt_guest_dl_api_dlsym(
         &context, &direct_entries, (void *)(uintptr_t)0x9000, symbol);
     CHECK("direct dlsym call", dlsym_calls == 1);
@@ -1516,12 +1680,29 @@ int main(void)
     reset_calls();
     guest_result = 0x2020;
     selected_result = 0x3020;
+    registry_match_enabled = 1;
+    registry_match.link_map_addr = 1;
+    registry_match.generation = 1;
+    registry_match.namespace_id = 0;
     symbol_result = kzt_guest_dl_api_dlsym(
         &context, &direct_entries, (void *)(uintptr_t)1, symbol);
     CHECK("opaque low dlsym call", dlsym_calls == 1);
     CHECK("opaque low dlsym handle preserved",
           seen_handle == (void *)(uintptr_t)1);
     CHECK("opaque low dlsym result", symbol_result.value == 0x3020);
+
+    reset_calls();
+    guest_result = 0x2028;
+    selected_result = 0x3028;
+    dlinfo_identity_enabled = 1;
+    dlinfo_link_map = 0x2098;
+    dlinfo_lmid = 0;
+    selector_identity_required = 1;
+    symbol_result = kzt_guest_dl_api_dlsym(
+        &context, &direct_entries, (void *)(uintptr_t)0x9028, symbol);
+    CHECK("unpublished handle queries exact dlinfo", dlinfo_calls == 2);
+    CHECK("unpublished handle selected result",
+          symbol_result.value == selected_result);
 
     reset_calls();
     symbol_result = kzt_guest_dl_api_dlsym(
@@ -1533,6 +1714,10 @@ int main(void)
     reset_calls();
     guest_result = 0x2030;
     selected_result = 0x3030;
+    registry_match_enabled = 1;
+    registry_match.link_map_addr = 1;
+    registry_match.generation = 1;
+    registry_match.namespace_id = 0;
     symbol_result = kzt_guest_dl_api_dlvsym(
         &context, &direct_entries, (void *)(uintptr_t)1, symbol, version);
     CHECK("dlvsym call", dlvsym_calls == 1);
@@ -1970,83 +2155,20 @@ int main(void)
           __atomic_load_n(&entry_destroy_done, __ATOMIC_ACQUIRE));
     CHECK("guest dl teardown prevents publication",
           destroy_init_race.result == &destroy_init_race.fallback);
-
-    CHECK("default guest dl teardown state initializes",
-          kzt_guest_dl_api_entry_state_init(&default_dl) == 0);
-    default_entry_pause = 0;
-    default_entry_libc_calls = 0;
-    default_entry_libdl_calls = 0;
-    default_entry_wine_calls = 0;
-    default_entry_path_calls = 0;
-    default_entry_header_frees = 0;
-    default_entry_path_present = 0;
-    default_entry_incomplete = 0;
-    default_wine_pause = 1;
-    default_wine_paused = 0;
-    default_wine_release = 0;
-    entry_destroy_started = 0;
-    entry_destroy_done = 0;
-    CHECK("default guest dl prepare starts",
-          pthread_create(&default_threads[0], NULL,
-                         initialize_default_guest_dl_entries,
-                         &default_races[0]) == 0);
-    pthread_mutex_lock(&entry_init_lock);
-    while (!default_wine_paused) {
-        pthread_cond_wait(&entry_init_ready, &entry_init_lock);
-    }
-    pthread_mutex_unlock(&entry_init_lock);
-    CHECK("default guest dl table remains hidden during prepare",
-          kzt_guest_dl_api_load_entries(&default_dl) == NULL);
-    CHECK("default guest dl prepare waiter starts",
-          pthread_create(&default_threads[1], NULL,
-                         initialize_default_guest_dl_entries,
-                         &default_races[1]) == 0);
-    for (;;) {
-        unsigned int slow_users;
-
-        pthread_mutex_lock(&default_dl.guest_dl_entries.mutex);
-        slow_users = default_dl.guest_dl_entries.slow_users;
-        pthread_mutex_unlock(&default_dl.guest_dl_entries.mutex);
-        if (slow_users == 2) {
-            break;
-        }
-        sched_yield();
-    }
-    destroy_race.dl = &default_dl;
-    CHECK("default guest dl prepare destroy starts",
-          pthread_create(&destroy_threads[0], NULL,
-                         destroy_guest_dl_entries, &destroy_race) == 0);
-    while (!__atomic_load_n(&entry_destroy_started, __ATOMIC_ACQUIRE)) {
-        sched_yield();
-    }
-    CHECK("default guest dl destroy waits for prepare and waiter",
-          !__atomic_load_n(&entry_destroy_done, __ATOMIC_ACQUIRE));
-    pthread_mutex_lock(&entry_init_lock);
-    default_wine_release = 1;
-    pthread_cond_broadcast(&entry_init_ready);
-    pthread_mutex_unlock(&entry_init_lock);
-    CHECK("default guest dl prepare initializer joins",
-          pthread_join(default_threads[0], NULL) == 0);
-    CHECK("default guest dl prepare waiter joins",
-          pthread_join(default_threads[1], NULL) == 0);
-    CHECK("default guest dl prepare destroy joins",
-          pthread_join(destroy_threads[0], NULL) == 0);
-    CHECK("default guest dl teardown blocks post-prepare publication",
-          default_races[0].result == &default_races[0].fallback &&
-              default_races[1].result == NULL &&
-              kzt_guest_dl_api_load_entries(&default_dl) == NULL);
+    kzt_guest_dl_api_entry_state_destroy(&destroy_dl);
 
     CHECK("default guest dl state initializes",
           kzt_guest_dl_api_entry_state_init(&default_dl) == 0);
     default_entry_pause = 1;
     default_entry_libc_calls = 0;
     default_entry_libdl_calls = 0;
-    default_entry_wine_calls = 0;
     default_entry_path_calls = 0;
     default_entry_header_frees = 0;
-    default_entry_path_present = 0;
+    memset(default_entry_context_calls, 0,
+           sizeof(default_entry_context_calls));
+    memset(default_entry_context_path_present, 0,
+           sizeof(default_entry_context_path_present));
     default_entry_incomplete = 0;
-    default_wine_pause = 0;
     entry_init_paused = 0;
     entry_init_release = 0;
     CHECK("default guest dl libc caller starts",
@@ -2075,13 +2197,30 @@ int main(void)
               default_entry_path_calls == 1);
     CHECK("default guest dl resolver frees transient headers",
           default_entry_header_frees == 2);
-    CHECK("default guest dl post init runs once",
-          default_entry_wine_calls == 1);
     CHECK("default guest dl callers share complete table",
           default_races[0].result &&
               default_races[0].result == default_races[1].result &&
               default_races[0].result->dlopen == 0x9000 &&
               default_races[0].result->dlerror == 0x9080);
+    CHECK("default initialization publishes runtime entries",
+          kzt_guest_runtime_entry_for_guest_branch(
+              &default_context, KZT_GUEST_RUNTIME_FREE) == 0x9090 &&
+              kzt_guest_runtime_entry_for_guest_branch(
+                  &default_context, KZT_GUEST_RUNTIME_REALLOC) == 0x90a0 &&
+              kzt_guest_runtime_entry_for_guest_branch(
+                  &default_context,
+                  KZT_GUEST_RUNTIME_PTHREAD_SETCANCELTYPE) == 0x90b0);
+    reset_calls();
+    runtime_dlsym_error_model = 1;
+    runtime_dlsym_error_pending = 1;
+    CHECK("runtime lookup does not consume an older guest error",
+          kzt_guest_runtime_entry_for_guest_branch(
+              &default_context, KZT_GUEST_RUNTIME_FREE) == 0x9090 &&
+              dlsym_calls == 0 && dlerror_calls == 0 &&
+              kzt_guest_library_run_dlerror(0x9080) ==
+                  (uintptr_t)guest_error &&
+              dlerror_calls == 1);
+    runtime_dlsym_error_model = 0;
     default_entry_pause = 0;
     for (int i = 0; i < 1000; ++i) {
         CHECK("default guest dl steady table remains published",
@@ -2091,17 +2230,37 @@ int main(void)
     }
     CHECK("default guest dl steady calls skip resolution",
           default_entry_libc_calls == 1 && default_entry_libdl_calls == 1 &&
-              default_entry_wine_calls == 1 && default_entry_path_calls == 1);
+              default_entry_path_calls == 1);
     kzt_guest_dl_api_entry_state_destroy(&default_dl);
+
+    CHECK("second-context guest dl state initializes",
+          kzt_guest_dl_api_entry_state_init(&default_dl_b) == 0);
+    default_entry_libc_calls = 0;
+    default_entry_libdl_calls = 0;
+    default_entry_path_calls = 0;
+    default_entry_header_frees = 0;
+    default_entry_context_calls[0] = 0;
+    default_entry_context_calls[1] = 0;
+    default_entry_context_path_present[1] = 0;
+    default_races[1].context = &default_context_b;
+    default_races[1].result = kzt_guest_dl_entries_for_call(
+        &default_context_b, &default_races[1].fallback);
+    CHECK("second context resolves through its own path collection",
+          default_races[1].result &&
+              default_races[1].result->dlopen == 0xa000 &&
+              default_races[1].result->dlerror == 0xa080 &&
+              default_entry_context_calls[0] == 0 &&
+              default_entry_context_calls[1] == 2 &&
+              default_entry_path_calls == 1);
+    kzt_guest_dl_api_entry_state_destroy(&default_dl_b);
 
     CHECK("default guest dl failure resource state initializes",
           kzt_guest_dl_api_entry_state_init(&default_dl) == 0);
     default_entry_libc_calls = 0;
     default_entry_libdl_calls = 0;
-    default_entry_wine_calls = 0;
     default_entry_path_calls = 0;
     default_entry_header_frees = 0;
-    default_entry_path_present = 0;
+    default_entry_context_path_present[0] = 0;
     default_entry_incomplete = 1;
     for (int i = 0; i < 100; ++i) {
         default_races[0].result = kzt_guest_dl_entries_for_call(
@@ -2114,8 +2273,7 @@ int main(void)
           default_entry_libc_calls == 100 &&
               default_entry_libdl_calls == 100 &&
               default_entry_header_frees == 200 &&
-              default_entry_path_calls == 1 &&
-              default_entry_wine_calls == 0);
+              default_entry_path_calls == 1);
     default_entry_incomplete = 0;
     default_races[0].result = kzt_guest_dl_entries_for_call(
         &default_context, &default_races[0].fallback);
@@ -2125,9 +2283,210 @@ int main(void)
               default_entry_libc_calls == 101 &&
               default_entry_libdl_calls == 101 &&
               default_entry_header_frees == 202 &&
-              default_entry_path_calls == 1 &&
-              default_entry_wine_calls == 1);
+              default_entry_path_calls == 1);
     kzt_guest_dl_api_entry_state_destroy(&default_dl);
+
+    CHECK("runtime entry state A initializes",
+          kzt_guest_dl_api_entry_state_init(&runtime_dl_a) == 0);
+    runtime_entry_resolver_state_init(
+        &runtime_resolver_a, "free", 0xa100);
+    runtime_resolver_a.failures = 1;
+    CHECK("runtime entry failure is not cached",
+          kzt_guest_runtime_entry_ensure(
+              &runtime_dl_a, KZT_GUEST_RUNTIME_FREE,
+              resolve_runtime_entry, &runtime_resolver_a) == 0 &&
+              kzt_guest_runtime_entry_load(
+                  &runtime_context_a, KZT_GUEST_RUNTIME_FREE) == 0);
+    CHECK("runtime entry retries and publishes a valid address",
+          kzt_guest_runtime_entry_ensure(
+              &runtime_dl_a, KZT_GUEST_RUNTIME_FREE,
+              resolve_runtime_entry, &runtime_resolver_a) == 0xa100 &&
+              runtime_resolver_a.calls == 2);
+    CHECK("runtime entry fast path is an atomic cached load",
+          kzt_guest_runtime_entry_load(
+              &runtime_context_a, KZT_GUEST_RUNTIME_FREE) == 0xa100);
+
+    runtime_entry_resolver_state_init(
+        &runtime_resolver_b, "realloc", 0xa200);
+    CHECK("runtime entries cache independently",
+          kzt_guest_runtime_entry_ensure(
+              &runtime_dl_a, KZT_GUEST_RUNTIME_REALLOC,
+              resolve_runtime_entry, &runtime_resolver_b) == 0xa200 &&
+              kzt_guest_runtime_entry_load(
+                  &runtime_context_a, KZT_GUEST_RUNTIME_FREE) == 0xa100 &&
+              runtime_resolver_a.calls == 2 &&
+              runtime_resolver_b.calls == 1);
+    runtime_entry_resolver_state_destroy(&runtime_resolver_a);
+    runtime_entry_resolver_state_destroy(&runtime_resolver_b);
+    kzt_guest_dl_api_entry_state_destroy(&runtime_dl_a);
+
+    CHECK("runtime concurrent state initializes",
+          kzt_guest_dl_api_entry_state_init(&runtime_dl_a) == 0);
+    runtime_entry_resolver_state_init(
+        &runtime_resolver_a, "pthread_setcanceltype", 0xa300);
+    runtime_resolver_a.pause = 1;
+    runtime_races[0] = (runtime_entry_race_t) {
+        .dl = &runtime_dl_a,
+        .entry = KZT_GUEST_RUNTIME_PTHREAD_SETCANCELTYPE,
+        .resolver = &runtime_resolver_a,
+    };
+    runtime_races[1] = runtime_races[0];
+    CHECK("runtime first resolver starts",
+          pthread_create(&runtime_threads[0], NULL,
+                         resolve_runtime_entry_in_thread,
+                         &runtime_races[0]) == 0);
+    pthread_mutex_lock(&runtime_resolver_a.mutex);
+    while (!runtime_resolver_a.paused) {
+        pthread_cond_wait(
+            &runtime_resolver_a.ready, &runtime_resolver_a.mutex);
+    }
+    pthread_mutex_unlock(&runtime_resolver_a.mutex);
+    CHECK("runtime concurrent waiter starts",
+          pthread_create(&runtime_threads[1], NULL,
+                         resolve_runtime_entry_in_thread,
+                         &runtime_races[1]) == 0);
+    CHECK("runtime concurrent waiter enters state gate",
+          wait_for_runtime_slow_users(&runtime_dl_a, 2) == 0);
+    CHECK("runtime entry remains hidden until nonzero publication",
+          kzt_guest_runtime_entry_load(
+              &runtime_context_a,
+              KZT_GUEST_RUNTIME_PTHREAD_SETCANCELTYPE) == 0);
+    pthread_mutex_lock(&runtime_resolver_a.mutex);
+    runtime_resolver_a.release = 1;
+    pthread_cond_broadcast(&runtime_resolver_a.ready);
+    pthread_mutex_unlock(&runtime_resolver_a.mutex);
+    CHECK("runtime resolver thread joins",
+          pthread_join(runtime_threads[0], NULL) == 0);
+    CHECK("runtime waiter thread joins",
+          pthread_join(runtime_threads[1], NULL) == 0);
+    CHECK("runtime concurrent first resolution publishes once",
+          runtime_resolver_a.calls == 1 &&
+              runtime_races[0].result == 0xa300 &&
+              runtime_races[1].result == 0xa300);
+    runtime_entry_resolver_state_destroy(&runtime_resolver_a);
+    kzt_guest_dl_api_entry_state_destroy(&runtime_dl_a);
+
+    CHECK("runtime isolated state A initializes",
+          kzt_guest_dl_api_entry_state_init(&runtime_dl_a) == 0);
+    CHECK("runtime isolated state B initializes",
+          kzt_guest_dl_api_entry_state_init(&runtime_dl_b) == 0);
+    runtime_entry_resolver_state_init(
+        &runtime_resolver_a, "free", 0xa410);
+    runtime_entry_resolver_state_init(
+        &runtime_resolver_b, "free", 0xa420);
+    CHECK("runtime contexts publish isolated addresses",
+          kzt_guest_runtime_entry_ensure(
+              &runtime_dl_a, KZT_GUEST_RUNTIME_FREE,
+              resolve_runtime_entry, &runtime_resolver_a) == 0xa410 &&
+              kzt_guest_runtime_entry_ensure(
+              &runtime_dl_b, KZT_GUEST_RUNTIME_FREE,
+              resolve_runtime_entry, &runtime_resolver_b) == 0xa420 &&
+              kzt_guest_runtime_entry_load(
+                  &runtime_context_a, KZT_GUEST_RUNTIME_FREE) == 0xa410 &&
+              kzt_guest_runtime_entry_load(
+                  &runtime_context_b, KZT_GUEST_RUNTIME_FREE) == 0xa420);
+    runtime_entry_resolver_state_destroy(&runtime_resolver_a);
+    runtime_entry_resolver_state_destroy(&runtime_resolver_b);
+    kzt_guest_dl_api_entry_state_destroy(&runtime_dl_a);
+    kzt_guest_dl_api_entry_state_destroy(&runtime_dl_b);
+
+    CHECK("runtime pinned state initializes",
+          kzt_guest_dl_api_entry_state_init(&runtime_dl_a) == 0);
+    CHECK("runtime pinned entries publish",
+          kzt_guest_runtime_entry_state_publish(
+              &runtime_dl_a.guest_dl_entries, runtime_entries) == 0);
+    CHECK("runtime pinned scope acquires",
+          kzt_guest_runtime_entry_acquire(
+              &runtime_context_a,
+              KZT_GUEST_RUNTIME_PTHREAD_SETCANCELTYPE,
+              &runtime_scope) == 0 && runtime_scope.address == 0xa630);
+    entry_destroy_started = 0;
+    entry_destroy_done = 0;
+    destroy_race.dl = &runtime_dl_a;
+    CHECK("runtime pinned teardown starts",
+          pthread_create(&runtime_threads[0], NULL,
+                         destroy_guest_dl_entries, &destroy_race) == 0);
+    while (!__atomic_load_n(&entry_destroy_started, __ATOMIC_ACQUIRE)) {
+        sched_yield();
+    }
+    for (;;) {
+        int teardown;
+
+        pthread_mutex_lock(&runtime_dl_a.guest_dl_entries.mutex);
+        teardown = runtime_dl_a.guest_dl_entries.teardown;
+        pthread_mutex_unlock(&runtime_dl_a.guest_dl_entries.mutex);
+        if (teardown) {
+            break;
+        }
+        sched_yield();
+    }
+    CHECK("runtime pinned teardown waits",
+          !__atomic_load_n(&entry_destroy_done, __ATOMIC_ACQUIRE));
+    kzt_guest_runtime_entry_release(&runtime_scope);
+    CHECK("runtime pinned teardown joins",
+          pthread_join(runtime_threads[0], NULL) == 0 &&
+          __atomic_load_n(&entry_destroy_done, __ATOMIC_ACQUIRE));
+    CHECK("runtime pinned teardown clears entries",
+          runtime_dl_a.guest_dl_entries.runtime_entries[
+              KZT_GUEST_RUNTIME_PTHREAD_SETCANCELTYPE] == 0);
+    kzt_guest_dl_api_entry_state_destroy(&runtime_dl_a);
+
+    CHECK("runtime teardown state initializes",
+          kzt_guest_dl_api_entry_state_init(&runtime_dl_a) == 0);
+    runtime_entry_resolver_state_init(
+        &runtime_resolver_a, "realloc", 0xa500);
+    runtime_resolver_a.pause = 1;
+    runtime_races[0] = (runtime_entry_race_t) {
+        .dl = &runtime_dl_a,
+        .entry = KZT_GUEST_RUNTIME_REALLOC,
+        .resolver = &runtime_resolver_a,
+    };
+    CHECK("runtime teardown resolver starts",
+          pthread_create(&runtime_threads[0], NULL,
+                         resolve_runtime_entry_in_thread,
+                         &runtime_races[0]) == 0);
+    pthread_mutex_lock(&runtime_resolver_a.mutex);
+    while (!runtime_resolver_a.paused) {
+        pthread_cond_wait(
+            &runtime_resolver_a.ready, &runtime_resolver_a.mutex);
+    }
+    pthread_mutex_unlock(&runtime_resolver_a.mutex);
+    entry_destroy_started = 0;
+    entry_destroy_done = 0;
+    destroy_race.dl = &runtime_dl_a;
+    CHECK("runtime teardown destroy starts",
+          pthread_create(&runtime_threads[1], NULL,
+                         destroy_guest_dl_entries, &destroy_race) == 0);
+    while (!__atomic_load_n(&entry_destroy_started, __ATOMIC_ACQUIRE)) {
+        sched_yield();
+    }
+    for (;;) {
+        int teardown;
+
+        pthread_mutex_lock(&runtime_dl_a.guest_dl_entries.mutex);
+        teardown = runtime_dl_a.guest_dl_entries.teardown;
+        pthread_mutex_unlock(&runtime_dl_a.guest_dl_entries.mutex);
+        if (teardown) {
+            break;
+        }
+        sched_yield();
+    }
+    CHECK("runtime teardown waits for resolver",
+          !__atomic_load_n(&entry_destroy_done, __ATOMIC_ACQUIRE));
+    pthread_mutex_lock(&runtime_resolver_a.mutex);
+    runtime_resolver_a.release = 1;
+    pthread_cond_broadcast(&runtime_resolver_a.ready);
+    pthread_mutex_unlock(&runtime_resolver_a.mutex);
+    CHECK("runtime teardown resolver joins",
+          pthread_join(runtime_threads[0], NULL) == 0);
+    CHECK("runtime teardown destroy joins",
+          pthread_join(runtime_threads[1], NULL) == 0);
+    CHECK("runtime teardown blocks late publication",
+          runtime_races[0].result == 0 &&
+              runtime_dl_a.guest_dl_entries.runtime_entries[
+                  KZT_GUEST_RUNTIME_REALLOC] == 0);
+    kzt_guest_dl_api_entry_state_destroy(&runtime_dl_a);
+    runtime_entry_resolver_state_destroy(&runtime_resolver_a);
 
     kzt_guest_dl_api_clear_error(&error_state);
     kzt_guest_dl_api_free_errors(&error_state);

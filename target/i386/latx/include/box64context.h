@@ -10,7 +10,9 @@
 #include "kzt_guest_registry_context.h"
 #include "kzt_guest_scope_layout.h"
 #include "kzt_lazy_prebind_scope.h"
+#include "kzt_loader_event_hook.h"
 #include "kzt_patch_spike_guard.h"
+#include "kzt_xcb_connection_map.h"
 
 typedef struct elfheader_s elfheader_t;
 typedef struct cleanup_s cleanup_t;
@@ -20,6 +22,7 @@ typedef struct kh_symbolmap_s kh_symbolmap_t;
 typedef struct kh_symbol1map_s kh_symbol1map_t;
 typedef struct library_s library_t;
 typedef struct linkmap_s linkmap_t;
+struct x86_ld_info;
 typedef struct kh_threadstack_s kh_threadstack_t;
 typedef struct atfork_fnc_s {
     uintptr_t prepare;
@@ -196,12 +199,6 @@ struct link_map_x64 {
     unsigned long long l_serial;
     struct auditstate l_audit[];
 };
-struct malloc_map {
-    void* mallocp;
-    void* freep;
-    void* reallocp;
-    void* h;
-};
 typedef struct box64context_s {
     path_collection_t   box64_path;     // PATH env. variable
     path_collection_t   box64_ld_lib;   // LD_LIBRARY_PATH env. variable
@@ -233,10 +230,6 @@ typedef struct box64context_s {
     elfheader_t         **elfs;         // elf headers and memory
     int                 elfcap;
     int                 elfsize;        // number of elf loaded
-
-    struct malloc_map          **mallocmaps;         // elf filepath and memory
-    int                 mallocmapcap;
-    int                 mallocmapsize;        // number of elf filepath
 
     needed_libs_t       neededlibs;     // needed libs for main elf
 
@@ -336,6 +329,9 @@ typedef struct box64context_s {
     int                 stack_clone_used;
 
     int                 current_line;
+    struct x86_ld_info  *kzt_loader_bridge_info;
+    uint32_t            kzt_loader_callback_original[2];
+    uint32_t            kzt_loader_debug_state_original[2];
 #ifdef CONFIG_LATX_DEBUG
     struct latx_kzt_debug **latx_kzt_debugs;
     int                 latx_kzt_debugcap;
@@ -345,11 +341,14 @@ typedef struct box64context_s {
     kzt_guest_registry_context_t kzt_guest_registry_context;
     kzt_guest_library_access_t kzt_guest_library_access;
     kzt_guest_scope_layout_t kzt_guest_scope_layout;
+    kzt_loader_event_hook_t kzt_loader_event_hook;
     kzt_lazy_prebind_scope_t *kzt_lazy_prebind_scope;
     kzt_patch_spike_guard_t kzt_patch_spike_guard;
     uintptr_t kzt_plt_resolver_bridge;
-    uintptr_t kzt_lazy_completion_bridge;
+    int kzt_lazy_prebind_refresh_pending;
+    int kzt_guest_loader_route_present;
 #endif
+    kzt_xcb_connection_map_t *kzt_xcb_connection_map;
 } box64context_t;
 
 extern box64context_t *my_context; // global context
@@ -371,8 +370,6 @@ kzt_patch_spike_guard_t *KztPatchSpikeGuardForContext(box64context_t *context);
 
 // return the index of the added header
 int AddElfHeader(box64context_t* ctx, elfheader_t* head);
-int AddMallocMap(box64context_t* ctx, struct malloc_map* map);
-struct malloc_map * SearchMallocMap(box64context_t* ctx, char *elfname);
 #if defined(CONFIG_LATX_KZT) && defined(CONFIG_LATX_DEBUG)
 int AddKztDebugInfo(box64context_t* ctx, struct latx_kzt_debug* debuginfo);
 #endif

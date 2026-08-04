@@ -115,5 +115,4 @@ int kzt_patch_spike_writer_try_apply_with_slot_ops(
     const kzt_patch_decision_t *decision,
     const kzt_patch_spike_slot_ops_t *slot_ops,
     kzt_patch_spike_record_t *record);
-
 #endif

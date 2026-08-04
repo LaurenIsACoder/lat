@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import pathlib
+import re
 import sys
 
 
@@ -17,9 +18,26 @@ def function_body(text: str, signature: str) -> str:
     raise AssertionError(f"unterminated function: {signature}")
 
 
+def if_condition(text: str, marker: str) -> str:
+    start = text.index(marker)
+    opening = text.index("(", start)
+    depth = 0
+    for pos in range(opening, len(text)):
+        if text[pos] == "(":
+            depth += 1
+        elif text[pos] == ")":
+            depth -= 1
+            if depth == 0:
+                return " ".join(text[opening + 1:pos].split())
+    raise AssertionError(f"unterminated if condition: {marker}")
+
+
 root = pathlib.Path(sys.argv[1]).resolve()
 myalign = (root / "target/i386/latx/context/myalign.c").read_text()
 elfloader = (root / "target/i386/latx/context/elfloader.c").read_text()
+registry = (
+    root / "target/i386/latx/context/kzt_guest_registry.c"
+).read_text()
 adapter = (
     root / "target/i386/latx/context/kzt_observation_adapter.c"
 ).read_text()
@@ -36,14 +54,57 @@ production_route = (
     root / "target/i386/latx/context/kzt_jump_slot_production.c"
 ).read_text()
 
-# The KZT callback materializes only the wrapper binding under the callback
-# gate.  It does not reconstruct an ELF object or derive private glibc data.
+# Registry observation materializes the exact observed link_map address as the
+# object identity.  Invalid identity input must fail before registry lookup.
+snapshot = function_body(
+    registry, "static int kzt_snapshot_from_observation("
+)
+assert "snapshot->link_map_addr = observation->link_map_addr;" in snapshot
+observe = function_body(
+    registry, "kzt_guest_registry_result_t kzt_guest_registry_observe_with_diagnostic("
+)
+invalid_identity = if_condition(observe, "if (!observation")
+assert invalid_identity == "!observation || observation->link_map_addr == 0"
+assert observe.index("if (!observation") < observe.index(
+    "kzt_find_object_index(registry, observation->link_map_addr)"
+)
+
+# The KZT callback consumes that exact identity through a Registry-owned copy.
+# No guest link_map pointer escapes the reader/observation boundary.
 materialize = function_body(
     myalign, "static int kzt_tb_callback_materialize_binding("
 )
-identity_guard = materialize.index("if (!link_map")
-first_dereference = materialize.index("link_map->")
-assert identity_guard < first_dereference
+assert "struct link_map_x64" not in materialize
+assert "link_map->" not in materialize
+assert "kzt_guest_registry_address_match_t match = { 0 };" in materialize
+assert "kzt_guest_registry_find_live_object(" in materialize
+identity_guard = if_condition(materialize, "if (!context")
+guard_terms = (
+    "!context",
+    "!link_map_addr",
+    "kzt_guest_registry_find_live_object(",
+    "match.match_count != 1",
+    "match.path_status != KZT_GUEST_FIELD_OK",
+)
+assert all(term in identity_guard for term in guard_terms)
+assert [identity_guard.index(term) for term in guard_terms] == sorted(
+    identity_guard.index(term) for term in guard_terms
+)
+assert "name = match.path;" in materialize
+assert re.search(
+    r"kzt_guest_library_wrapper_source_acquire\(\s*"
+    r"context,\s*link_map_addr,\s*name,\s*basename,\s*&source_proof\)",
+    materialize,
+)
+for note_call in (
+    "kzt_guest_library_note_loader_pair_pending",
+    "kzt_guest_library_note_loader_pair",
+):
+    assert re.search(
+        rf"{note_call}\(\s*context,.*?\blink_map_addr\b",
+        materialize,
+        re.DOTALL,
+    )
 assert "l_map_start" not in materialize
 assert "l_map_end" not in materialize
 assert "->l_ns" not in materialize
@@ -89,8 +150,10 @@ assert ".legacy_flow = NULL" in consumer
 assert "if (registry && diagnostics_enabled)" in consumer
 
 callback = function_body(myalign, "static void kzt_tb_callback(")
+assert "box64context_t *context = my_context;" in callback
+assert "context ? &context->kzt_loader_event_hook : NULL" in callback
 assert "kzt_loader_event_hook_publish(" in callback
-assert "kzt_tb_callback_consume(env, &event);" in callback
+assert "kzt_tb_callback_consume(context, env, &event);" in callback
 for forbidden in (
     "LoadAndCheckElfHeader", "LoadNeededLibs", "RelocateElf",
     "kzt_main_elf_identity", "kzt_observe_guest_object",

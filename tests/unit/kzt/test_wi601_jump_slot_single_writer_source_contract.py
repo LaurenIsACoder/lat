@@ -226,10 +226,22 @@ def detector_coordinates(body: str, value: str) -> list[str]:
 
 
 eager = function_body(elfloader, "int RelocateElfRELA(")
+glob_dat_source = (
+    root / "target/i386/latx/context/kzt_guest_glob_dat_target.c"
+).read_text(encoding="utf-8")
+glob_dat_route = function_body(
+    glob_dat_source, "int kzt_guest_glob_dat_route("
+)
 compatibility_writer = function_body(
     elfloader, "static int kzt_eager_compatibility_write("
 )
 lazy = function_body(elfloader, "void PltResolver(void)")
+glob_dat_start = eager.find("case R_X86_64_GLOB_DAT:")
+jump_slot_start = eager.find("case R_X86_64_JUMP_SLOT:")
+if glob_dat_start < 0 or jump_slot_start < 0 or glob_dat_start >= jump_slot_start:
+    fail("RelocateElfRELA: missing ordered GLOB_DAT/JUMP_SLOT cases")
+glob_dat = eager[glob_dat_start:jump_slot_start]
+jump_slot = eager[jump_slot_start:]
 eager_decision = decision_name(eager, "RelocateElfRELA")
 arguments = decision_arguments("RelocateElfRELA", eager)
 if arguments != "route_call_succeeded,&route_result,0,final_value_usable":
@@ -246,21 +258,76 @@ route_call = eager.find("kzt_production_jump_slot_route(")
 if route_call < 0 or fallback < route_call:
     fail("RelocateElfRELA: compatibility write must follow guest-first route")
 for required in (
-    "option_kzt || wine_option_kzt",
-    "__atomic_compare_exchange_n(",
-    "kzt_patch_spike_guard_circuit_open(",
+    "if (!slot)",
     "*slot = replacement;",
+    "*final_value = replacement;",
+    "return KZT_EAGER_COMPATIBILITY_WRITE_APPLIED;",
 ):
     if required not in compatibility_writer:
         fail(f"compatibility writer lacks {required}")
-if eager.count("kzt_eager_compatibility_write(") < 3:
-    fail("RelocateElfRELA: eager compatibility writes do not share the CAS helper")
-if not re.search(
-    r"if\s*\(\s*\(option_kzt\s*\|\|\s*wine_option_kzt\)\s*&&\s*"
-    r"bind\s*!=\s*STB_LOCAL\s*\)\s*\{[\s\S]*?"
-    r"route=GUEST_PRESERVED[\s\S]*?host_lookup=0[\s\S]*?break\s*;",
-    eager,
+for forbidden in (
+    "option_kzt",
+    "wine_option_kzt",
+    "__atomic_compare_exchange_n(",
+    "kzt_patch_spike_guard_",
+    "kzt_production_",
 ):
+    if forbidden in compatibility_writer:
+        fail(f"compatibility writer must remain policy-free: {forbidden}")
+if compatibility_writer.count("*slot = replacement;") != 1:
+    fail("compatibility writer must contain exactly one simple slot store")
+if glob_dat.count("kzt_eager_compatibility_write(") != 1 or \
+        jump_slot.count("kzt_eager_compatibility_write(") != 2:
+    fail("non-KZT GLOB_DAT/JUMP_SLOT writes must share the compatibility writer")
+
+# KZT owns eager relocation writes.  Native GLOB_DAT bridges use the guarded
+# writer transaction, while guest/local writes use the mandatory transaction.
+if glob_dat_route.count("kzt_production_eager_relocation_write(") != 1:
+    fail("KZT GLOB_DAT native bridge must use one guarded transaction")
+if glob_dat.count("kzt_production_guest_relocation_write(") != 1:
+    fail("KZT local GLOB_DAT must use one mandatory transaction")
+if not re.search(
+    rf"{re.escape('kzt_production_eager_relocation_write(')}"
+    r"[\s\S]*?KZT_PATCH_RELOCATION_GLOB_DAT",
+    glob_dat_route,
+):
+    fail("KZT native GLOB_DAT transaction has the wrong relocation type")
+if not re.search(
+    rf"{re.escape('kzt_production_guest_relocation_write(')}"
+    r"[\s\S]*?KZT_PATCH_RELOCATION_GLOB_DAT",
+    glob_dat,
+):
+    fail("KZT local GLOB_DAT transaction has the wrong relocation type")
+glob_legacy = glob_dat.find("kzt_resolve_legacy_rela_target(")
+if glob_legacy < 0 or glob_dat.find("kzt_guest_glob_dat_route(") > glob_legacy or \
+        glob_dat.find("kzt_production_guest_relocation_write(") > glob_legacy:
+    fail("KZT GLOB_DAT transactions must precede the compatibility path")
+
+# KZT JUMP_SLOT writes have three controlled routes: deferred/local guest
+# relocations use the mandatory transaction, and non-local eager binding uses
+# the shared Registry-backed route.  The simple writer is only the KZT-off arm.
+if jump_slot.count("kzt_production_guest_relocation_write(") != 2:
+    fail("KZT deferred/local JUMP_SLOT writes must use mandatory transactions")
+if jump_slot.count("kzt_production_jump_slot_route(") != 1:
+    fail("KZT non-local JUMP_SLOT must use the shared transactional route")
+if not re.search(
+    r"if\s*\(\s*option_kzt\s*\|\|\s*wine_option_kzt\s*\)\s*\{"
+    r"[\s\S]*?kzt_production_guest_relocation_write\s*\("
+    r"[\s\S]*?KZT_PATCH_RELOCATION_JUMP_SLOT[\s\S]*?\}\s*else"
+    r"[\s\S]*?kzt_eager_compatibility_write\s*\(",
+    jump_slot,
+):
+    fail("deferred JUMP_SLOT does not separate KZT transaction from compatibility")
+preserve_blocks = [
+    (start, end)
+    for start, end, block in guarded_blocks(
+        jump_slot, r"\boption_kzt\s*\|\|\s*wine_option_kzt\b"
+    )
+    if 'route=GUEST_PRESERVED' in block and 'host_lookup=0' in block and
+    re.search(r"\bbreak\s*;", block)
+]
+jump_legacy = jump_slot.find("kzt_resolve_legacy_rela_target(")
+if jump_legacy < 0 or not any(end < jump_legacy for _, end in preserve_blocks):
     fail("RelocateElfRELA: KZT evidence failure can reach host lookup")
 
 for forbidden_lazy_writer in (
@@ -314,7 +381,18 @@ if not re.search(
     eager,
 ):
     fail("RelocateElfRELA: production route does not receive observed stub fact")
-if "return -1;" in eager:
+route_blocks = [
+    block
+    for _, _, block in guarded_blocks(
+        jump_slot,
+        r"\boption_kzt\s*\|\|\s*wine_option_kzt\b[\s\S]*?"
+        r"\bbind\s*!=\s*STB_LOCAL\b",
+    )
+    if "kzt_production_jump_slot_route(" in block
+]
+if len(route_blocks) != 1:
+    fail("RelocateElfRELA: expected one KZT non-local route block")
+if "return -1;" in route_blocks[0]:
     fail("RelocateElfRELA: route-owned unusable slot must fail open")
 if re.search(
     r"kzt_rela_slot_current_is_unresolved_stub\s*\(\s*"

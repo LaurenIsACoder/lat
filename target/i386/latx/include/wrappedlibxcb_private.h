@@ -653,10 +653,10 @@ GO(xcb_unregister_for_special_event, vFbp)
 //GO(xcb_visualid_next, 
 //GO(xcb_visualtype_end, 
 GO(xcb_visualtype_next, vFp)
-GO(xcb_wait_for_event, pFb)
-GO(xcb_wait_for_reply, pFbup)
-GO(xcb_wait_for_reply64, pFbUp)
-GO(xcb_wait_for_special_event, pFbp)
+GOM(xcb_wait_for_event, pFb)
+GOM(xcb_wait_for_reply, pFbup)
+GOM(xcb_wait_for_reply64, pFbUp)
+GOM(xcb_wait_for_special_event, pFbp)
 GO(xcb_warp_pointer, pFbuuwwWWww)
 //GO(xcb_warp_pointer_checked, 
 //GO(xcb_window_end, 

@@ -38,6 +38,11 @@ typedef struct fixture_bridge_map {
     void *native_symbol;
     uintptr_t target;
     int check_calls;
+    int add_calls;
+    int guarded_add_calls;
+    int corrupt_guarded_entry;
+    onebridge_t ordinary_entry;
+    onebridge_t guarded_entry;
 } fixture_bridge_map_t;
 
 typedef struct runtime_fixture {
@@ -56,6 +61,12 @@ enum fixture_setup_status {
 };
 
 uintptr_t CheckBridged(bridge_t *bridge, void *fnc);
+uintptr_t AddCheckBridge(bridge_t *bridge, wrapper_t wrapper, void *fnc,
+                         int stack_bytes, const char *name);
+uintptr_t AddGuardedBridge(
+    bridge_t *bridge, wrapper_t wrapper, void *fnc, int stack_bytes,
+    const char *name, uintptr_t guest_fallback_target,
+    kzt_bridge_guard_kind_t guard_kind);
 int BridgeForkProtectionAvailable(void);
 
 int BridgeForkProtectionAvailable(void)
@@ -75,6 +86,59 @@ uintptr_t CheckBridged(bridge_t *bridge, void *fnc)
         return 0;
     }
     return map->target;
+}
+
+uintptr_t AddCheckBridge(bridge_t *bridge, wrapper_t wrapper, void *fnc,
+                         int stack_bytes, const char *name)
+{
+    fixture_bridge_map_t *map = (fixture_bridge_map_t *)bridge;
+    onebridge_t *entry;
+
+    (void)name;
+    if (!map || !wrapper || !fnc) {
+        return 0;
+    }
+    ++map->add_calls;
+    entry = &map->ordinary_entry;
+    memset(entry, 0, sizeof(*entry));
+    entry->CC = 0xCC;
+    entry->S = 'S';
+    entry->C = 'C';
+    entry->w = wrapper;
+    entry->f = (uintptr_t)fnc;
+    entry->C3 = stack_bytes ? 0xC2 : 0xC3;
+    entry->N = stack_bytes;
+    map->target = (uintptr_t)&entry->CC;
+    return map->target;
+}
+
+uintptr_t AddGuardedBridge(
+    bridge_t *bridge, wrapper_t wrapper, void *fnc, int stack_bytes,
+    const char *name, uintptr_t guest_fallback_target,
+    kzt_bridge_guard_kind_t guard_kind)
+{
+    fixture_bridge_map_t *map = (fixture_bridge_map_t *)bridge;
+    onebridge_t *entry;
+
+    (void)name;
+    if (!map || !wrapper || !fnc || !guest_fallback_target ||
+        guard_kind != KZT_BRIDGE_GUARD_XCB_CONNECTION) {
+        return 0;
+    }
+    ++map->guarded_add_calls;
+    entry = &map->guarded_entry;
+    memset(entry, 0, sizeof(*entry));
+    entry->CC = 0xCC;
+    entry->S = 'S';
+    entry->C = 'C';
+    entry->w = wrapper;
+    entry->f = (uintptr_t)fnc;
+    entry->C3 = stack_bytes ? 0xC2 : 0xC3;
+    entry->N = stack_bytes;
+    entry->guest_fallback_target = map->corrupt_guarded_entry ?
+        guest_fallback_target + 1 : guest_fallback_target;
+    entry->guard_kind = guard_kind;
+    return (uintptr_t)&entry->CC;
 }
 
 typedef struct guarded_slot {
@@ -464,12 +528,223 @@ static void test_null_inputs_fail_without_bridge_inspection(void)
     runtime_fixture_destroy(&fixture);
 }
 
+static void test_guarded_discovery_creates_unique_unmapped_bridge(void)
+{
+    const uintptr_t guest_fallback_target = 0x7100abcd;
+    runtime_fixture_t fixture;
+    kzt_wrapper_bridge_provider_t runtime_provider;
+    kzt_wrapper_probe_request_t request = {
+        .symbol_name = FIXTURE_SYMBOL,
+        .symbol_version_evidence = KZT_SYMBOL_VERSION_VERSIONED,
+        .symbol_version = FIXTURE_VERSION,
+    };
+    kzt_wrapper_probe_result_t result;
+    uintptr_t ordinary_target;
+    int setup_status;
+
+    setup_status = runtime_fixture_setup(&fixture);
+    if (setup_status == FIXTURE_SETUP_SKIP) {
+        return;
+    }
+    if (setup_status != FIXTURE_SETUP_OK) {
+        ++failures;
+        return;
+    }
+    ordinary_target = fixture.bridge_map.target;
+    check_int("guarded-runtime.discover",
+              kzt_rela_runtime_wrapper_provider_discover_guarded_with_version_evidence(
+                  &fixture.context, &fixture.library, FIXTURE_SYMBOL,
+                  KZT_SYMBOL_VERSION_VERSIONED, FIXTURE_VERSION,
+                  guest_fallback_target,
+                  KZT_BRIDGE_GUARD_XCB_CONNECTION, &runtime_provider),
+              1);
+    check_int("guarded-runtime.no-map-inspection",
+              fixture.bridge_map.check_calls, 0);
+    check_ulong("guarded-runtime.fallback",
+                runtime_provider.match.guest_fallback_target,
+                guest_fallback_target);
+    check_int("guarded-runtime.guard-kind",
+              runtime_provider.match.guard_kind,
+              KZT_BRIDGE_GUARD_XCB_CONNECTION);
+    check_int("guarded-runtime.probe",
+              kzt_wrapper_probe_minimal_manifest(
+                  &runtime_provider.manifest, &request,
+                  &runtime_provider.bridge_ops, &result),
+              0);
+    check_int("guarded-runtime.add-once",
+              fixture.bridge_map.guarded_add_calls, 1);
+    check_ulong("guarded-runtime.unique-target", result.bridge_target,
+                (uintptr_t)&fixture.bridge_map.guarded_entry.CC);
+    check_int("guarded-runtime.metadata",
+              kzt_guarded_bridge_is_exact(
+                  result.bridge_target, fixture_iFp,
+                  (void *)fixture.native_symbol, guest_fallback_target,
+                  KZT_BRIDGE_GUARD_XCB_CONNECTION),
+              1);
+    check_ulong("guarded-runtime.map-unchanged",
+                fixture.bridge_map.target, ordinary_target);
+    check_int("guarded-runtime.no-post-add-map-check",
+              fixture.bridge_map.check_calls, 0);
+    runtime_fixture_destroy(&fixture);
+}
+
+static void test_guarded_discovery_fail_open_contracts(void)
+{
+    const uintptr_t guest_fallback_target = 0x7100dcba;
+    runtime_fixture_t fixture;
+    kzt_wrapper_bridge_provider_t runtime_provider;
+    kzt_wrapper_probe_request_t request = {
+        .symbol_name = FIXTURE_SYMBOL,
+        .symbol_version_evidence = KZT_SYMBOL_VERSION_VERSIONED,
+        .symbol_version = FIXTURE_VERSION,
+    };
+    kzt_wrapper_probe_result_t result;
+    kzt_guest_library_handle_t retained_handle;
+    int setup_status;
+
+    setup_status = runtime_fixture_setup(&fixture);
+    if (setup_status == FIXTURE_SETUP_SKIP) {
+        return;
+    }
+    if (setup_status != FIXTURE_SETUP_OK) {
+        ++failures;
+        return;
+    }
+    check_int("guarded-invalid.zero-fallback",
+              kzt_rela_runtime_wrapper_provider_discover_guarded_with_version_evidence(
+                  &fixture.context, &fixture.library, FIXTURE_SYMBOL,
+                  KZT_SYMBOL_VERSION_VERSIONED, FIXTURE_VERSION, 0,
+                  KZT_BRIDGE_GUARD_XCB_CONNECTION, &runtime_provider),
+              0);
+    check_int("guarded-invalid.none-guard",
+              kzt_rela_runtime_wrapper_provider_discover_guarded_with_version_evidence(
+                  &fixture.context, &fixture.library, FIXTURE_SYMBOL,
+                  KZT_SYMBOL_VERSION_VERSIONED, FIXTURE_VERSION,
+                  guest_fallback_target, KZT_BRIDGE_GUARD_NONE,
+                  &runtime_provider),
+              0);
+
+    retained_handle = (kzt_guest_library_handle_t) {
+        .bindings = (kzt_guest_library_bindings_t *)1,
+        .entry = (void *)1,
+        .library = &fixture.library,
+        .object_type = KZT_GUEST_LIBRARY_OBJECT_WRAPPED,
+    };
+    check_int("guarded-retained.discover",
+              kzt_rela_runtime_wrapper_provider_discover_guarded_retained_with_version_evidence(
+                  &fixture.context, &retained_handle, FIXTURE_SYMBOL,
+                  KZT_SYMBOL_VERSION_VERSIONED, FIXTURE_VERSION,
+                  guest_fallback_target,
+                  KZT_BRIDGE_GUARD_XCB_CONNECTION, &runtime_provider),
+              1);
+    fixture.bridge_map.corrupt_guarded_entry = 1;
+    check_int("guarded-retained.probe",
+              kzt_wrapper_probe_minimal_manifest(
+                  &runtime_provider.manifest, &request,
+                  &runtime_provider.bridge_ops, &result),
+              0);
+    check_ulong("guarded-retained.corrupt-entry-rejected",
+                result.bridge_target, 0);
+    check_int("guarded-retained.add-attempted",
+              fixture.bridge_map.guarded_add_calls, 1);
+    runtime_fixture_destroy(&fixture);
+}
+
+static void test_retained_exact_selector(void)
+{
+    runtime_fixture_t fixture;
+    kzt_guest_library_handle_t retained_handle;
+    int setup_status;
+
+    setup_status = runtime_fixture_setup(&fixture);
+    if (setup_status == FIXTURE_SETUP_SKIP) {
+        return;
+    }
+    if (setup_status != FIXTURE_SETUP_OK) {
+        ++failures;
+        return;
+    }
+    retained_handle = (kzt_guest_library_handle_t) {
+        .bindings = (kzt_guest_library_bindings_t *)1,
+        .entry = (void *)1,
+        .library = &fixture.library,
+        .object_type = KZT_GUEST_LIBRARY_OBJECT_WRAPPED,
+    };
+    check_ulong(
+        "retained-selector.versioned",
+        kzt_rela_runtime_select_exact_wrapper_bridge_retained(
+            &fixture.context, &retained_handle, FIXTURE_SYMBOL,
+            KZT_SYMBOL_VERSION_VERSIONED, FIXTURE_VERSION),
+        fixture.bridge_map.target);
+    check_ulong(
+        "retained-selector.unversioned",
+        kzt_rela_runtime_select_exact_wrapper_bridge_retained(
+            &fixture.context, &retained_handle, FIXTURE_SYMBOL,
+            KZT_SYMBOL_VERSION_CONFIRMED_UNVERSIONED, NULL),
+        fixture.bridge_map.target);
+    check_ulong(
+        "retained-selector.missing-version",
+        kzt_rela_runtime_select_exact_wrapper_bridge_retained(
+            &fixture.context, &retained_handle, FIXTURE_SYMBOL,
+            KZT_SYMBOL_VERSION_VERSIONED, NULL),
+        0);
+    retained_handle.object_type = KZT_GUEST_LIBRARY_OBJECT_EMULATED;
+    check_ulong(
+        "retained-selector.non-wrapper",
+        kzt_rela_runtime_select_exact_wrapper_bridge_retained(
+            &fixture.context, &retained_handle, FIXTURE_SYMBOL,
+            KZT_SYMBOL_VERSION_CONFIRMED_UNVERSIONED, NULL),
+        0);
+    runtime_fixture_destroy(&fixture);
+}
+
+static void test_retained_exact_selector_creates_first_bridge(void)
+{
+    runtime_fixture_t fixture;
+    kzt_guest_library_handle_t retained_handle;
+    uintptr_t selected;
+    int setup_status;
+
+    setup_status = runtime_fixture_setup(&fixture);
+    if (setup_status == FIXTURE_SETUP_SKIP) {
+        return;
+    }
+    if (setup_status != FIXTURE_SETUP_OK) {
+        ++failures;
+        return;
+    }
+    retained_handle = (kzt_guest_library_handle_t) {
+        .bindings = (kzt_guest_library_bindings_t *)1,
+        .entry = (void *)1,
+        .library = &fixture.library,
+        .object_type = KZT_GUEST_LIBRARY_OBJECT_WRAPPED,
+    };
+    fixture.bridge_map.target = 0;
+    selected = kzt_rela_runtime_select_exact_wrapper_bridge_retained(
+        &fixture.context, &retained_handle, FIXTURE_SYMBOL,
+        KZT_SYMBOL_VERSION_CONFIRMED_UNVERSIONED, NULL);
+    check_int("retained-selector-first.add-once",
+              fixture.bridge_map.add_calls, 1);
+    check_ulong("retained-selector-first.selected", selected,
+                fixture.bridge_map.target);
+    check_int("retained-selector-first.exact",
+              kzt_bridge_is_exact(
+                  selected, fixture_iFp,
+                  (void *)fixture.native_symbol),
+              1);
+    runtime_fixture_destroy(&fixture);
+}
+
 int main(void)
 {
     test_runtime_adapter_helper_chain();
     test_version_mismatch_leaves_helper_fallback_eligible();
     test_bridge_owner_mismatch_fails_closed();
     test_null_inputs_fail_without_bridge_inspection();
+    test_guarded_discovery_creates_unique_unmapped_bridge();
+    test_guarded_discovery_fail_open_contracts();
+    test_retained_exact_selector();
+    test_retained_exact_selector_creates_first_bridge();
 
     if (failures) {
         fprintf(stderr, "kzt-rela-runtime-helper-chain: %d failure(s)\n",

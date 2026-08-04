@@ -50,8 +50,19 @@ if "typedef int (*kzt_lazy_prebind_target_prepare_fn)" not in header:
 prepare = function_body(
     production, "static int production_lazy_prebind_object_prepare("
 )
+find_symbol = function_body(
+    production, "static size_t production_lazy_prebind_find_symbol_index("
+)
 for required in (
     "kzt_runtime_got_plt_candidates_collect(",
+    "KZT_PATCH_TABLE_PLT_RELA",
+    "candidate.symbol_name",
+):
+    if required not in find_symbol:
+        raise AssertionError(f"structured prebind symbol scan lacks {required}")
+for required in (
+    "kzt_runtime_got_plt_candidates_collect(",
+    "production_lazy_prebind_find_symbol_index(",
     "production_symbol_scope_request(",
     "kzt_guest_symbol_scope_discover(",
     "kzt_guest_library_access_lookup(",
@@ -129,7 +140,7 @@ revoke = function_body(
 for required in (
     "kzt_lazy_prebind_scope_revoke_acquire(",
     "kzt_lazy_prebind_scope_revoke_finish(",
-    "production_lazy_prebind_slot_cas(",
+    "production_mandatory_slot_transaction(",
     "writer_result == KZT_PRODUCTION_SLOT_TRANSACTION_APPLIED",
     "writer_result == KZT_PRODUCTION_SLOT_TRANSACTION_CAS_MISMATCH",
 ):

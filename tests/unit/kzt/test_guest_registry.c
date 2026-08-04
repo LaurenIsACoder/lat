@@ -1,3 +1,4 @@
+#include <limits.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
@@ -1493,12 +1494,49 @@ static void test_loader_symbol_source_is_exact_main_generation(void)
     check_true("symbol-source.lease", lease.active);
     kzt_guest_registry_source_lease_release(&lease);
 
+    source = (kzt_guest_loader_identity_t) { 0 };
+    {
+        const kzt_guest_loader_identity_t queried = {
+            .handle = 0x91f0,
+            .link_map_addr = main_object.link_map_addr,
+            .namespace_id = 0,
+        };
+
+        check_int("symbol-source.exact-dlinfo-acquire",
+                  kzt_guest_registry_loader_symbol_source_acquire_exact(
+                      registry, &queried, &source, &found_view,
+                      &dynamic_status, &dynamic_revision, &lease),
+                  0);
+        check_uintptr("symbol-source.exact-handle", source.handle,
+                      queried.handle);
+        check_uintptr("symbol-source.exact-link-map", source.link_map_addr,
+                      queried.link_map_addr);
+        check_ulong("symbol-source.exact-generation", source.generation,
+                    published.generation);
+        check_true("symbol-source.exact-lease", lease.active);
+        kzt_guest_registry_source_lease_release(&lease);
+    }
+    {
+        const kzt_guest_loader_identity_t wrong_namespace = {
+            .handle = 0x91f0,
+            .link_map_addr = main_object.link_map_addr,
+            .namespace_id = 7,
+        };
+
+        check_not_int("symbol-source.exact-non-main-rejected",
+                      kzt_guest_registry_loader_symbol_source_acquire_exact(
+                          registry, &wrong_namespace, &source, &found_view,
+                          &dynamic_status, &dynamic_revision, &lease),
+                      0);
+        check_true("symbol-source.exact-non-main-no-lease", !lease.active);
+    }
+
     view.strsz.present = 1;
     view.strsz.value = 0x80;
     view.strsz.address_semantics = KZT_GUEST_DYNAMIC_SCALAR;
     check_int("symbol-source.dynamic-main-update",
               kzt_guest_registry_commit_dynamic_view(
-                  registry, main_object.link_map_addr, source.generation,
+                  registry, main_object.link_map_addr, published.generation,
                   &view),
               KZT_GUEST_REGISTRY_UPDATED);
     check_int("symbol-source.acquire-main-update",
@@ -1541,6 +1579,110 @@ static void test_loader_symbol_source_is_exact_main_generation(void)
                       &dynamic_revision, &lease),
                   0);
     check_true("symbol-source.retired-no-lease", !lease.active);
+    {
+        const kzt_guest_loader_identity_t retired = {
+            .handle = 0x91f0,
+            .link_map_addr = main_object.link_map_addr,
+            .namespace_id = 0,
+        };
+
+        check_not_int("symbol-source.exact-retired-rejected",
+                      kzt_guest_registry_loader_symbol_source_acquire_exact(
+                          registry, &retired, &source, &found_view,
+                          &dynamic_status, &dynamic_revision, &lease),
+                      0);
+        check_true("symbol-source.exact-retired-no-lease", !lease.active);
+    }
+    kzt_guest_registry_destroy(&registry);
+}
+
+static void test_source_lease_counter_overflow_is_rejected(void)
+{
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_guest_object_observation_t object = make_observation(0x74a0);
+    kzt_guest_loader_identity_t published = { 0 };
+    kzt_guest_loader_identity_t identity = { 0 };
+    const kzt_guest_loader_identity_t queried = {
+        .handle = 0x91a0,
+        .link_map_addr = 0x74a0,
+        .namespace_id = 0,
+    };
+    kzt_guest_dynamic_view_t view = {
+        .dynamic_addr = 0x101000,
+        .load_bias = 0x100000,
+        .status = KZT_GUEST_DYNAMIC_COMPLETE,
+        .has_null = 1,
+    };
+    kzt_guest_dynamic_view_t found_view = { 0 };
+    kzt_guest_field_status_t dynamic_status = KZT_GUEST_FIELD_UNKNOWN;
+    unsigned long dynamic_revision = 0;
+    kzt_guest_registry_source_lease_t anchor = { 0 };
+    kzt_guest_registry_source_lease_t rejected = { 0 };
+    kzt_guest_registry_patch_decision_lease_t decision = { 0 };
+    kzt_guest_registry_symbol_candidate_t candidate = { 0 };
+    size_t cursor = 0;
+
+    check_true("lease-overflow.registry", registry != NULL);
+    if (!registry) return;
+    check_int("lease-overflow.observe",
+              kzt_guest_registry_observe(registry, &object),
+              KZT_GUEST_REGISTRY_ADDED);
+    check_int("lease-overflow.publish-handle",
+              kzt_guest_registry_publish_loader_identity(
+                  registry, queried.handle, object.link_map_addr, 0,
+                  &published),
+              0);
+    check_int("lease-overflow.dynamic",
+              kzt_guest_registry_commit_dynamic_view(
+                  registry, object.link_map_addr, published.generation,
+                  &view),
+              KZT_GUEST_REGISTRY_UPDATED);
+    check_int("lease-overflow.anchor",
+              kzt_guest_registry_source_lease_acquire(
+                  registry, object.link_map_addr, published.generation, 0,
+                  &anchor),
+              0);
+    check_int("lease-overflow.decision",
+              kzt_guest_registry_patch_decision_lease_acquire(
+                  &anchor, &decision),
+              0);
+    check_int("lease-overflow.force-max",
+              kzt_guest_registry_test_set_active_source_leases(
+                  registry, object.link_map_addr, published.generation,
+                  ULONG_MAX),
+              0);
+
+    check_not_int("lease-overflow.direct-rejected",
+                  kzt_guest_registry_source_lease_acquire(
+                      registry, object.link_map_addr, published.generation,
+                      0, &rejected),
+                  0);
+    check_true("lease-overflow.direct-cleared", !rejected.active);
+    check_not_int("lease-overflow.handle-rejected",
+                  kzt_guest_registry_loader_symbol_source_acquire(
+                      registry, queried.handle, &identity, &found_view,
+                      &dynamic_status, &dynamic_revision, &rejected),
+                  0);
+    check_true("lease-overflow.handle-cleared", !rejected.active);
+    check_not_int("lease-overflow.exact-rejected",
+                  kzt_guest_registry_loader_symbol_source_acquire_exact(
+                      registry, &queried, &identity, &found_view,
+                      &dynamic_status, &dynamic_revision, &rejected),
+                  0);
+    check_true("lease-overflow.exact-cleared", !rejected.active);
+    check_not_int("lease-overflow.candidate-rejected",
+                  kzt_guest_registry_symbol_candidate_acquire_next(
+                      &decision, &cursor, &candidate),
+                  1);
+    check_true("lease-overflow.candidate-cleared",
+               !candidate.lease.active);
+
+    check_int("lease-overflow.restore-anchor",
+              kzt_guest_registry_test_set_active_source_leases(
+                  registry, object.link_map_addr, published.generation, 1),
+              0);
+    kzt_guest_registry_patch_decision_lease_release(&decision);
+    kzt_guest_registry_source_lease_release(&anchor);
     kzt_guest_registry_destroy(&registry);
 }
 
@@ -1737,6 +1879,97 @@ static void test_address_match_overlong_path_is_unknown(void)
     kzt_guest_registry_destroy(&registry);
 }
 
+static void test_symbol_candidate_iteration_is_leased_and_compact(void)
+{
+    kzt_guest_registry_t *registry = kzt_guest_registry_init();
+    kzt_guest_object_observation_t source = make_observation(0x7700);
+    kzt_guest_object_observation_t owner = make_observation(0x7710);
+    kzt_guest_dynamic_view_t view = {
+        .dynamic_addr = 0x201000,
+        .load_bias = 0x200000,
+        .status = KZT_GUEST_DYNAMIC_COMPLETE,
+        .has_null = 1,
+    };
+    kzt_guest_object_snapshot_t *snapshot;
+    kzt_guest_registry_source_lease_t source_lease = { 0 };
+    kzt_guest_registry_patch_decision_lease_t decision_lease = { 0 };
+    kzt_guest_registry_symbol_candidate_t candidate = { 0 };
+    unsigned long source_generation;
+    unsigned long owner_generation;
+    size_t cursor = 0;
+    int count = 0;
+
+    owner.load_bias.value += 0x100000;
+    owner.dynamic_addr.value += 0x100000;
+    source.namespace_id.status = KZT_GUEST_FIELD_OK;
+    owner.namespace_id.status = KZT_GUEST_FIELD_OK;
+    owner.path.value = "/lib/x86_64-linux-gnu/libdl.so.2";
+    owner.soname.value = "libdl.so.2";
+    owner.soname.status = KZT_GUEST_FIELD_OK;
+    check_true("symbol-candidate.registry", registry != NULL);
+    if (!registry) return;
+    check_int("symbol-candidate.observe-source",
+              kzt_guest_registry_observe(registry, &source),
+              KZT_GUEST_REGISTRY_ADDED);
+    check_int("symbol-candidate.observe-owner",
+              kzt_guest_registry_observe(registry, &owner),
+              KZT_GUEST_REGISTRY_ADDED);
+    snapshot = find_snapshot(registry, source.link_map_addr);
+    source_generation = snapshot->generation;
+    kzt_guest_object_snapshot_free(snapshot);
+    snapshot = find_snapshot(registry, owner.link_map_addr);
+    owner_generation = snapshot->generation;
+    kzt_guest_object_snapshot_free(snapshot);
+    check_int("symbol-candidate.dynamic-source",
+              kzt_guest_registry_commit_dynamic_view(
+                  registry, source.link_map_addr, source_generation, &view),
+              KZT_GUEST_REGISTRY_UPDATED);
+    view.dynamic_addr = owner.dynamic_addr.value;
+    view.load_bias = owner.load_bias.value;
+    check_int("symbol-candidate.dynamic-owner",
+              kzt_guest_registry_commit_dynamic_view(
+                  registry, owner.link_map_addr, owner_generation, &view),
+              KZT_GUEST_REGISTRY_UPDATED);
+    check_int("symbol-candidate.source-lease",
+              kzt_guest_registry_source_lease_acquire(
+                  registry, source.link_map_addr, source_generation, 0,
+                  &source_lease),
+              0);
+    check_not_int("symbol-candidate.requires-decision",
+                  kzt_guest_registry_symbol_candidate_acquire_next(
+                      &decision_lease, &cursor, &candidate),
+                  1);
+    check_int("symbol-candidate.decision-lease",
+              kzt_guest_registry_patch_decision_lease_acquire(
+                  &source_lease, &decision_lease),
+              0);
+    kzt_guest_registry_test_set_alloc_failure_after(0);
+    while (kzt_guest_registry_symbol_candidate_acquire_next(
+               &decision_lease, &cursor, &candidate) == 1) {
+        check_true("symbol-candidate.lease-active", candidate.lease.active);
+        check_true("symbol-candidate.exact-identity",
+                   candidate.link_map_addr == candidate.lease.link_map_addr &&
+                   candidate.generation == candidate.lease.generation &&
+                   candidate.namespace_id == candidate.lease.namespace_id);
+        if (candidate.link_map_addr == owner.link_map_addr) {
+            check_string("symbol-candidate.path", candidate.path,
+                         owner.path.value);
+            check_string("symbol-candidate.soname", candidate.soname,
+                         owner.soname.value);
+            check_ulong("symbol-candidate.owner-generation",
+                        candidate.generation, owner_generation);
+        }
+        ++count;
+        kzt_guest_registry_symbol_candidate_release(&candidate);
+    }
+    kzt_guest_registry_test_set_alloc_failure_after(-1);
+    check_int("symbol-candidate.count", count, 2);
+    check_true("symbol-candidate.release-zero", !candidate.lease.active);
+    kzt_guest_registry_patch_decision_lease_release(&decision_lease);
+    kzt_guest_registry_source_lease_release(&source_lease);
+    kzt_guest_registry_destroy(&registry);
+}
+
 int main(void)
 {
     test_first_and_repeat_observation_keep_generation();
@@ -1759,10 +1992,12 @@ int main(void)
     test_loader_handle_binds_exact_link_map_generation_and_namespace();
     test_unproven_unload_is_not_reused_without_resident_proof();
     test_loader_symbol_source_is_exact_main_generation();
+    test_source_lease_counter_overflow_is_rejected();
     test_loader_unload_retires_only_exact_namespace_and_generation();
     test_loader_unload_prepares_before_unmap_and_can_cancel();
     test_namespace_evidence_supplements_exact_dependency();
     test_address_match_overlong_path_is_unknown();
+    test_symbol_candidate_iteration_is_leased_and_compact();
 
     if (failures) {
         fprintf(stderr, "kzt-guest-registry: %d failure(s)\n", failures);

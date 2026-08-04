@@ -32,8 +32,20 @@ typedef struct kzt_guest_dl_entries_s {
 
 typedef int (*kzt_guest_dl_entries_resolver_fn)(
     kzt_guest_dl_entries_t *entries, void *opaque);
-typedef void (*kzt_guest_dl_entries_prepare_fn)(
+typedef int (*kzt_guest_dl_entries_prepare_fn)(
     const kzt_guest_dl_entries_t *entries, void *opaque);
+
+typedef enum kzt_guest_runtime_entry_id_e {
+    KZT_GUEST_RUNTIME_FREE = 0,
+    KZT_GUEST_RUNTIME_REALLOC,
+    KZT_GUEST_RUNTIME_PTHREAD_SETCANCELTYPE,
+    KZT_GUEST_RUNTIME_ENTRY_COUNT,
+} kzt_guest_runtime_entry_id_t;
+
+#define KZT_GUEST_DL_LIFECYCLE_OPEN (1U << 31)
+#define KZT_GUEST_DL_LIFECYCLE_CLOSING (1U << 30)
+#define KZT_GUEST_DL_LIFECYCLE_USERS \
+    ~(KZT_GUEST_DL_LIFECYCLE_OPEN | KZT_GUEST_DL_LIFECYCLE_CLOSING)
 
 typedef struct kzt_guest_dl_entry_state_s {
     pthread_mutex_t mutex;
@@ -45,7 +57,12 @@ typedef struct kzt_guest_dl_entry_state_s {
     int initializing;
     int initializer_valid;
     int teardown;
+    unsigned int lifecycle;
     unsigned int slow_users;
+    unsigned int runtime_users;
+    uintptr_t runtime_entries[KZT_GUEST_RUNTIME_ENTRY_COUNT];
+    pthread_t runtime_initializers[KZT_GUEST_RUNTIME_ENTRY_COUNT];
+    unsigned int runtime_initializing;
 } kzt_guest_dl_entry_state_t;
 
 #endif

@@ -85,5 +85,4 @@ int kzt_rela_immediate_jump_slot_try_write(
     kzt_patch_spike_guard_t *guard,
     const kzt_patch_spike_slot_ops_t *slot_ops,
     kzt_rela_immediate_writer_result_t *result);
-
 #endif

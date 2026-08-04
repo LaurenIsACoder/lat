@@ -162,7 +162,8 @@ int kzt_rela_immediate_jump_slot_try_write(
     }
 
     if (kzt_patch_spike_writer_try_apply_with_slot_ops(
-            guard, &result->plan.decision, slot_ops, &result->record) != 0) {
+            guard, &result->plan.decision, slot_ops,
+            &result->record) != 0) {
         return 0;
     }
 

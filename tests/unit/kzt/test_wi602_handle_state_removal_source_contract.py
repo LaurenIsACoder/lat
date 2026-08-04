@@ -32,6 +32,23 @@ header = (root / "target/i386/latx/include/box64context.h").read_text(
 api = (root / "target/i386/latx/context/kzt_guest_dl_api.c").read_text(
     encoding="utf-8"
 )
+production_meson = (
+    root / "target/i386/latx/context/meson.build"
+).read_text(encoding="utf-8")
+test_meson = (root / "tests/unit/meson.build").read_text(encoding="utf-8")
+
+for removed_path in (
+    "target/i386/latx/context/dlopen_recycle_transaction.c",
+    "target/i386/latx/include/dlopen_recycle_transaction.h",
+    "tests/unit/kzt/test_dlopen_recycle_transaction.c",
+):
+    if (root / removed_path).exists():
+        raise AssertionError(f"removed recycle helper still exists: {removed_path}")
+
+for meson_text in (production_meson, test_meson):
+    if "dlopen_recycle_transaction" in meson_text:
+        raise AssertionError("build graph still references removed recycle helper")
+
 dlprivate_start = header.find("typedef struct dlprivate_s {")
 dlprivate_end = header.find("} dlprivate_t;", dlprivate_start)
 if dlprivate_start < 0 or dlprivate_end < 0:

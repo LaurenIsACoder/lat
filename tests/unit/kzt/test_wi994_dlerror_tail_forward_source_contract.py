@@ -93,7 +93,8 @@ for relative in (
         wrapper, "static char *kzt_guest_dlerror_slow_path("
     )
     for required in (
-        "kzt_guest_dl_api_dlerror(error_state, guest_dlerror)",
+        "kzt_guest_dl_api_dlerror(",
+        "guest_route_may_have_pending_error",
         "kzt_guest_dl_api_load_dlerror_hint(",
         "kzt_guest_dlerror_entry_slow(context)",
         "error_state->guest_dlerror_entry = guest_dlerror",
@@ -108,7 +109,7 @@ for relative in (
         raise AssertionError(f"{relative}: dlerror does not use shared result")
     if "forward_to_guest_caller" not in state_slow:
         raise AssertionError(f"{relative}: dlerror does not check tail forwarding")
-    state_check = body.find("if (fast_result)")
+    state_check = body.find("if (fast_result || guest_loader_route)")
     slow = body.find("kzt_guest_dlerror_slow_path(")
     fast_return = body.find("return fast_result;")
     if min(state_check, slow, fast_return) < 0 or not (
@@ -118,6 +119,12 @@ for relative in (
         )
     if "char *fast_result" not in body:
         raise AssertionError(f"{relative}: clean dlerror result is materialized")
+    if "kzt_guest_loader_route_present" not in body:
+        raise AssertionError(f"{relative}: guest loader route is not preserved")
+    if "guest_loader_route);" not in body:
+        raise AssertionError(
+            f"{relative}: guest loader route is not passed to the slow path"
+        )
     if "kzt_guest_dl_entries_t fallback" in body:
         raise AssertionError(f"{relative}: hot dlerror retains cold stack state")
     if "RunFunctionWithState" in body:

@@ -15,9 +15,11 @@
 typedef struct kzt_guest_library_symbol_evidence {
     char symbol[KZT_GUEST_LIBRARY_SYMBOL_NAME_LIMIT];
     uintptr_t runtime_address;
+    uintptr_t bridge_target;
     unsigned long age;
     unsigned long dynamic_revision;
     unsigned char symbol_type;
+    int bridge_valid;
     int valid;
 } kzt_guest_library_symbol_evidence_t;
 
@@ -1592,10 +1594,30 @@ kzt_guest_library_handle_entry_locked(
     return entry;
 }
 
+int kzt_guest_library_handle_matches_key(
+    const kzt_guest_library_handle_t *handle,
+    const kzt_guest_library_binding_key_t *key)
+{
+    kzt_guest_library_bindings_t *bindings;
+    kzt_guest_library_binding_entry_t *entry;
+    int matches = 0;
+
+    if (!handle || !(bindings = handle->bindings) || !key) {
+        return 0;
+    }
+    pthread_mutex_lock(&bindings->lock);
+    entry = kzt_guest_library_handle_entry_locked(bindings, handle);
+    if (entry && !shutting_down(bindings) && same_key(&entry->key, key)) {
+        matches = 1;
+    }
+    pthread_mutex_unlock(&bindings->lock);
+    return matches;
+}
+
 int kzt_guest_library_symbol_evidence_lookup(
     const kzt_guest_library_handle_t *handle, const char *symbol,
     unsigned long dynamic_revision, uintptr_t *runtime_address,
-    unsigned char *symbol_type)
+    unsigned char *symbol_type, uintptr_t *bridge_target)
 {
     kzt_guest_library_bindings_t *bindings;
     kzt_guest_library_binding_entry_t *entry;
@@ -1604,6 +1626,7 @@ int kzt_guest_library_symbol_evidence_lookup(
 
     if (runtime_address) *runtime_address = 0;
     if (symbol_type) *symbol_type = 0;
+    if (bridge_target) *bridge_target = 0;
     if (!handle || !(bindings = handle->bindings) || !symbol || !symbol[0] ||
         !dynamic_revision || !runtime_address || !symbol_type) {
         return -1;
@@ -1621,6 +1644,8 @@ int kzt_guest_library_symbol_evidence_lookup(
             cached->age = ++entry->symbol_cache_age;
             *runtime_address = cached->runtime_address;
             *symbol_type = cached->symbol_type;
+            if (bridge_target && cached->bridge_valid)
+                *bridge_target = cached->bridge_target;
             result = 0;
             break;
         }
@@ -1664,12 +1689,52 @@ void kzt_guest_library_symbol_evidence_store(
         }
     }
     if (selected) {
+        if (!selected->valid ||
+            strcmp(selected->symbol, symbol) != 0 ||
+            selected->dynamic_revision != dynamic_revision ||
+            selected->runtime_address != runtime_address ||
+            selected->symbol_type != symbol_type) {
+            selected->bridge_target = 0;
+            selected->bridge_valid = 0;
+        }
         memcpy(selected->symbol, symbol, symbol_length + 1);
         selected->runtime_address = runtime_address;
         selected->symbol_type = symbol_type;
         selected->dynamic_revision = dynamic_revision;
         selected->age = ++entry->symbol_cache_age;
         selected->valid = 1;
+    }
+out:
+    pthread_mutex_unlock(&bindings->lock);
+}
+
+void kzt_guest_library_symbol_bridge_store(
+    const kzt_guest_library_handle_t *handle, const char *symbol,
+    unsigned long dynamic_revision, uintptr_t bridge_target)
+{
+    kzt_guest_library_bindings_t *bindings;
+    kzt_guest_library_binding_entry_t *entry;
+    size_t i;
+
+    if (!handle || !(bindings = handle->bindings) || !symbol || !symbol[0] ||
+        !dynamic_revision || !bridge_target) {
+        return;
+    }
+    pthread_mutex_lock(&bindings->lock);
+    entry = kzt_guest_library_handle_entry_locked(bindings, handle);
+    if (!entry || shutting_down(bindings)) goto out;
+    for (i = 0; i < KZT_GUEST_LIBRARY_SYMBOL_CACHE_SLOTS; ++i) {
+        kzt_guest_library_symbol_evidence_t *cached =
+            &entry->symbol_cache[i];
+
+        if (cached->valid &&
+            cached->dynamic_revision == dynamic_revision &&
+            strcmp(cached->symbol, symbol) == 0) {
+            cached->bridge_target = bridge_target;
+            cached->bridge_valid = 1;
+            cached->age = ++entry->symbol_cache_age;
+            break;
+        }
     }
 out:
     pthread_mutex_unlock(&bindings->lock);

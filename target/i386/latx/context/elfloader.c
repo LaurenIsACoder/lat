@@ -37,13 +37,13 @@
 #include "myalign.h"
 #include "kzt_rela_stub_detector.h"
 #include "kzt_guest_registry.h"
+#include "kzt_guest_glob_dat_target.h"
+#include "kzt_guest_dl_api.h"
 #include "kzt_guest_symbol_scope.h"
 #include "kzt_lifecycle_diagnostics.h"
 #include "kzt_per_object_got_plt.h"
 #include "kzt_observation_adapter.h"
 #include "kzt_jump_slot_production.h"
-#include "kzt_lazy_diagnostics.h"
-#include "kzt_owner_resolver.h"
 #include "kzt_plt_resolver_adapter.h"
 #include "elf_plt_relocation.h"
 #include "elfmap.h"
@@ -730,29 +730,8 @@ static int kzt_eager_compatibility_write(
     if (!slot) {
         return KZT_EAGER_COMPATIBILITY_WRITE_ERROR;
     }
-#ifdef CONFIG_LATX_KZT
-    if (option_kzt || wine_option_kzt) {
-        uintptr_t expected = observed;
-
-        if (kzt_patch_spike_guard_circuit_open(
-                KztPatchSpikeGuardForContext(context))) {
-            return KZT_EAGER_COMPATIBILITY_WRITE_CIRCUIT_OPEN;
-        }
-        if (!__atomic_compare_exchange_n(
-                (uintptr_t *)slot, &expected, replacement, 0,
-                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            if (final_value) {
-                *final_value = expected;
-            }
-            return KZT_EAGER_COMPATIBILITY_WRITE_CAS_MISMATCH;
-        }
-        if (final_value) {
-            *final_value = replacement;
-        }
-        return KZT_EAGER_COMPATIBILITY_WRITE_APPLIED;
-    }
-#endif
     (void)context;
+    (void)observed;
     *slot = replacement;
     if (final_value) {
         *final_value = replacement;
@@ -761,156 +740,24 @@ static int kzt_eager_compatibility_write(
 }
 
 #ifdef CONFIG_LATX_KZT
+static void kzt_relocation_abort_unrecoverable(
+    const elfheader_t *head, const char *symbol, const char *stage)
+{
+    printf_log(
+        LOG_NONE,
+        "KZT: unrecoverable relocation transaction for %s in %s during %s; "
+        "aborting before guest execution\n",
+        symbol ? symbol : "(unknown)",
+        head && head->name ? head->name : "(unknown)",
+        stage ? stage : "unknown stage");
+    abort();
+}
+#endif
+
+#ifdef CONFIG_LATX_KZT
 static int kzt_elfloader_read_guest_memory(uintptr_t guest_addr, void *dst,
                                            size_t size, void *opaque);
 
-typedef struct kzt_guest_glob_dat_target {
-    uintptr_t guest_target;
-    uintptr_t selected_target;
-    kzt_patch_object_ref_t owner;
-    kzt_guest_registry_source_lease_t source_lease;
-    kzt_guest_registry_patch_decision_lease_t decision_lease;
-    kzt_guest_library_loader_quiescence_lease_t loader_quiescence_lease;
-    kzt_guest_symbol_scope_request_t scope_request;
-    kzt_guest_symbol_scope_result_t scope_proof;
-    int exact_bridge;
-} kzt_guest_glob_dat_target_t;
-
-static void kzt_guest_glob_dat_target_release(
-    kzt_guest_glob_dat_target_t *target)
-{
-    if (!target) {
-        return;
-    }
-    kzt_guest_registry_patch_decision_lease_release(&target->decision_lease);
-    kzt_guest_library_loader_quiescence_release(
-        &target->loader_quiescence_lease);
-    kzt_guest_registry_source_lease_release(&target->source_lease);
-}
-
-static int kzt_guest_glob_dat_target_resolve(
-    box64context_t *context, elfheader_t *head, uintptr_t guest_target,
-    unsigned long symbol_index, const Elf64_Sym *symbol,
-    const char *symbol_name, int version, const char *version_name,
-    kzt_guest_glob_dat_target_t *target)
-{
-    kzt_owner_resolution_t resolution;
-    kzt_guest_registry_address_match_t source_match;
-    kzt_guest_registry_address_match_t owner_match;
-    kzt_guest_link_map_reader_ops_t reader_ops = {
-        .read_memory = kzt_elfloader_read_guest_memory,
-    };
-    kzt_guest_library_binding_key_t key;
-    kzt_guest_library_handle_t handle;
-    uintptr_t namespace_head = 0;
-    uintptr_t bridge_start = 0;
-    uintptr_t bridge_end = 0;
-
-    if (!context || !head || !head->self_link_map || !guest_target ||
-        symbol_index >= head->numDynSym || !symbol || !symbol_name ||
-        !symbol_name[0] || !target) {
-        return 0;
-    }
-    memset(target, 0, sizeof(*target));
-    target->guest_target = guest_target;
-    target->selected_target = guest_target;
-    kzt_owner_resolver_init(&resolution);
-    if (kzt_owner_resolver_resolve_current(
-            KztGuestRegistryForContext(context), guest_target,
-            guest_target, &resolution) != 0 ||
-        resolution.status != KZT_OWNER_RESOLVER_RESOLVED ||
-        resolution.owner_match != KZT_PATCH_OWNER_MATCH ||
-        !resolution.current_owner.known ||
-        !resolution.current_owner.link_map_addr ||
-        !resolution.current_owner.generation) {
-        return 0;
-    }
-    target->owner = resolution.current_owner;
-
-    /* The legacy bridge cache is keyed by name.  Use it only for confirmed
-       unversioned function symbols in the exact guest-selected object. */
-    if (ELF64_ST_TYPE(symbol->st_info) != STT_FUNC ||
-        version >= 2 || (version_name && version_name[0]) ||
-        context->kzt_guest_scope_layout ==
-            KZT_GUEST_SCOPE_LAYOUT_UNSUPPORTED ||
-        kzt_guest_registry_find_live_object(
-            KztGuestRegistryForContext(context), head->self_link_map,
-            &source_match) != 0 ||
-        !source_match.generation ||
-        source_match.namespace_id_status != KZT_GUEST_FIELD_OK ||
-        source_match.namespace_id != 0 ||
-        kzt_guest_registry_find_live_object(
-            KztGuestRegistryForContext(context),
-            target->owner.link_map_addr, &owner_match) != 0 ||
-        owner_match.generation != target->owner.generation ||
-        owner_match.namespace_id_status != KZT_GUEST_FIELD_OK ||
-        owner_match.namespace_id != 0 ||
-        kzt_guest_registry_source_lease_acquire(
-            KztGuestRegistryForContext(context), head->self_link_map,
-            source_match.generation, source_match.namespace_id,
-            &target->source_lease) != 0 ||
-        kzt_guest_registry_patch_decision_lease_acquire(
-            &target->source_lease, &target->decision_lease) != 0 ||
-        kzt_guest_library_loader_quiescence_try_acquire(
-            KztGuestLibraryBindingsForContext(context),
-            &target->loader_quiescence_lease) != 0 ||
-        kzt_guest_registry_context_get_main_namespace_head(
-            &context->kzt_guest_registry_context, &namespace_head) != 0) {
-        kzt_guest_glob_dat_target_release(target);
-        return 1;
-    }
-    target->scope_request = (kzt_guest_symbol_scope_request_t) {
-        .source = {
-            .link_map_addr = head->self_link_map,
-            .generation = source_match.generation,
-            .namespace_id = source_match.namespace_id,
-            .namespace_head = namespace_head,
-            .layout = context->kzt_guest_scope_layout,
-        },
-        .symbol = symbol_name,
-        .version_evidence = KZT_SYMBOL_VERSION_CONFIRMED_UNVERSIONED,
-        .reference_binding = ELF64_ST_BIND(symbol->st_info),
-        .reference_type = ELF64_ST_TYPE(symbol->st_info),
-        .reference_visibility = symbol->st_other & 0x3,
-    };
-    if (kzt_guest_symbol_scope_check(
-            &target->scope_request, target->owner.link_map_addr,
-            guest_target,
-            &reader_ops, &target->scope_proof) !=
-            KZT_GUEST_SYMBOL_SCOPE_SAFE) {
-        kzt_guest_glob_dat_target_release(target);
-        return 1;
-    }
-    key = (kzt_guest_library_binding_key_t) {
-        .link_map_addr = target->owner.link_map_addr,
-        .generation = target->owner.generation,
-        .namespace_id = owner_match.namespace_id,
-        .namespace_kind = owner_match.namespace_id == 0 ?
-            KZT_GUEST_LIBRARY_NAMESPACE_MAIN :
-            KZT_GUEST_LIBRARY_NAMESPACE_EXPLICIT,
-    };
-    memset(&handle, 0, sizeof(handle));
-    if (KztGuestLibraryLookupForContext(context, &key, &handle) != 0 ||
-        !handle.library ||
-        (handle.object_type != KZT_GUEST_LIBRARY_OBJECT_EMULATED &&
-         handle.object_type != KZT_GUEST_LIBRARY_OBJECT_WRAPPED)) {
-        kzt_guest_library_handle_release(&handle);
-        kzt_guest_glob_dat_target_release(target);
-        return 1;
-    }
-    if (GetLibSymbolStartEnd(
-            handle.library, symbol_name, 0, &bridge_start, &bridge_end,
-            version, version_name, 0) &&
-        bridge_start) {
-        target->selected_target = bridge_start;
-        target->exact_bridge = bridge_start != guest_target;
-    }
-    kzt_guest_library_handle_release(&handle);
-    if (!target->exact_bridge) {
-        kzt_guest_glob_dat_target_release(target);
-    }
-    return 1;
-}
 #endif
 
 int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t* head, int cnt, Elf64_Rela *rela, int* need_resolv)
@@ -936,56 +783,81 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
                 if ((option_kzt || wine_option_kzt) && p) {
                     uintptr_t observed = __atomic_load_n(
                         (uintptr_t *)p, __ATOMIC_ACQUIRE);
-                    kzt_guest_glob_dat_target_t guest_target;
+                    kzt_guest_glob_dat_route_result_t route_result;
                     kzt_guest_link_map_reader_ops_t reader_ops = {
                         .read_memory = kzt_elfloader_read_guest_memory,
                     };
-                    kzt_guest_symbol_scope_result_t revalidated_scope;
 
                     if (observed && bind != STB_LOCAL &&
-                        kzt_guest_glob_dat_target_resolve(
-                            my_context, head, observed,
+                        kzt_guest_glob_dat_route(
+                            my_context, head, (uintptr_t)p, observed,
                             ELF64_R_SYM(rela[i].r_info), sym, symname,
-                            version, vername, &guest_target)) {
-                        uintptr_t expected = observed;
-                        int scope_valid =
-                            !guest_target.exact_bridge ||
-                            kzt_guest_symbol_scope_revalidate(
-                                &guest_target.scope_proof,
-                                &guest_target.scope_request, &reader_ops,
-                                &revalidated_scope) ==
-                                KZT_GUEST_SYMBOL_SCOPE_SAFE;
-                        int applied =
-                            guest_target.selected_target == observed ||
-                            (scope_valid &&
-                             !kzt_patch_spike_guard_circuit_open(
-                                KztPatchSpikeGuardForContext(my_context)) &&
-                             __atomic_compare_exchange_n(
-                                (uintptr_t *)p, &expected,
-                                guest_target.selected_target, 0,
-                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
-
+                            version, vername, &reader_ops, &route_result)) {
                         printf_kzt_registry_diagnostics(
                             "kzt_eager_relocation schema=1 type=GLOB_DAT "
                             "symbol=%s route=%s host_lookup=0 "
                             "guest=%p selected=%p final=%p\n",
                             symname ? symname : "(none)",
-                            applied && guest_target.exact_bridge ?
-                                "EXACT_OWNER_BRIDGE" : "GUEST_PRESERVED",
+                            route_result.writer_result ==
+                                KZT_PRODUCTION_SLOT_TRANSACTION_APPLIED ?
+                                "EXACT_OWNER_BRIDGE" :
+                                (route_result.writer_result ==
+                                     KZT_PRODUCTION_SLOT_TRANSACTION_ROLLED_BACK ?
+                                     "WRITE_ROLLED_BACK" :
+                                     (route_result.writer_result ==
+                                          KZT_PRODUCTION_SLOT_TRANSACTION_UNRECOVERABLE ?
+                                          "UNRECOVERABLE" :
+                                          "GUEST_PRESERVED")),
                             (void *)observed,
-                            (void *)guest_target.selected_target,
-                            (void *)(applied ?
-                                guest_target.selected_target : expected));
-                        kzt_guest_glob_dat_target_release(&guest_target);
+                            (void *)route_result.selected_target,
+                            (void *)route_result.final_value);
+                        if (route_result.writer_result ==
+                            KZT_PRODUCTION_SLOT_TRANSACTION_UNRECOVERABLE) {
+                            kzt_relocation_abort_unrecoverable(
+                                head, symname, "GLOB_DAT native bridge");
+                        }
                         continue;
                     }
-                    if (bind != STB_LOCAL) {
+                    if (observed || bind != STB_LOCAL ||
+                        !head->self_link_map) {
                         printf_kzt_registry_diagnostics(
                             "kzt_eager_relocation schema=1 type=GLOB_DAT "
                             "symbol=%s route=GUEST_PRESERVED host_lookup=0 "
                             "guest=%p final=%p evidence=UNAVAILABLE\n",
                             symname ? symname : "(none)", (void *)observed,
                             (void *)observed);
+                        continue;
+                    }
+                    {
+                        uintptr_t final_value = observed;
+                        uintptr_t local_target =
+                            sym->st_value + head->delta;
+                        kzt_production_slot_transaction_result_t writer_result =
+                            kzt_production_guest_relocation_write(
+                                my_context, head->self_link_map,
+                                KZT_PATCH_RELOCATION_GLOB_DAT,
+                                (uintptr_t)p, observed, local_target,
+                                symname,
+                                version >= 2 ?
+                                    KZT_SYMBOL_VERSION_VERSIONED :
+                                    KZT_SYMBOL_VERSION_CONFIRMED_UNVERSIONED,
+                                version >= 2 ? vername : NULL,
+                                &final_value);
+
+                        printf_kzt_registry_diagnostics(
+                            "kzt_eager_relocation schema=1 type=GLOB_DAT "
+                            "symbol=%s route=%s host_lookup=0 "
+                            "target=%p final=%p\n",
+                            symname ? symname : "(none)",
+                            writer_result ==
+                                KZT_PRODUCTION_SLOT_TRANSACTION_APPLIED ?
+                                "LOCAL_APPLIED" : "GUEST_PRESERVED",
+                            (void *)local_target, (void *)final_value);
+                        if (writer_result !=
+                                KZT_PRODUCTION_SLOT_TRANSACTION_APPLIED &&
+                            final_value != local_target) {
+                            return -1;
+                        }
                         continue;
                     }
                 }
@@ -1041,12 +913,34 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
                         symname, rela[i].r_addend);
                     if (defer_plan.should_add_delta) {
                         uintptr_t final_value = slot_observation;
-                        int write_status = kzt_eager_compatibility_write(
-                            my_context, p, slot_observation,
-                            slot_observation + head->delta, &final_value);
+                        int write_status;
+
+#ifdef CONFIG_LATX_KZT
+                        if (option_kzt || wine_option_kzt) {
+                            write_status =
+                                kzt_production_guest_relocation_write(
+                                    my_context, head->self_link_map,
+                                    KZT_PATCH_RELOCATION_JUMP_SLOT,
+                                    (uintptr_t)p, slot_observation,
+                                    slot_observation + head->delta,
+                                    symname,
+                                    version >= 2 ?
+                                        KZT_SYMBOL_VERSION_VERSIONED :
+                                        KZT_SYMBOL_VERSION_CONFIRMED_UNVERSIONED,
+                                    version >= 2 ? vername : NULL,
+                                    &final_value);
+                        } else
+#endif
+                        {
+                            write_status = kzt_eager_compatibility_write(
+                                my_context, p, slot_observation,
+                                slot_observation + head->delta, &final_value);
+                        }
 
                         if (write_status !=
-                            KZT_EAGER_COMPATIBILITY_WRITE_APPLIED) {
+                                KZT_EAGER_COMPATIBILITY_WRITE_APPLIED &&
+                            write_status !=
+                                KZT_PRODUCTION_SLOT_TRANSACTION_APPLIED) {
                             printf_kzt_registry_diagnostics(
                                 "kzt_eager_relocation schema=1 "
                                 "type=JUMP_SLOT symbol=%s route=%s "
@@ -1056,6 +950,9 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
                                     KZT_EAGER_COMPATIBILITY_WRITE_CAS_MISMATCH ?
                                     "CAS_MISMATCH" : "WRITE_BLOCKED",
                                 (void *)final_value);
+                            if (final_value != slot_observation + head->delta) {
+                                return -1;
+                            }
                         }
                     }
                     *need_resolv = 1;
@@ -1116,11 +1013,50 @@ int RelocateElfRELA(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t
                                           "GUEST_PRESERVED")),
                             (void *)slot_observation,
                             (void *)route_result.final_value);
+                        if (route_result.status ==
+                            KZT_JUMP_SLOT_ROUTE_UNRECOVERABLE) {
+                            kzt_relocation_abort_unrecoverable(
+                                head, symname, "JUMP_SLOT native bridge");
+                        }
                         break;
                     }
                 }
                 if ((option_kzt || wine_option_kzt) &&
-                    bind != STB_LOCAL) {
+                    bind == STB_LOCAL && head->self_link_map && p &&
+                    slot_is_unresolved_stub) {
+                    uintptr_t local_target =
+                        sym->st_value + head->delta + rela[i].r_addend;
+                    uintptr_t final_value = __atomic_load_n(
+                        (uintptr_t *)p, __ATOMIC_ACQUIRE);
+                    kzt_production_slot_transaction_result_t writer_result =
+                        kzt_production_guest_relocation_write(
+                            my_context, head->self_link_map,
+                            KZT_PATCH_RELOCATION_JUMP_SLOT,
+                            (uintptr_t)p, final_value, local_target,
+                            symname,
+                            version >= 2 ?
+                                KZT_SYMBOL_VERSION_VERSIONED :
+                                KZT_SYMBOL_VERSION_CONFIRMED_UNVERSIONED,
+                            version >= 2 ? vername : NULL,
+                            &final_value);
+
+                    printf_kzt_registry_diagnostics(
+                        "kzt_eager_relocation schema=1 type=JUMP_SLOT "
+                        "symbol=%s route=%s host_lookup=0 "
+                        "target=%p final=%p\n",
+                        symname ? symname : "(none)",
+                        writer_result ==
+                            KZT_PRODUCTION_SLOT_TRANSACTION_APPLIED ?
+                            "LOCAL_APPLIED" : "GUEST_PRESERVED",
+                        (void *)local_target, (void *)final_value);
+                    if (writer_result !=
+                            KZT_PRODUCTION_SLOT_TRANSACTION_APPLIED &&
+                        final_value != local_target) {
+                        return -1;
+                    }
+                    break;
+                }
+                if (option_kzt || wine_option_kzt) {
                     uintptr_t final_value = p ? __atomic_load_n(
                         (uintptr_t *)p, __ATOMIC_ACQUIRE) : slot_observation;
 
@@ -1203,8 +1139,6 @@ static int RelocateElfPltRELA(void *opaque, int *need_resolver)
 }
 
 #ifdef CONFIG_LATX_KZT
-static void KztLazyBindingCompleteResolver(void);
-
 static int kzt_per_object_runtime_to_raw(uintptr_t runtime,
                                          uintptr_t load_bias,
                                          uintptr_t *raw)
@@ -1455,12 +1389,6 @@ out:
 #endif
 }
 
-static int kzt_per_object_prepare_pinned_target(uintptr_t target, void *opaque)
-{
-    (void)opaque;
-    return KztPrebindTargetTbPrepare(target);
-}
-
 int KztPerObjectGotPltWrite(uintptr_t link_map_addr,
                             unsigned long generation,
                             const kzt_guest_dynamic_view_t *view,
@@ -1516,11 +1444,6 @@ int KztPerObjectGotPltWrite(uintptr_t link_map_addr,
     if (!context->kzt_plt_resolver_bridge) {
         context->kzt_plt_resolver_bridge = AddBridge(
             context->system, vFE, PltResolver, 0, "PltResolver");
-    }
-    if (!context->kzt_lazy_completion_bridge) {
-        context->kzt_lazy_completion_bridge = AddBridge(
-            context->system, vFE, KztLazyBindingCompleteResolver, 0,
-            "KztLazyBindingCompleteResolver");
     }
     resolver_bridge = context->kzt_plt_resolver_bridge;
     if (!kzt_plt_resolver_injection_allowed(guest_resolver, resolver_bridge)) {
@@ -1593,9 +1516,6 @@ int KztPerObjectGotPltWrite(uintptr_t link_map_addr,
         KztPerObjectGotPltRelease((uintptr_t)head);
         return -1;
     }
-    (void)kzt_production_lazy_prebind_object(
-        context, head, generation, view,
-        kzt_per_object_prepare_pinned_target, NULL);
     printf_kzt_registry_diagnostics(
         "kzt_per_object_got_plt schema=1 link_map=0x%lx generation=%lu "
         "result=APPLIED\n",
@@ -1824,15 +1744,6 @@ int RelocateElfPlt(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t*
             }
             resolver_bridge = pltResolver;
 #endif
-#ifdef CONFIG_LATX_KZT
-            if ((option_kzt || wine_option_kzt) &&
-                !my_context->kzt_lazy_completion_bridge) {
-                my_context->kzt_lazy_completion_bridge = AddBridge(
-                    my_context->system, vFE,
-                    KztLazyBindingCompleteResolver, 0,
-                    "KztLazyBindingCompleteResolver");
-            }
-#endif
             if(resolver_got_runtime) {
 #ifdef CONFIG_LATX_KZT
                 if (!resolver_snapshot_available) {
@@ -1877,6 +1788,7 @@ int RelocateElfPlt(lib_t *maplib, lib_t *local_maplib, int bindnow, elfheader_t*
                         .resolver_slot = resolver_got_runtime + 16,
                         .guest_link_map = guest_link_map,
                         .guest_resolver = guest_resolver,
+                        .object_head = (uintptr_t)head,
                     };
                     if (kzt_guest_registry_find_live_object(
                             KztGuestRegistryForContext(my_context),
@@ -2464,61 +2376,8 @@ int KztPltResolverDispatch(void *cpu_state, uintptr_t pc)
 }
 
 #ifdef CONFIG_LATX_KZT
-static void KztLazyBindingCompleteResolver(void)
-{
-    CPUX86State *cpu = (CPUX86State *)lsenv->cpu_state;
-    kzt_lazy_binding_pending_t *pending =
-        &cpu->kzt_lazy_binding_pending;
-    uintptr_t original_return = cpu->kzt_lazy_original_return;
-    uintptr_t slot_addr = pending->slot_addr;
-    char symbol[KZT_LAZY_BINDING_SYMBOL_MAX];
-    kzt_lazy_binding_result_t result;
-
-    (void)slot_addr;
-
-    symbol[0] = '\0';
-    if (pending->symbol) {
-        strncpy(symbol, pending->symbol, sizeof(symbol) - 1);
-        symbol[sizeof(symbol) - 1] = '\0';
-    }
-    if (pending->armed) {
-        if (option_kzt_lazy_diagnostics) {
-            kzt_lazy_binding_pending_t pending_snapshot = *pending;
-            kzt_lazy_diagnostic_emit_result_t diagnostic_result;
-
-            pending_snapshot.symbol = pending->symbol ?
-                pending_snapshot.symbol_storage : NULL;
-            pending_snapshot.version = pending->version ?
-                pending_snapshot.version_storage : NULL;
-            (void)kzt_production_lazy_complete(
-                (void *)pending->context_id, pending, &result);
-            (void)kzt_lazy_diagnostics_emit_production(
-                &pending_snapshot, &result, &diagnostic_result);
-        } else {
-            (void)kzt_production_lazy_complete(
-                (void *)pending->context_id, pending, &result);
-        }
-        printf_log(LOG_DEBUG,
-                   "KZT: lazy complete status=%d reason=%d slot=%p "
-                   "before=%p after=%p sym=%s\n",
-                   result.status, result.reason,
-                   (void *)slot_addr,
-                   (void *)result.slot_before, (void *)result.slot_after,
-                   symbol[0] ? symbol : "(none)");
-    }
-    kzt_lazy_binding_cancel(pending);
-    cpu->kzt_lazy_original_return = 0;
-    Push64(cpu, original_return);
-}
-
 typedef struct kzt_plt_resolver_production_state {
     elfheader_t *head;
-    uintptr_t slot_addr;
-    uintptr_t unresolved_stub;
-    const char *symbol;
-    kzt_symbol_version_evidence_t version_evidence;
-    const char *version;
-    long addend;
 } kzt_plt_resolver_production_state_t;
 
 static int kzt_plt_resolver_lookup_source(
@@ -2535,19 +2394,7 @@ static int kzt_plt_resolver_lookup_source(
     if (kzt_guest_registry_find_lazy_source(
             registry, state->head->self_link_map, &registry_source) == 0) {
         *source = (kzt_plt_resolver_source_t) {
-            .enabled = my_context->kzt_lazy_completion_bridge != 0,
-            .context_id = (uintptr_t)my_context,
-            .object_head = object_head,
             .source_link_map = state->head->self_link_map,
-            .source_generation = registry_source.generation,
-            .namespace_id = registry_source.namespace_id,
-            .namespace_kind = KZT_GUEST_LIBRARY_NAMESPACE_MAIN,
-            .slot_addr = state->slot_addr,
-            .unresolved_stub = state->unresolved_stub,
-            .symbol = state->symbol,
-            .version_evidence = state->version_evidence,
-            .version = state->version,
-            .addend = state->addend,
             .guest_resolver = registry_source.guest_resolver,
         };
         return 0;
@@ -2556,29 +2403,10 @@ static int kzt_plt_resolver_lookup_source(
         return -1;
     }
     *source = (kzt_plt_resolver_source_t) {
-        .enabled = 0,
-        .context_id = (uintptr_t)my_context,
-        .object_head = object_head,
         .source_link_map = state->head->self_link_map,
-        .namespace_kind = KZT_GUEST_LIBRARY_NAMESPACE_UNSUPPORTED,
-        .slot_addr = state->slot_addr,
-        .unresolved_stub = state->unresolved_stub,
-        .symbol = state->symbol,
-        .version_evidence = state->version_evidence,
-        .version = state->version,
-        .addend = state->addend,
         .guest_resolver = state->head->kzt_guest_resolver,
     };
     return 0;
-}
-
-static int kzt_plt_resolver_begin_lazy_binding(
-    const kzt_lazy_binding_begin_request_t *request,
-    kzt_lazy_binding_pending_t *pending,
-    kzt_lazy_binding_result_t *result, void *opaque)
-{
-    (void)opaque;
-    return kzt_lazy_binding_begin(request, pending, result);
 }
 #endif
 
@@ -2594,6 +2422,18 @@ static int plt_resolver_handoff_guest(
     Push64(cpu, head->self_link_map);
     Push64(cpu, head->kzt_guest_resolver);
     return 0;
+}
+
+static void plt_resolver_abort_unrecoverable(
+    elfheader_t *head, const char *symbol)
+{
+    printf_log(
+        LOG_NONE,
+        "KZT: unrecoverable PLT slot transaction for %s in %s; "
+        "aborting before guest resolver handoff\n",
+        symbol ? symbol : "(unknown)",
+        head && head->name ? head->name : "(unknown)");
+    abort();
 }
 
 static void plt_resolver_handoff_guest_or_abort(
@@ -2690,20 +2530,9 @@ void PltResolver(void)
         kzt_lazy_direct_route_result_t direct_result;
         kzt_plt_resolver_production_state_t state = {
             .head = h,
-            .slot_addr = (uintptr_t)p,
-            .unresolved_stub = p ?
-                __atomic_load_n((uintptr_t *)p, __ATOMIC_ACQUIRE) : 0,
-            .symbol = symname,
-            .version_evidence = version_evidence,
-            .version = vername,
-            .addend = rel->r_addend,
         };
         kzt_plt_resolver_runtime_ops_t ops = {
             .lookup_source = kzt_plt_resolver_lookup_source,
-            .begin_lazy_binding = kzt_plt_resolver_begin_lazy_binding,
-            .pending = &cpu->kzt_lazy_binding_pending,
-            .completion_bridge = my_context->kzt_lazy_completion_bridge,
-            .original_return = &cpu->kzt_lazy_original_return,
             .opaque = &state,
         };
         kzt_plt_resolver_enter_result_t enter_result;
@@ -2719,7 +2548,9 @@ void PltResolver(void)
                 __atomic_load_n(p, __ATOMIC_ACQUIRE),
                 symbol_index, symname, version_evidence, vername,
                 &direct_result) == 0 &&
-            direct_result.status == KZT_LAZY_DIRECT_ROUTE_NATIVE_APPLIED) {
+            (direct_result.status == KZT_LAZY_DIRECT_ROUTE_NATIVE_APPLIED ||
+             direct_result.status ==
+                 KZT_LAZY_DIRECT_ROUTE_NATIVE_TRANSIENT)) {
             uint64_t route_done_ns = timing_enabled
                 ? kzt_lazy_resolver_timing_now()
                 : 0;
@@ -2727,9 +2558,12 @@ void PltResolver(void)
                 ? kzt_lazy_resolver_minor_faults()
                 : 0;
             printf_kzt_registry_diagnostics(
-                "kzt_lazy_path schema=1 symbol=%s route=NEW_DIRECT "
+                "kzt_lazy_path schema=1 symbol=%s route=%s "
                 "guest_handoff=0 legacy_lookup=0 legacy_write=0\n",
-                symname ? symname : "(none)");
+                symname ? symname : "(none)",
+                direct_result.status ==
+                    KZT_LAZY_DIRECT_ROUTE_NATIVE_APPLIED ?
+                    "NEW_DIRECT" : "NEW_DIRECT_TRANSIENT");
             (void)Pop64(cpu);
             (void)Pop64(cpu);
             Push64(cpu, direct_result.selected_target);
@@ -2791,6 +2625,18 @@ void PltResolver(void)
                     direct_result.selected_target, __ATOMIC_RELEASE);
             }
             return;
+        }
+
+        if (direct_result.status == KZT_LAZY_DIRECT_ROUTE_UNRECOVERABLE) {
+            plt_resolver_abort_unrecoverable(h, symname);
+        }
+
+        if (kzt_patch_symbol_requires_dlerror_prebind(symname)) {
+            __atomic_store_n(
+                &my_context->kzt_guest_loader_route_present, 1,
+                __ATOMIC_RELEASE);
+            kzt_guest_dl_api_set_slow_required(
+                &cpu->kzt_guest_dlerror_state, 1);
         }
 
         if (kzt_plt_resolver_enter(cpu, &ops, &enter_result) == 0 &&

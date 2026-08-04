@@ -40,17 +40,16 @@ wrappedlibdl = (
 ).read_text(encoding="utf-8")
 
 selector = function_body(
-    adapter, "uintptr_t kzt_guest_library_select_symbol_result(")
+    adapter, "uintptr_t kzt_guest_library_select_symbol_result_with_identity(")
 required_selector_tokens = (
-    "KZT_SYMBOL_VERSION_VERSIONED, version",
-    "kzt_rela_runtime_wrapper_provider_discover_retained_with_version_evidence(",
-    "kzt_wrapper_probe_minimal_manifest(",
-    "KZT_PATCH_WRAPPER_VERSION_MATCH",
-    "kzt_symbol_version_evidence_matches(",
+    "kzt_rela_runtime_select_exact_wrapper_bridge_retained(",
+    "KZT_SYMBOL_VERSION_VERSIONED",
+    "KZT_SYMBOL_VERSION_CONFIRMED_UNVERSIONED",
 )
 for token in required_selector_tokens:
     if token not in selector:
         raise AssertionError(f"versioned selector misses exact evidence: {token}")
+
 if "(version && version[0]) ||" in selector:
     raise AssertionError("versioned selection still returns before owner proof")
 if "versioned = version != NULL" not in selector or \

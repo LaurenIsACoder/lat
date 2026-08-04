@@ -46,6 +46,9 @@ typedef struct kzt_lazy_prebind_record {
     uintptr_t bridge_target;
     unsigned long bridge_generation;
     int bridge_custom_wrapper;
+    /* Set only for a process-resident source whose loader wrapper ownership
+     * cannot change across dlopen/dlclose namespace mutations. */
+    int loader_mutation_invariant;
     kzt_symbol_version_evidence_t version_evidence;
     char symbol[KZT_LAZY_PREBIND_TEXT_MAX];
     char version[KZT_LAZY_PREBIND_TEXT_MAX];
@@ -68,6 +71,13 @@ uint64_t kzt_lazy_prebind_scope_epoch(kzt_lazy_prebind_scope_t *scope);
 uint64_t kzt_lazy_prebind_scope_mutate(
     kzt_lazy_prebind_scope_t *scope, kzt_lazy_prebind_mutation_t mutation);
 
+/* True only while this exact source has a current published custom dlerror
+ * bridge.  Process-resident records can remain current across mutations;
+ * other records are invalidated with their scope epoch. */
+int kzt_lazy_prebind_scope_has_native_dlerror(
+    kzt_lazy_prebind_scope_t *scope,
+    const kzt_lazy_prebind_identity_t *source);
+
 kzt_lazy_prebind_claim_result_t kzt_lazy_prebind_scope_claim(
     kzt_lazy_prebind_scope_t *scope,
     const kzt_lazy_prebind_record_t *record);
@@ -78,6 +88,8 @@ int kzt_lazy_prebind_scope_acquire(
     kzt_lazy_prebind_scope_t *scope,
     const kzt_lazy_prebind_record_t *expected,
     kzt_lazy_prebind_lease_t *lease);
+int kzt_lazy_prebind_scope_lease_published(
+    const kzt_lazy_prebind_lease_t *lease);
 void kzt_lazy_prebind_scope_release(kzt_lazy_prebind_lease_t *lease);
 
 /* Only one current record owner can publish a speculative bridge.  The

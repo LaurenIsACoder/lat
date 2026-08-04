@@ -148,11 +148,16 @@ void AlignEpollEvent(void* dest, void* source, int nbr); // x86 -> Arm
 void* align_xcb_connection(void* src);
 void unalign_xcb_connection(void* src, void* dst);
 void* add_xcb_connection(void* src);
-void del_xcb_connection(void* src);
 int sync_xcb_connection(void* src);
-int kzt_init(char** argv, int argc,char** target_argv, int  target_argc,
-    struct linux_binprm* bprm);
-int collectX86free(elfheader_t* h);
+int begin_xcb_connection_disconnect(
+    void *guest, kzt_xcb_connection_lease_t *lease);
+int begin_xcb_connection_disconnect_native(
+    void *native, kzt_xcb_connection_lease_t *lease);
+void finish_xcb_connection_disconnect(kzt_xcb_connection_lease_t *lease);
+uintptr_t kzt_xcb_guard_acquire_for_bridge(
+    CPUX86State *env, uintptr_t guest);
+int kzt_init(CPUX86State *env, char** argv, int argc, char** target_argv,
+    int target_argc, struct linux_binprm* bprm);
 TranslationBlock * kzt_tb_find_exp(
             CPUState *cpu,
             TranslationBlock *last_tb,
@@ -169,6 +174,7 @@ void kzt_wine_bridge(abi_ulong start, int fd);
 int latx_dpy_xcb_sync(void *v1);
 elfheader_t* loadElfFromFile(const char* name);
 elfheader_t* tryLoadElfFromFile(const char* name);
+elfheader_t* tryLoadElfFromFileForContext(
+    box64context_t *context, const char *name);
 void freeElfFromFile(elfheader_t **header);
-void kzt_wine_init_x86(box64context_t *context, uintptr_t guest_dlsym);
 #endif  //__MY_ALIGN__H_

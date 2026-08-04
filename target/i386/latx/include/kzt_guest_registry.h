@@ -167,6 +167,22 @@ typedef struct kzt_guest_registry_address_pair {
     kzt_guest_registry_address_match_t expected;
 } kzt_guest_registry_address_pair_t;
 
+typedef struct kzt_guest_registry_symbol_candidate {
+    kzt_guest_registry_source_lease_t lease;
+    kzt_guest_dynamic_view_t dynamic_view;
+    uintptr_t link_map_addr;
+    uintptr_t map_start;
+    uintptr_t map_end;
+    uintptr_t namespace_id;
+    unsigned long generation;
+    unsigned long dynamic_view_revision;
+    kzt_guest_field_status_t dynamic_view_status;
+    kzt_guest_field_status_t path_status;
+    kzt_guest_field_status_t soname_status;
+    char path[KZT_GUEST_REGISTRY_ADDRESS_TEXT_LIMIT];
+    char soname[KZT_GUEST_REGISTRY_ADDRESS_TEXT_LIMIT];
+} kzt_guest_registry_symbol_candidate_t;
+
 typedef struct kzt_guest_registry_dump {
     kzt_guest_object_snapshot_t *objects;
     size_t count;
@@ -324,6 +340,17 @@ int kzt_guest_registry_loader_symbol_source_acquire(
     kzt_guest_field_status_t *dynamic_status,
     unsigned long *dynamic_revision,
     kzt_guest_registry_source_lease_t *lease);
+/* Acquires the same source proof from an exact guest dlinfo result without
+ * assuming that the opaque loader handle is a link_map or publishing a
+ * synthetic dlopen reference. */
+int kzt_guest_registry_loader_symbol_source_acquire_exact(
+    kzt_guest_registry_t *registry,
+    const kzt_guest_loader_identity_t *queried_identity,
+    kzt_guest_loader_identity_t *identity,
+    kzt_guest_dynamic_view_t *dynamic_view,
+    kzt_guest_field_status_t *dynamic_status,
+    unsigned long *dynamic_revision,
+    kzt_guest_registry_source_lease_t *lease);
 /* Resolves a loader object while it is LIVE or pre-unmap UNLOADING. */
 int kzt_guest_registry_find_loader_object_identity(
     kzt_guest_registry_t *registry,
@@ -391,6 +418,15 @@ int kzt_guest_registry_patch_decision_lease_acquire(
     kzt_guest_registry_patch_decision_lease_t *lease);
 void kzt_guest_registry_patch_decision_lease_release(
     kzt_guest_registry_patch_decision_lease_t *lease);
+
+/* Iterates main-namespace symbol-owner candidates while one source-derived
+ * decision lease freezes Registry mutations.  Each returned candidate owns an
+ * exact source lease that must cover all guest-memory reads for that object. */
+int kzt_guest_registry_symbol_candidate_acquire_next(
+    const kzt_guest_registry_patch_decision_lease_t *decision_lease,
+    size_t *cursor, kzt_guest_registry_symbol_candidate_t *candidate);
+void kzt_guest_registry_symbol_candidate_release(
+    kzt_guest_registry_symbol_candidate_t *candidate);
 
 /* Claims the one PLTGOT injection transaction for the exact generation
  * protected by an active patch-decision lease.  The supplied Dynamic View
@@ -492,6 +528,9 @@ void kzt_guest_registry_dump_free(kzt_guest_registry_dump_t *dump);
 void kzt_guest_registry_test_set_alloc_failure_after(long allocations);
 void kzt_guest_registry_test_set_dynamic_commit_failure_after(long commits);
 void kzt_guest_registry_test_fail_next_cond_init(void);
+int kzt_guest_registry_test_set_active_source_leases(
+    kzt_guest_registry_t *registry, uintptr_t link_map_addr,
+    unsigned long generation, unsigned long active_source_leases);
 #endif
 
 #endif

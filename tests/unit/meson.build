@@ -20,6 +20,186 @@ kzt_guest_registry_test = executable(
 
 test('kzt-guest-registry', kzt_guest_registry_test)
 
+kzt_xcb_connection_map_test = executable(
+  'kzt-xcb-connection-map',
+  files(
+    'kzt/test_xcb_connection_map.c',
+    '../../target/i386/latx/context/kzt_xcb_connection_map.c',
+  ),
+  include_directories: include_directories('../../target/i386/latx/include'),
+  dependencies: dependency('threads'),
+)
+
+test('kzt-xcb-connection-map', kzt_xcb_connection_map_test)
+
+test(
+  'kzt-xcb-connection-map-performance',
+  kzt_xcb_connection_map_test,
+  args: '--benchmark',
+  timeout: 90,
+  is_parallel: false,
+)
+
+kzt_xcb_connection_guard_test = executable(
+  'kzt-xcb-connection-guard',
+  files(
+    'kzt/test_xcb_connection_guard.c',
+    '../../target/i386/latx/context/kzt_xcb_connection_guard.c',
+    '../../target/i386/latx/context/kzt_xcb_connection_map.c',
+  ),
+  include_directories: include_directories('../../target/i386/latx/include'),
+  dependencies: dependency('threads'),
+)
+
+test('kzt-xcb-connection-guard', kzt_xcb_connection_guard_test)
+
+kzt_wi1618_guest_cancel_scope_test = executable(
+  'kzt-wi1618-guest-cancel-scope',
+  files(
+    'kzt/test_wi1618_guest_cancel_scope.c',
+    '../../target/i386/latx/context/kzt_guest_cancel_scope.c',
+  ),
+  include_directories: include_directories(
+    '../..',
+    '../../target/i386/latx/include',
+  ),
+)
+
+test('kzt-wi1618-guest-cancel-scope',
+     kzt_wi1618_guest_cancel_scope_test)
+
+test(
+  'kzt-wi1618-guest-cancel-scope-source-contract',
+  find_program('python3'),
+  args: [
+    files('kzt/test_wi1618_guest_cancel_scope_source_contract.py'),
+    meson.project_source_root(),
+  ],
+)
+
+kzt_wi1619_xcb_queue_mirror_test = executable(
+  'kzt-wi1619-xcb-queue-mirror',
+  files('kzt/test_wi1619_xcb_queue_mirror.c'),
+  include_directories: include_directories(
+    '../../target/i386/latx/include',
+  ),
+)
+
+kzt_wi1621_x11_xcb_close_source_contract = files(
+  'kzt/test_wi1621_x11_xcb_close_source_contract.py',
+)
+test(
+  'kzt-wi1621-x11-xcb-close-source-contract',
+  find_program('python3'),
+  args: [kzt_wi1621_x11_xcb_close_source_contract, meson.project_source_root()],
+  suite: ['unit', 'kzt'],
+)
+
+test(
+  'kzt-wi1629-loader-callback-snapshot-source-contract',
+  find_program('python3'),
+  args: [
+    files('kzt/test_wi1629_loader_callback_snapshot_source_contract.py'),
+    meson.project_source_root(),
+  ],
+  suite: ['unit', 'kzt'],
+)
+
+test(
+  'kzt-wi1633-exact-wrapper-selection-source-contract',
+  find_program('python3'),
+  args: [
+    files('kzt/test_wi1633_exact_wrapper_selection_source_contract.py'),
+    meson.project_source_root(),
+  ],
+  suite: ['unit', 'kzt'],
+)
+
+kzt_guest_glob_dat_target_test = executable(
+  'kzt-guest-glob-dat-target',
+  files(
+    'kzt/test_guest_glob_dat_target.c',
+    '../../target/i386/latx/context/kzt_guest_glob_dat_target.c',
+  ),
+  c_args: ['-DCONFIG_LATX_KZT'],
+  include_directories: include_directories(
+    '../..',
+    '../../target/i386/latx/include',
+  ),
+)
+
+test('kzt-guest-glob-dat-target', kzt_guest_glob_dat_target_test)
+
+test('kzt-wi1619-xcb-queue-mirror',
+     kzt_wi1619_xcb_queue_mirror_test)
+
+test('kzt-wi1619-xcb-queue-mirror-performance',
+     kzt_wi1619_xcb_queue_mirror_test,
+     args: ['--benchmark'])
+
+test(
+  'kzt-wi1619-xcb-flush-state-source-contract',
+  find_program('python3'),
+  args: [
+    files('kzt/test_wi1619_xcb_flush_state_source_contract.py'),
+    meson.project_source_root(),
+  ],
+)
+
+test(
+  'kzt-wi1571-xcb-context-map-source-contract',
+  find_program('python3'),
+  args: [
+    files('kzt/test_wi1571_xcb_context_map_source_contract.py'),
+    meson.source_root(),
+  ],
+)
+
+test(
+  'kzt-wi1572-guarded-xcb-bridge-source-contract',
+  find_program('python3'),
+  args: [
+    files('kzt/test_wi1572_guarded_xcb_bridge_source_contract.py'),
+    meson.source_root(),
+  ],
+)
+
+test(
+  'kzt-wi1573-guarded-xcb-production-source-contract',
+  find_program('python3'),
+  args: [
+    files('kzt/test_wi1573_guarded_xcb_production_source_contract.py'),
+    meson.source_root(),
+  ],
+)
+
+test(
+  'kzt-wi1611-xcb-cancellation-source-contract',
+  find_program('python3'),
+  args: [
+    files('kzt/test_wi1611_xcb_cancellation_source_contract.py'),
+    meson.source_root(),
+  ],
+)
+
+test(
+  'kzt-wi1612-xcb-serialization-source-contract',
+  find_program('python3'),
+  args: [
+    files('kzt/test_wi1612_xcb_serialization_source_contract.py'),
+    meson.source_root(),
+  ],
+)
+
+test(
+  'kzt-wi1574-dlerror-route-coherence-source-contract',
+  find_program('python3'),
+  args: [
+    files('kzt/test_wi1574_dlerror_route_coherence_source_contract.py'),
+    meson.source_root(),
+  ],
+)
+
 test(
   'kzt-wi1009-lazy-slot-bridge-removal-contract',
   find_program('python3'),
@@ -110,6 +290,63 @@ if 'x86_64-linux-user' in target_dirs
 
   test('kzt-bridge-concurrency', kzt_bridge_concurrency_test)
 
+  kzt_wi1633_real_bridge_selection_test = executable(
+    'kzt-wi1633-real-bridge-selection',
+    files(
+      'kzt/test_wi1633_real_bridge_selection.c',
+      'kzt/kzt_test_options.c',
+      '../../target/i386/latx/context/bridge.c',
+      '../../target/i386/latx/context/kzt_rela_runtime_bridge.c',
+      '../../target/i386/latx/context/kzt_wrapper_bridge_provider.c',
+      '../../target/i386/latx/context/kzt_wrapper_probe.c',
+      '../../target/i386/latx/context/kzt_bridge_exact.c',
+    ),
+    c_args: [
+      '-DBRIDGE_TEST',
+      '-DCONFIG_LATX_KZT',
+      '-DNEED_CPU_H',
+      '-DCONFIG_TARGET="x86_64-linux-user-config-target.h"',
+      '-DCONFIG_DEVICES="x86_64-linux-user-config-devices.h"',
+    ],
+    include_directories: include_directories(
+      '../..',
+      '../../target/i386',
+      '../../linux-user/host/loongarch',
+      '../../linux-user',
+      '../../linux-user/x86_64',
+      '../../target/i386/latx/include',
+    ),
+    dependencies: [dependency('threads'), cc.find_library('dl')],
+  )
+
+  test('kzt-wi1633-real-bridge-selection',
+       kzt_wi1633_real_bridge_selection_test)
+
+  kzt_wi1572_guarded_bridge_test = executable(
+    'kzt-wi1572-guarded-bridge',
+    files(
+      'kzt/test_wi1572_guarded_bridge.c',
+      '../../target/i386/latx/context/bridge.c',
+    ),
+    c_args: [
+      '-DBRIDGE_TEST',
+      '-DNEED_CPU_H',
+      '-DCONFIG_TARGET="x86_64-linux-user-config-target.h"',
+      '-DCONFIG_DEVICES="x86_64-linux-user-config-devices.h"',
+    ],
+    include_directories: include_directories(
+      '../..',
+      '../../target/i386',
+      '../../linux-user/host/loongarch',
+      '../../linux-user',
+      '../../linux-user/x86_64',
+      '../../target/i386/latx/include',
+    ),
+    dependencies: [dependency('threads'), cc.find_library('dl')],
+  )
+
+  test('kzt-wi1572-guarded-bridge', kzt_wi1572_guarded_bridge_test)
+
   kzt_bridge_atfork_fail_open_test = executable(
     'kzt-bridge-atfork-fail-open',
     files(
@@ -186,6 +423,13 @@ kzt_guest_library_binding_test = executable(
 )
 
 test('kzt-guest-library-binding', kzt_guest_library_binding_test)
+test(
+  'kzt-guest-library-binding-performance',
+  kzt_guest_library_binding_test,
+  args: '--benchmark',
+  timeout: 90,
+  is_parallel: false,
+)
 
 kzt_guest_library_binding_teardown_test = executable(
   'kzt-guest-library-binding-teardown',
@@ -227,6 +471,8 @@ kzt_guest_dl_api_test = executable(
     'kzt/test_guest_dl_api.c',
     '../../target/i386/latx/context/kzt_guest_dl_api.c',
     '../../target/i386/latx/context/kzt_guest_dl_init.c',
+    '../../target/i386/latx/context/kzt_guest_runtime_entry.c',
+    '../../target/i386/latx/context/kzt_guest_runtime_entry_state.c',
     '../../target/i386/latx/context/kzt_lifecycle_diagnostics.c',
     '../../target/i386/latx/context/kzt_lazy_prebind_scope.c',
   ),
@@ -265,24 +511,6 @@ kzt_guest_dlclose_quiescence_test = executable(
 )
 
 test('kzt-guest-dlclose-quiescence', kzt_guest_dlclose_quiescence_test)
-
-kzt_dlopen_recycle_transaction_test = executable(
-  'kzt-dlopen-recycle-transaction',
-  files(
-    'kzt/test_dlopen_recycle_transaction.c',
-    '../../target/i386/latx/context/dlopen_recycle_transaction.c',
-    '../../target/i386/latx/context/elf_plt_relocation.c',
-    '../../target/i386/latx/context/kzt_guest_library_binding.c',
-    '../../target/i386/latx/context/kzt_lifecycle_diagnostics.c',
-    '../../target/i386/latx/context/kzt_guest_registry.c',
-  ),
-  c_args: ['-DKZT_GUEST_LIBRARY_BINDING_TEST'],
-  include_directories: include_directories('../../target/i386/latx/include'),
-  dependencies: dependency('threads'),
-)
-
-test('kzt-dlopen-recycle-transaction',
-     kzt_dlopen_recycle_transaction_test)
 
 python3 = find_program('python3')
 test(
@@ -500,6 +728,14 @@ kzt_patch_planner_test = executable(
 )
 
 test('kzt-patch-planner', kzt_patch_planner_test)
+
+kzt_xcb_route_policy_test = executable(
+  'kzt-xcb-route-policy',
+  files('kzt/test_xcb_route_policy.c'),
+  include_directories: include_directories('../..', '../../target/i386/latx/include'),
+)
+
+test('kzt-xcb-route-policy', kzt_xcb_route_policy_test)
 
 kzt_runtime_got_plt_candidate_test = executable(
   'kzt-runtime-got-plt-candidate',
@@ -884,7 +1120,10 @@ kzt_loader_event_hook_test = executable(
     'kzt/test_loader_event_hook.c',
     '../../target/i386/latx/context/kzt_loader_event_hook.c',
   ),
-  c_args: ['-DKZT_LOADER_EVENT_HOOK_TEST'],
+  c_args: [
+    '-DCONFIG_LATX_KZT',
+    '-DKZT_LOADER_EVENT_HOOK_TEST',
+  ],
   include_directories: include_directories('../..', '../../target/i386/latx/include'),
 )
 
@@ -899,6 +1138,7 @@ kzt_lifecycle_snapshot_capacity_test = executable(
     '../../target/i386/latx/context/kzt_guest_registry.c',
   ),
   c_args: [
+    '-DCONFIG_LATX_KZT',
     '-DKZT_LOADER_EVENT_HOOK_TEST',
     '-DKZT_LOADER_LIFECYCLE_SNAPSHOT_TEST',
   ],
@@ -948,6 +1188,15 @@ test(
   python3,
   args: [
     files('kzt/test_wi987_guest_relocation_authority_source_contract.py'),
+    meson.source_root(),
+  ],
+)
+
+test(
+  'kzt-wi1095-eager-transaction-source-contract',
+  python3,
+  args: [
+    files('kzt/test_wi1095_eager_transaction_source_contract.py'),
     meson.source_root(),
   ],
 )
@@ -1006,17 +1255,6 @@ test(
   ],
 )
 
-kzt_wi256_lazy_binding_test = executable(
-  'kzt-wi256-lazy-binding',
-  files(
-    'kzt/test_wi256_lazy_binding.c',
-    '../../target/i386/latx/context/kzt_lazy_binding.c',
-  ),
-  include_directories: include_directories('../..', '../../target/i386/latx/include'),
-)
-
-test('kzt-wi256-lazy-binding', kzt_wi256_lazy_binding_test)
-
 kzt_wi837_lazy_direct_route_test = executable(
   'kzt-wi837-lazy-direct-route',
   files(
@@ -1027,27 +1265,6 @@ kzt_wi837_lazy_direct_route_test = executable(
 )
 
 test('kzt-wi837-lazy-direct-route', kzt_wi837_lazy_direct_route_test)
-
-kzt_wi256_lazy_diagnostics_test = executable(
-  'kzt-wi256-lazy-diagnostics',
-  files(
-    'kzt/test_wi256_lazy_diagnostics.c',
-    '../../target/i386/latx/context/kzt_lazy_diagnostics.c',
-  ),
-  c_args: ['-DCONFIG_LATX_KZT'],
-  include_directories: include_directories('../..', '../../target/i386/latx/include'),
-)
-
-test('kzt-wi256-lazy-diagnostics', kzt_wi256_lazy_diagnostics_test)
-
-test(
-  'kzt-wi256-lazy-diagnostics-source-contract',
-  python3,
-  args: [
-    files('kzt/test_wi256_lazy_diagnostics_source_contract.py'),
-    meson.source_root(),
-  ],
-)
 
 kzt_wi256_plt_resolver_adapter_test = executable(
   'kzt-wi256-plt-resolver-adapter',
@@ -1067,7 +1284,6 @@ kzt_wi256_lazy_production_bridge_test = executable(
   files(
     'kzt/test_wi256_lazy_production_bridge.c',
     'kzt/kzt_test_options.c',
-    '../../target/i386/latx/context/kzt_lazy_binding.c',
     '../../target/i386/latx/context/kzt_lazy_prebind_scope.c',
     '../../target/i386/latx/context/kzt_lazy_direct_route.c',
     '../../target/i386/latx/context/kzt_jump_slot_production.c',
@@ -1105,7 +1321,8 @@ kzt_wi256_lazy_production_bridge_test = executable(
 )
 
 test('kzt-wi256-lazy-production-bridge',
-     kzt_wi256_lazy_production_bridge_test)
+     kzt_wi256_lazy_production_bridge_test,
+     timeout: 120)
 
 test(
   'kzt-wi256-plt-resolver-source-contract',

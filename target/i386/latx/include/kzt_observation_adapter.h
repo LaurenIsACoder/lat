@@ -21,6 +21,7 @@ typedef enum kzt_observation_adapter_result {
     KZT_OBSERVATION_ADAPTER_CONFLICT,
     KZT_OBSERVATION_ADAPTER_READER_FAILED,
     KZT_OBSERVATION_ADAPTER_REGISTRY_FAILED,
+    KZT_OBSERVATION_ADAPTER_PER_OBJECT_FAILED,
 } kzt_observation_adapter_result_t;
 
 typedef int (*kzt_observation_legacy_flow_fn)(uintptr_t link_map_addr,

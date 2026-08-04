@@ -6,11 +6,23 @@
 
 #include "kzt_guest_scope_layout.h"
 
+typedef struct box64context_s box64context_t;
+
 #define KZT_LOADER_EVENT_HOOK_BUILD_ID_SIZE 41
-#define KZT_LOADER_EVENT_HOOK_SUPPORTED_BUILD_ID \
+#define KZT_LOADER_EVENT_HOOK_GLIBC_2_28_BUILD_ID \
+    "3b10a1b21d87ee3af8da437bce08fe1ca1a0aaff"
+#define KZT_LOADER_EVENT_HOOK_GLIBC_2_39_BUILD_ID \
     "c591a5df63f461bfdafb01908ca16845b375fa37"
+#define KZT_LOADER_EVENT_HOOK_SUPPORTED_BUILD_ID \
+    KZT_LOADER_EVENT_HOOK_GLIBC_2_39_BUILD_ID
 #define KZT_LOADER_EVENT_HOOK_DEBUG_STATE_OFFSET 0x3630
 #define KZT_LOADER_EVENT_HOOK_R_DEBUG_OFFSET 0x36e58
+
+typedef struct kzt_loader_event_layout {
+    kzt_guest_scope_layout_t scope_layout;
+    uintptr_t debug_state_offset;
+    uintptr_t r_debug_offset;
+} kzt_loader_event_layout_t;
 
 typedef enum kzt_loader_event_hook_result {
     KZT_LOADER_EVENT_HOOK_INSTALLED = 0,
@@ -42,6 +54,8 @@ typedef struct kzt_loader_event_hook {
     unsigned int lifecycle_lock;
     unsigned int lifecycle_publishers;
     unsigned int lifecycle_result;
+    unsigned int lifecycle_confirmed;
+    unsigned int lifecycle_failed;
     size_t pending_delete_count;
     size_t pending_delete_capacity;
     struct kzt_loader_lifecycle_identity *pending_delete;
@@ -72,7 +86,7 @@ typedef int (*kzt_loader_lifecycle_resolve_fn)(
 typedef int (*kzt_loader_lifecycle_transition_fn)(
     const kzt_loader_lifecycle_identity_t *identity,
     void *opaque);
-typedef void (*kzt_loader_lifecycle_unload_fn)(
+typedef int (*kzt_loader_lifecycle_unload_fn)(
     const kzt_loader_lifecycle_identity_t *identity,
     void *opaque);
 
@@ -80,6 +94,9 @@ typedef void (*kzt_loader_lifecycle_unload_fn)(
  * outside the publish path, which only releases an already-authorized event. */
 int kzt_loader_event_hook_read_build_id(
     const char *path, char build_id[KZT_LOADER_EVENT_HOOK_BUILD_ID_SIZE]);
+
+int kzt_loader_event_hook_lookup_layout(
+    const char *build_id, kzt_loader_event_layout_t *layout);
 
 int kzt_loader_event_hook_install(kzt_loader_event_hook_t *hook,
                                   const char *build_id,
@@ -111,6 +128,8 @@ int kzt_loader_event_hook_publish_lifecycle(
     kzt_loader_lifecycle_unload_fn unload,
     void *opaque);
 int kzt_loader_event_hook_destroy(kzt_loader_event_hook_t *hook);
+void kzt_loader_event_hook_context_init(kzt_loader_event_hook_t *hook);
+void kzt_loader_event_hook_context_destroy(kzt_loader_event_hook_t *hook);
 
 kzt_guest_scope_layout_t kzt_loader_event_hook_scope_layout(
     const kzt_loader_event_hook_t *hook);
@@ -120,6 +139,9 @@ const char *kzt_loader_event_hook_result_name(
 
 kzt_loader_lifecycle_result_t kzt_loader_event_hook_lifecycle_result(
     const kzt_loader_event_hook_t *hook);
+int kzt_loader_event_hook_lifecycle_healthy(
+    const kzt_loader_event_hook_t *hook);
+int kzt_loader_lifecycle_runtime_healthy(box64context_t *context);
 
 const char *kzt_loader_lifecycle_result_name(
     kzt_loader_lifecycle_result_t result);

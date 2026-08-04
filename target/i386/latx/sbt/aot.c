@@ -29,6 +29,11 @@
 #include<sys/syscall.h>
 #include "exec/translate-all.h"
 #include "latx-smc.h"
+#ifdef CONFIG_LATX_KZT
+#include "kzt_guest_runtime_entry.h"
+extern uintptr_t kzt_xcb_guard_acquire_for_bridge(
+    CPUX86State *env, uintptr_t guest);
+#endif
 #ifdef CONFIG_LATX_AOT
 /* Tbs vector with @tb_num@ elements. */
 static TranslationBlock **tb_vector;
@@ -1334,6 +1339,12 @@ static void* relkind_to_fixup_addr[] = {
     [LOAD_HELPER_CVTPH2PS_XMM] = helper_cvtph2ps_xmm,
     [LOAD_HELPER_CVTPS2PH_YMM] = helper_cvtps2ph_ymm,
     [LOAD_HELPER_CVTPS2PH_XMM] = helper_cvtps2ph_xmm,
+#endif
+#ifdef CONFIG_LATX_KZT
+    [LOAD_HELPER_KZT_RUNTIME_GUEST_ENTRY] =
+        kzt_runtime_guest_entry_or_abort,
+    [LOAD_HELPER_KZT_XCB_GUARD_ACQUIRE] =
+        kzt_xcb_guard_acquire_for_bridge,
 #endif
 
 

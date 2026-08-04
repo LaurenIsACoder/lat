@@ -12,7 +12,10 @@ typedef struct fake_library {
     uintptr_t bridge_target;
     uintptr_t add_target;
     uintptr_t post_add_target;
+    uintptr_t guest_fallback_target;
+    kzt_bridge_guard_kind_t guard_kind;
     int bridge_exact;
+    int guarded_absent_from_map;
     int lifetime_bound;
     int inspect_calls;
     int check_calls;
@@ -75,6 +78,8 @@ static int fake_inspect(
     match->wrapper_provider_lifetime_bound = lib->lifetime_bound;
     match->native_owner_lifetime_bound = lib->lifetime_bound;
     match->bridge_owner_lifetime_bound = lib->lifetime_bound;
+    match->guest_fallback_target = lib->guest_fallback_target;
+    match->guard_kind = lib->guard_kind;
     return 1;
 }
 
@@ -99,8 +104,10 @@ static uintptr_t fake_add(
         return 0;
     }
     ++lib->add_calls;
-    lib->bridge_target = lib->post_add_target ? lib->post_add_target :
-                                               lib->add_target;
+    if (!lib->guarded_absent_from_map) {
+        lib->bridge_target = lib->post_add_target ? lib->post_add_target :
+                                                   lib->add_target;
+    }
     return lib->add_target;
 }
 
@@ -361,6 +368,46 @@ static void test_created_bridge_must_match_recheck(void)
     check_int("inexact-created.add-once", inexact.add_calls, 1);
 }
 
+static void test_guarded_created_bridge_does_not_require_map_recheck(void)
+{
+    fake_library_t guarded = {
+        .inspect_status = 1,
+        .name = "libgtk-3.so.0",
+        .native_symbol = 0x71000000,
+        .add_target = 0x72000000,
+        .guest_fallback_target = 0x73000000,
+        .guard_kind = KZT_BRIDGE_GUARD_XCB_CONNECTION,
+        .guarded_absent_from_map = 1,
+        .lifetime_bound = 1,
+    };
+    void *libraries[] = { &guarded };
+    kzt_wrapper_bridge_provider_runtime_ops_t ops = fake_ops();
+    kzt_wrapper_bridge_provider_t provider;
+    kzt_wrapper_probe_result_t result;
+    kzt_wrapper_probe_request_t request = {
+        .symbol_name = "gtk_widget_show",
+        .symbol_version = "GTK_3.0",
+    };
+
+    check_int("guarded.prepare",
+              kzt_wrapper_bridge_provider_prepare(
+                  &provider, libraries, 1, request.symbol_name,
+                  request.symbol_version, &ops),
+              1);
+    check_int("guarded.probe",
+              kzt_wrapper_probe_minimal_manifest(
+                  &provider.manifest, &request, &provider.bridge_ops,
+                  &result),
+              0);
+    check_ulong("guarded.bridge", result.bridge_target,
+                guarded.add_target);
+    check_int("guarded.bridge-source", result.bridge_source,
+              KZT_WRAPPER_PROBE_BRIDGE_ADD_BRIDGE);
+    check_int("guarded.initial-check-only", guarded.check_calls, 1);
+    check_int("guarded.add-once", guarded.add_calls, 1);
+    check_ulong("guarded.map-remains-empty", guarded.bridge_target, 0);
+}
+
 int main(void)
 {
     test_exact_unique_candidate_builds_temporary_provider();
@@ -370,6 +417,7 @@ int main(void)
     test_bridge_abi_conflict_fails_open_without_add();
     test_missing_bridge_is_created_then_rechecked();
     test_created_bridge_must_match_recheck();
+    test_guarded_created_bridge_does_not_require_map_recheck();
 
     if (failures) {
         fprintf(stderr, "kzt-wrapper-bridge-provider: %d failure(s)\n",

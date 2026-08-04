@@ -65,6 +65,7 @@ void kzt_guest_dl_api_bind_current_thread(kzt_guest_dlerror_state_t *state);
 
 void kzt_guest_dl_api_free_errors(kzt_guest_dlerror_state_t *state);
 int kzt_guest_dl_api_entry_state_init(dlprivate_t *dl);
+void kzt_guest_dl_api_entry_state_begin_teardown(dlprivate_t *dl);
 void kzt_guest_dl_api_entry_state_destroy(dlprivate_t *dl);
 static inline const kzt_guest_dl_entries_t *
 kzt_guest_dl_api_load_entries(dlprivate_t *dl)
@@ -119,7 +120,8 @@ kzt_guest_dl_symbol_result_t kzt_guest_dl_api_dlvsym(
     box64context_t *context, const kzt_guest_dl_entries_t *entries,
     void *handle, void *symbol, const char *version);
 kzt_guest_dlerror_result_t kzt_guest_dl_api_dlerror(
-    kzt_guest_dlerror_state_t *state, uintptr_t guest_dlerror);
+    kzt_guest_dlerror_state_t *state, uintptr_t guest_dlerror,
+    int guest_route_may_have_pending_error);
 int kzt_guest_dl_api_dlinfo(
     const kzt_guest_dl_entries_t *entries,
     void *handle, int request, void *info);

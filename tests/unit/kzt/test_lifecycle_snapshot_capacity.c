@@ -140,22 +140,27 @@ static int cancel_unload(
     return 0;
 }
 
-static void finish_unload(
+static int finish_unload(
     const kzt_loader_lifecycle_identity_t *identity,
     void *opaque)
 {
     lifecycle_fixture_t *fixture = opaque;
+    int status;
     kzt_guest_loader_identity_t unload = {
         .link_map_addr = identity->link_map_addr,
         .generation = identity->generation,
         .namespace_id = identity->namespace_id,
     };
 
-    CHECK("finish loader unload",
-          kzt_guest_registry_finish_loader_unload(
-              fixture->registry, &unload) == 0);
+    status = kzt_guest_registry_finish_loader_unload(
+        fixture->registry, &unload);
+    CHECK("finish loader unload", status == 0);
+    if (status != 0) {
+        return -1;
+    }
     fixture->unloaded = *identity;
     ++fixture->unload_calls;
+    return 0;
 }
 
 static void link_maps(test_link_map_chain_x64_t *maps, size_t count)

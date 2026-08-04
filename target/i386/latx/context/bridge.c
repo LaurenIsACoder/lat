@@ -25,6 +25,42 @@
 
 KHASH_MAP_INIT_INT64(bridgemap, uintptr_t)
 
+typedef struct guarded_bridge_key_s {
+    wrapper_t wrapper;
+    uintptr_t function;
+    int stack_bytes;
+    uintptr_t guest_fallback_target;
+    kzt_bridge_guard_kind_t guard_kind;
+} guarded_bridge_key_t;
+
+static khint_t guarded_bridge_key_hash(guarded_bridge_key_t key)
+{
+    uint64_t hash = (uintptr_t)key.wrapper;
+
+    hash ^= key.function + UINT64_C(0x9e3779b97f4a7c15) +
+            (hash << 6) + (hash >> 2);
+    hash ^= (uint32_t)key.stack_bytes + UINT64_C(0x9e3779b97f4a7c15) +
+            (hash << 6) + (hash >> 2);
+    hash ^= key.guest_fallback_target + UINT64_C(0x9e3779b97f4a7c15) +
+            (hash << 6) + (hash >> 2);
+    hash ^= (uint32_t)key.guard_kind + UINT64_C(0x9e3779b97f4a7c15) +
+            (hash << 6) + (hash >> 2);
+    return kh_int64_hash_func(hash);
+}
+
+static int guarded_bridge_key_equal(guarded_bridge_key_t left,
+                                    guarded_bridge_key_t right)
+{
+    return left.wrapper == right.wrapper &&
+           left.function == right.function &&
+           left.stack_bytes == right.stack_bytes &&
+           left.guest_fallback_target == right.guest_fallback_target &&
+           left.guard_kind == right.guard_kind;
+}
+
+KHASH_INIT(guardedbridgemap, guarded_bridge_key_t, uintptr_t, 1,
+           guarded_bridge_key_hash, guarded_bridge_key_equal)
+
 //onebridge is 32 bytes
 #define NBRICK  4096/sizeof(onebridge_t)
 typedef struct brick_s brick_t;
@@ -39,6 +75,7 @@ typedef struct bridge_s {
     brick_t         *head;
     brick_t         *last;      // to speed up
     kh_bridgemap_t  *bridgemap;
+    kh_guardedbridgemap_t *guardedmap;
     struct bridge_s *fork_next;
 } bridge_t;
 
@@ -220,6 +257,7 @@ bridge_t *NewBridge(void)
     b->head = NewBrick();
     b->last = b->head;
     b->bridgemap = kh_init(bridgemap);
+    b->guardedmap = kh_init(guardedbridgemap);
     pthread_mutex_lock(&bridge_fork_lock);
     b->fork_next = fork_bridges;
     fork_bridges = b;
@@ -256,6 +294,7 @@ void FreeBridge(bridge_t** bridge)
         b = n;
     }
     kh_destroy(bridgemap, current->bridgemap);
+    kh_destroy(guardedbridgemap, current->guardedmap);
     *bridge = NULL;
     pthread_mutex_unlock(&current->lock);
     pthread_mutex_destroy(&current->lock);
@@ -264,7 +303,9 @@ void FreeBridge(bridge_t** bridge)
 }
 
 static uintptr_t bridge_add_locked(bridge_t* bridge, wrapper_t w, void* fnc,
-                                   int N, const char* name)
+                                   int N, const char* name, int add_to_map,
+                                   uintptr_t guest_fallback_target,
+                                   kzt_bridge_guard_kind_t guard_kind)
 {
     brick_t *b = NULL;
     int sz = -1;
@@ -282,10 +323,14 @@ static uintptr_t bridge_add_locked(bridge_t* bridge, wrapper_t w, void* fnc,
     b->b[sz].f = (uintptr_t)fnc;
     b->b[sz].C3 = N?0xC2:0xC3;
     b->b[sz].N = N;
-    // add bridge to map, for fast recovery
-    int ret;
-    khint_t k = kh_put(bridgemap, bridge->bridgemap, (uintptr_t)fnc, &ret);
-    kh_value(bridge->bridgemap, k) = (uintptr_t)&b->b[sz].CC;
+    b->b[sz].guest_fallback_target = guest_fallback_target;
+    b->b[sz].guard_kind = guard_kind;
+    if (add_to_map) {
+        // add bridge to map, for fast recovery
+        int ret;
+        khint_t k = kh_put(bridgemap, bridge->bridgemap, (uintptr_t)fnc, &ret);
+        kh_value(bridge->bridgemap, k) = (uintptr_t)&b->b[sz].CC;
+    }
 
     return (uintptr_t)&b->b[sz].CC;
 }
@@ -307,10 +352,70 @@ uintptr_t AddBridge(bridge_t* bridge, wrapper_t w, void* fnc, int N, const char*
         return 0;
     }
     pthread_mutex_lock(&bridge->lock);
-    ret = bridge_add_locked(bridge, w, fnc, N, name);
+    ret = bridge_add_locked(bridge, w, fnc, N, name, 1, 0,
+                            KZT_BRIDGE_GUARD_NONE);
     pthread_mutex_unlock(&bridge->lock);
     return ret;
 }
+
+uintptr_t AddGuardedBridge(bridge_t* bridge, wrapper_t w, void* fnc, int N,
+                           const char* name, uintptr_t fallback,
+                           kzt_bridge_guard_kind_t guard_kind)
+{
+    guarded_bridge_key_t key;
+    khint_t entry;
+    int insert_status;
+    uintptr_t ret;
+
+    if (!bridge || !w || !fnc || !fallback ||
+        guard_kind != KZT_BRIDGE_GUARD_XCB_CONNECTION) {
+        return 0;
+    }
+    key = (guarded_bridge_key_t) {
+        .wrapper = w,
+        .function = (uintptr_t)fnc,
+        .stack_bytes = N,
+        .guest_fallback_target = fallback,
+        .guard_kind = guard_kind,
+    };
+    pthread_mutex_lock(&bridge->lock);
+    if (!bridge->guardedmap) {
+        pthread_mutex_unlock(&bridge->lock);
+        return 0;
+    }
+    entry = kh_get(guardedbridgemap, bridge->guardedmap, key);
+    if (entry != kh_end(bridge->guardedmap)) {
+        ret = kh_value(bridge->guardedmap, entry);
+        pthread_mutex_unlock(&bridge->lock);
+        return ret;
+    }
+    entry = kh_put(guardedbridgemap, bridge->guardedmap, key,
+                   &insert_status);
+    if (insert_status < 0) {
+        pthread_mutex_unlock(&bridge->lock);
+        return 0;
+    }
+    ret = bridge_add_locked(bridge, w, fnc, N, name, 0, fallback,
+                            guard_kind);
+    kh_value(bridge->guardedmap, entry) = ret;
+    pthread_mutex_unlock(&bridge->lock);
+    return ret;
+}
+
+#ifdef BRIDGE_TEST
+int bridge_test_guarded_count(bridge_t *bridge)
+{
+    int count;
+
+    if (!bridge) {
+        return 0;
+    }
+    pthread_mutex_lock(&bridge->lock);
+    count = bridge->guardedmap ? kh_size(bridge->guardedmap) : 0;
+    pthread_mutex_unlock(&bridge->lock);
+    return count;
+}
+#endif
 
 uintptr_t CheckBridged(bridge_t* bridge, void* fnc)
 {
@@ -342,7 +447,8 @@ uintptr_t AddCheckBridge(bridge_t* bridge, wrapper_t w, void* fnc, int N, const 
     }
 #endif
     if(!ret)
-        ret = bridge_add_locked(bridge, w, fnc, N, name);
+        ret = bridge_add_locked(bridge, w, fnc, N, name, 1, 0,
+                                KZT_BRIDGE_GUARD_NONE);
     pthread_mutex_unlock(&bridge->lock);
     return ret;
 }
@@ -364,7 +470,8 @@ uintptr_t AddAutomaticBridge(bridge_t* bridge, wrapper_t w, void* fnc, int N)
     }
 #endif
     if(!ret)
-        ret = bridge_add_locked(bridge, w, fnc, N, NULL);
+        ret = bridge_add_locked(bridge, w, fnc, N, NULL, 1, 0,
+                                KZT_BRIDGE_GUARD_NONE);
     pthread_mutex_unlock(&bridge->lock);
     if(alternate_add_if_absent(fnc, (void*)ret)) {
         printf_log(LOG_DEBUG, "Adding AutomaticBridge for %p to %p\n", fnc, (void*)ret);
@@ -399,6 +506,8 @@ void* GetNativeFnc(uintptr_t fnc)
     onebridge_t *b = (onebridge_t*)fnc;
     if(b->CC != 0xCC || b->S!='S' || b->C!='C' || (b->C3!=0xC3 && b->C3!=0xC2))
         return NULL;    // not a bridge?!
+    if (b->guard_kind != KZT_BRIDGE_GUARD_NONE)
+        return NULL;
     return (void*)b->f;
 }
 
@@ -407,6 +516,8 @@ void* GetNativeFncOrFnc(uintptr_t fnc)
     onebridge_t *b = (onebridge_t*)fnc;
     if(b->CC != 0xCC || b->S!='S' || b->C!='C' || (b->C3!=0xC3 && b->C3!=0xC2))
         return (void*)fnc;    // not a bridge?!
+    if (b->guard_kind != KZT_BRIDGE_GUARD_NONE)
+        return (void*)fnc;
     return (void*)b->f;
 }
 

@@ -1,5 +1,7 @@
 #include "kzt_loader_event_hook.h"
 
+#include "box64context.h"
+
 #include <elf.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,10 +71,39 @@ static void kzt_loader_event_hook_lifecycle_unlock(
     __atomic_clear(&hook->lifecycle_lock, __ATOMIC_RELEASE);
 }
 
+static int kzt_loader_event_hook_publisher_enter(
+    kzt_loader_event_hook_t *hook)
+{
+    if (!hook) {
+        return -1;
+    }
+    kzt_loader_event_hook_lifecycle_lock(hook);
+    if (!__atomic_load_n(&hook->lifecycle_enabled, __ATOMIC_ACQUIRE)) {
+        kzt_loader_event_hook_lifecycle_unlock(hook);
+        return -1;
+    }
+    __atomic_add_fetch(&hook->lifecycle_publishers, 1U, __ATOMIC_RELEASE);
+    kzt_loader_event_hook_lifecycle_unlock(hook);
+    return 0;
+}
+
 static int kzt_loader_event_hook_publisher_leave(
     kzt_loader_event_hook_t *hook, int result,
-    kzt_loader_lifecycle_result_t lifecycle_result)
+    kzt_loader_lifecycle_result_t lifecycle_result,
+    int consistent_snapshot)
 {
+    if (lifecycle_result == KZT_LOADER_LIFECYCLE_OK) {
+        if (consistent_snapshot &&
+            !__atomic_load_n(&hook->lifecycle_failed, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&hook->lifecycle_confirmed, 1U,
+                             __ATOMIC_RELEASE);
+        } else if (!consistent_snapshot) {
+            __atomic_store_n(&hook->lifecycle_confirmed, 0U,
+                             __ATOMIC_RELEASE);
+        }
+    } else {
+        __atomic_store_n(&hook->lifecycle_failed, 1U, __ATOMIC_RELEASE);
+    }
     __atomic_store_n(&hook->lifecycle_result, lifecycle_result,
                      __ATOMIC_RELEASE);
     __atomic_sub_fetch(&hook->lifecycle_publishers, 1U, __ATOMIC_RELEASE);
@@ -473,6 +504,35 @@ static int kzt_loader_event_hook_disabled(void)
     return value && strcmp(value, "0") == 0;
 }
 
+int kzt_loader_event_hook_lookup_layout(
+    const char *build_id, kzt_loader_event_layout_t *layout)
+{
+    if (!layout) {
+        return -1;
+    }
+    memset(layout, 0, sizeof(*layout));
+    if (!build_id) {
+        return -1;
+    }
+    if (strcmp(build_id, KZT_LOADER_EVENT_HOOK_GLIBC_2_39_BUILD_ID) == 0) {
+        *layout = (kzt_loader_event_layout_t) {
+            .scope_layout = KZT_GUEST_SCOPE_LAYOUT_GLIBC_2_39_C591A5DF,
+            .debug_state_offset = KZT_LOADER_EVENT_HOOK_DEBUG_STATE_OFFSET,
+            .r_debug_offset = KZT_LOADER_EVENT_HOOK_R_DEBUG_OFFSET,
+        };
+        return 0;
+    }
+    if (strcmp(build_id, KZT_LOADER_EVENT_HOOK_GLIBC_2_28_BUILD_ID) == 0) {
+        *layout = (kzt_loader_event_layout_t) {
+            .scope_layout = KZT_GUEST_SCOPE_LAYOUT_UNSUPPORTED,
+            .debug_state_offset = 0xfb10,
+            .r_debug_offset = 0x29160,
+        };
+        return 0;
+    }
+    return -1;
+}
+
 int kzt_loader_event_hook_pattern_allowed(int pattern_matched)
 {
     const char *value = getenv("LATX_KZT_LOADER_EVENT_FORCE_PATTERN_MISMATCH");
@@ -487,6 +547,7 @@ int kzt_loader_event_hook_install(kzt_loader_event_hook_t *hook,
                                   int pattern_matched)
 {
     kzt_loader_event_hook_result_t result = KZT_LOADER_EVENT_HOOK_INSTALLED;
+    kzt_loader_event_layout_t layout;
 
     if (!hook) {
         return -1;
@@ -496,7 +557,7 @@ int kzt_loader_event_hook_install(kzt_loader_event_hook_t *hook,
         result = KZT_LOADER_EVENT_HOOK_FAIL_OPEN_DISABLED;
     } else if (!build_id) {
         result = KZT_LOADER_EVENT_HOOK_FAIL_OPEN_BUILD_ID_READ;
-    } else if (strcmp(build_id, KZT_LOADER_EVENT_HOOK_SUPPORTED_BUILD_ID) != 0) {
+    } else if (kzt_loader_event_hook_lookup_layout(build_id, &layout) != 0) {
         result = KZT_LOADER_EVENT_HOOK_FAIL_OPEN_UNKNOWN_BUILD_ID;
     } else if (!pattern_matched || !callback_addr || link_map_reg > 15) {
         result = KZT_LOADER_EVENT_HOOK_FAIL_OPEN_PATTERN_MISMATCH;
@@ -508,7 +569,7 @@ int kzt_loader_event_hook_install(kzt_loader_event_hook_t *hook,
     memcpy(hook->build_id, build_id, KZT_LOADER_EVENT_HOOK_BUILD_ID_SIZE);
     hook->callback_addr = callback_addr;
     hook->link_map_reg = link_map_reg;
-    hook->scope_layout = KZT_GUEST_SCOPE_LAYOUT_GLIBC_2_39_C591A5DF;
+    hook->scope_layout = layout.scope_layout;
     __atomic_store_n(&hook->installed, 1U, __ATOMIC_RELEASE);
     return 0;
 }
@@ -550,6 +611,7 @@ int kzt_loader_event_hook_enable_lifecycle(
     pending = kzt_loader_event_hook_calloc(
         KZT_LOADER_LIFECYCLE_INLINE_IDENTITIES, sizeof(*pending));
     if (!pending) {
+        __atomic_store_n(&hook->lifecycle_failed, 1U, __ATOMIC_RELEASE);
         __atomic_store_n(&hook->lifecycle_result,
                          KZT_LOADER_LIFECYCLE_ALLOCATION,
                          __ATOMIC_RELEASE);
@@ -593,13 +655,8 @@ int kzt_loader_event_hook_publish_lifecycle(
     size_t i;
 
     if (!hook || !resolve || !prepare || !cancel || !unload ||
-        !__atomic_load_n(&hook->lifecycle_enabled, __ATOMIC_ACQUIRE)) {
+        kzt_loader_event_hook_publisher_enter(hook) != 0) {
         return -1;
-    }
-    __atomic_add_fetch(&hook->lifecycle_publishers, 1U, __ATOMIC_ACQUIRE);
-    if (!__atomic_load_n(&hook->lifecycle_enabled, __ATOMIC_ACQUIRE)) {
-        return kzt_loader_event_hook_publisher_leave(
-            hook, -1, KZT_LOADER_LIFECYCLE_DISABLED);
     }
     if (!kzt_loader_event_hook_live_maps_valid(live_maps, live_map_count) ||
         (state != KZT_LOADER_DEBUG_CONSISTENT &&
@@ -609,7 +666,7 @@ int kzt_loader_event_hook_publish_lifecycle(
         kzt_loader_lifecycle_cancel_buffer(&pending, cancel, opaque);
         kzt_loader_lifecycle_identity_buffer_release(&pending);
         return kzt_loader_event_hook_publisher_leave(
-            hook, -1, KZT_LOADER_LIFECYCLE_INVALID);
+            hook, -1, KZT_LOADER_LIFECYCLE_INVALID, 0);
     }
 
     if (state == KZT_LOADER_DEBUG_DELETE) {
@@ -621,7 +678,11 @@ int kzt_loader_event_hook_publish_lifecycle(
             if (resolve(live_maps[i], &identity, opaque) != 0 ||
                 identity.link_map_addr != live_maps[i] ||
                 !identity.generation || prepare(&identity, opaque) != 0) {
-                continue;
+                kzt_loader_lifecycle_cancel_buffer(
+                    &pending, cancel, opaque);
+                kzt_loader_lifecycle_identity_buffer_release(&pending);
+                return kzt_loader_event_hook_publisher_leave(
+                    hook, -1, KZT_LOADER_LIFECYCLE_INVALID, 0);
             }
             lifecycle_result =
                 kzt_loader_lifecycle_identity_buffer_append(
@@ -632,7 +693,7 @@ int kzt_loader_event_hook_publish_lifecycle(
                     &pending, cancel, opaque);
                 kzt_loader_lifecycle_identity_buffer_release(&pending);
                 return kzt_loader_event_hook_publisher_leave(
-                    hook, -1, lifecycle_result);
+                    hook, -1, lifecycle_result, 0);
             }
         }
         lifecycle_result = kzt_loader_event_hook_append_pending(
@@ -643,35 +704,42 @@ int kzt_loader_event_hook_publish_lifecycle(
         kzt_loader_lifecycle_identity_buffer_release(&pending);
         return kzt_loader_event_hook_publisher_leave(
             hook, lifecycle_result == KZT_LOADER_LIFECYCLE_OK ? 0 : -1,
-            lifecycle_result);
+            lifecycle_result, 0);
     }
     if (state == KZT_LOADER_DEBUG_ADD) {
         return kzt_loader_event_hook_publisher_leave(
-            hook, 0, KZT_LOADER_LIFECYCLE_OK);
+            hook, 0, KZT_LOADER_LIFECYCLE_OK, 0);
     }
 
     kzt_loader_event_hook_take_pending(hook, &pending);
 
+    lifecycle_result = KZT_LOADER_LIFECYCLE_OK;
     for (i = 0; i < pending.count; ++i) {
         kzt_loader_lifecycle_identity_t current = { 0 };
+        int transition_result;
 
         if (!kzt_loader_event_hook_map_present(
                 pending.identities[i].link_map_addr,
                 live_maps, live_map_count)) {
-            unload(&pending.identities[i], opaque);
-        } else if (resolve(
-                       pending.identities[i].link_map_addr,
-                       &current, opaque) == 0 &&
-                   !kzt_loader_lifecycle_identity_equal(
+            transition_result = unload(&pending.identities[i], opaque);
+        } else if (resolve(pending.identities[i].link_map_addr,
+                           &current, opaque) != 0) {
+            transition_result = cancel(&pending.identities[i], opaque);
+            lifecycle_result = KZT_LOADER_LIFECYCLE_INVALID;
+        } else if (!kzt_loader_lifecycle_identity_equal(
                        &pending.identities[i], &current)) {
-            unload(&pending.identities[i], opaque);
+            transition_result = unload(&pending.identities[i], opaque);
         } else {
-            (void)cancel(&pending.identities[i], opaque);
+            transition_result = cancel(&pending.identities[i], opaque);
+        }
+        if (transition_result != 0) {
+            lifecycle_result = KZT_LOADER_LIFECYCLE_INVALID;
         }
     }
     kzt_loader_lifecycle_identity_buffer_release(&pending);
     return kzt_loader_event_hook_publisher_leave(
-        hook, 0, KZT_LOADER_LIFECYCLE_OK);
+        hook, lifecycle_result == KZT_LOADER_LIFECYCLE_OK ? 0 : -1,
+        lifecycle_result, 1);
 }
 
 int kzt_loader_event_hook_destroy(kzt_loader_event_hook_t *hook)
@@ -679,7 +747,9 @@ int kzt_loader_event_hook_destroy(kzt_loader_event_hook_t *hook)
     if (!hook) {
         return -1;
     }
+    kzt_loader_event_hook_lifecycle_lock(hook);
     __atomic_store_n(&hook->lifecycle_enabled, 0U, __ATOMIC_RELEASE);
+    kzt_loader_event_hook_lifecycle_unlock(hook);
     while (__atomic_load_n(&hook->lifecycle_publishers, __ATOMIC_ACQUIRE)) {
     }
     kzt_loader_event_hook_lifecycle_lock(hook);
@@ -699,14 +769,39 @@ int kzt_loader_event_hook_destroy(kzt_loader_event_hook_t *hook)
     return 0;
 }
 
+void kzt_loader_event_hook_context_init(kzt_loader_event_hook_t *hook)
+{
+    if (hook) {
+        memset(hook, 0, sizeof(*hook));
+    }
+}
+
+void kzt_loader_event_hook_context_destroy(kzt_loader_event_hook_t *hook)
+{
+    if (!hook) {
+        return;
+    }
+    kzt_loader_event_hook_lifecycle_lock(hook);
+    __atomic_store_n(&hook->lifecycle_enabled, 0U, __ATOMIC_RELEASE);
+    kzt_loader_event_hook_lifecycle_unlock(hook);
+    while (__atomic_load_n(&hook->lifecycle_publishers, __ATOMIC_ACQUIRE)) {
+    }
+    kzt_loader_event_hook_lifecycle_lock(hook);
+    free(hook->pending_delete);
+    hook->pending_delete = NULL;
+    hook->pending_delete_count = 0;
+    hook->pending_delete_capacity = 0;
+    kzt_loader_event_hook_lifecycle_unlock(hook);
+    memset(hook, 0, sizeof(*hook));
+}
+
 kzt_guest_scope_layout_t kzt_loader_event_hook_scope_layout(
     const kzt_loader_event_hook_t *hook)
 {
     if (!hook ||
         !__atomic_load_n(&hook->installed, __ATOMIC_ACQUIRE) ||
         hook->result != KZT_LOADER_EVENT_HOOK_INSTALLED ||
-        strcmp(hook->build_id,
-               KZT_LOADER_EVENT_HOOK_SUPPORTED_BUILD_ID) != 0) {
+        hook->scope_layout == KZT_GUEST_SCOPE_LAYOUT_UNSUPPORTED) {
         return KZT_GUEST_SCOPE_LAYOUT_UNSUPPORTED;
     }
     return hook->scope_layout;
@@ -738,6 +833,26 @@ kzt_loader_lifecycle_result_t kzt_loader_event_hook_lifecycle_result(
     }
     return __atomic_load_n(&hook->lifecycle_result, __ATOMIC_ACQUIRE);
 }
+
+int kzt_loader_event_hook_lifecycle_healthy(
+    const kzt_loader_event_hook_t *hook)
+{
+    return hook &&
+           __atomic_load_n(&hook->installed, __ATOMIC_ACQUIRE) &&
+           __atomic_load_n(&hook->lifecycle_enabled, __ATOMIC_ACQUIRE) &&
+           __atomic_load_n(&hook->lifecycle_confirmed, __ATOMIC_ACQUIRE) &&
+           !__atomic_load_n(&hook->lifecycle_failed, __ATOMIC_ACQUIRE) &&
+           kzt_loader_event_hook_lifecycle_result(hook) ==
+               KZT_LOADER_LIFECYCLE_OK;
+}
+
+#ifdef CONFIG_LATX_KZT
+int kzt_loader_lifecycle_runtime_healthy(box64context_t *context)
+{
+    return context && kzt_loader_event_hook_lifecycle_healthy(
+                          &context->kzt_loader_event_hook);
+}
+#endif
 
 const char *kzt_loader_lifecycle_result_name(
     kzt_loader_lifecycle_result_t result)

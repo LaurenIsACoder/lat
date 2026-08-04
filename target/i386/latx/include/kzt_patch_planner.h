@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "kzt_xcb_route_policy.h"
+
 typedef enum kzt_patch_table_kind {
     KZT_PATCH_TABLE_UNKNOWN = 0,
     KZT_PATCH_TABLE_RELA,
@@ -161,7 +163,36 @@ int kzt_patch_planner_decide(const kzt_patch_candidate_t *candidate,
 static inline int kzt_patch_symbol_must_stay_guest(
     const char *symbol_name)
 {
-    return symbol_name && strcmp(symbol_name, "dlclose") == 0;
+    return symbol_name &&
+           (strcmp(symbol_name, "dlclose") == 0 ||
+            strcmp(symbol_name, "free") == 0 ||
+            strcmp(symbol_name, "__free") == 0 ||
+            strcmp(symbol_name, "__libc_free") == 0 ||
+            strcmp(symbol_name, "realloc") == 0 ||
+            strcmp(symbol_name, "XOpenDisplay") == 0 ||
+            strcmp(symbol_name, "XSetEventQueueOwner") == 0 ||
+            kzt_xcb_route_must_stay_guest(symbol_name));
+}
+
+static inline int kzt_patch_symbol_requires_dlerror_prebind(
+    const char *symbol_name)
+{
+    return symbol_name &&
+           (strcmp(symbol_name, "dlopen") == 0 ||
+            strcmp(symbol_name, "dlmopen") == 0 ||
+            strcmp(symbol_name, "dlsym") == 0 ||
+            strcmp(symbol_name, "dlvsym") == 0 ||
+            strcmp(symbol_name, "dlinfo") == 0 ||
+            strcmp(symbol_name, "dladdr") == 0 ||
+            strcmp(symbol_name, "dladdr1") == 0);
+}
+
+static inline int kzt_patch_symbol_is_loader_route_family(
+    const char *symbol_name)
+{
+    return symbol_name &&
+           (strcmp(symbol_name, "dlerror") == 0 ||
+            kzt_patch_symbol_requires_dlerror_prebind(symbol_name));
 }
 
 const char *kzt_patch_decision_kind_name(kzt_patch_decision_kind_t kind);

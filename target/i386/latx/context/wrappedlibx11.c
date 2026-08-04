@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <pthread.h>
 
 #include "wrappedlibs.h"
 
@@ -21,6 +22,7 @@
 #include "callback.h"
 #include "librarian.h"
 #include "box64context.h"
+#include "kzt_guest_cancel_scope.h"
 #include "myalign.h"
 #include "wrappertbbridge.h"
 
@@ -1187,7 +1189,6 @@ void sub_image_wrapper(uintptr_t fnc)
 #undef R_RDX
 #undef R_RCX
 #undef R_R8
-extern void * x86free;
 abi_ulong latx_is_shm(abi_ulong maddr);
 EXPORT void* my_XCreateImage(void* disp, void* vis, uint32_t depth, int32_t fmt, int32_t off
                     , void* data, uint32_t w, uint32_t h, int32_t pad, int32_t bpl)
@@ -1253,11 +1254,34 @@ EXPORT void my_XDestroyImage(void* image)
     XImage* img = image;
     if (img->data && (uintptr_t)img->data  < reserved_va &&
         !latx_is_shm((abi_ulong)img->data)) {
-        size_t len = img->bytes_per_line * img->height;
-        void *la_data = malloc(len);
-        memcpy(la_data, img->data, len);
-        lsassert(x86free);
-        RunFunctionWithState((uintptr_t)x86free ,1, img->data);
+        kzt_guest_runtime_entry_scope_t guest_free = { 0 };
+        size_t len;
+        void *la_data;
+
+        if (img->bytes_per_line < 0 || img->height < 0 ||
+            (img->height &&
+             (size_t)img->bytes_per_line > SIZE_MAX / (size_t)img->height) ||
+            kzt_guest_runtime_entry_acquire(
+                my_context, KZT_GUEST_RUNTIME_FREE, &guest_free) != 0) {
+            printf_log(
+                LOG_NONE,
+                "KZT: cannot safely destroy XImage guest-owned data\n");
+            abort();
+        }
+        len = (size_t)img->bytes_per_line * (size_t)img->height;
+        la_data = malloc(len ? len : 1);
+        if (!la_data) {
+            kzt_guest_runtime_entry_release(&guest_free);
+            printf_log(
+                LOG_NONE,
+                "KZT: cannot allocate native XImage destruction buffer\n");
+            abort();
+        }
+        if (len) {
+            memcpy(la_data, img->data, len);
+        }
+        RunFunctionWithState(guest_free.address, 1, img->data);
+        kzt_guest_runtime_entry_release(&guest_free);
         img->data = la_data;
     }
     my->XDestroyImage(image);
@@ -1454,6 +1478,34 @@ EXPORT void* my_XOpenDisplay(void* d)
     return ret;
 }
 
+EXPORT int32_t my_XCloseDisplay(my_XDisplay_t *dpy);
+EXPORT int32_t my_XCloseDisplay(my_XDisplay_t *dpy)
+{
+    kzt_xcb_connection_lease_t lease = { 0 };
+    void *native_xcb = dpy && dpy->xcb ? *dpy->xcb : NULL;
+    int old_cancel_state = PTHREAD_CANCEL_ENABLE;
+    int tracked = 0;
+    int32_t result;
+
+    (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel_state);
+    if (native_xcb) {
+        tracked = begin_xcb_connection_disconnect_native(
+            native_xcb, &lease) == 0;
+        if (!tracked) {
+            printf_kzt_registry_diagnostics(
+                "kzt_xcb_guard schema=1 phase=XCloseDisplay "
+                "native=%p result=FALLBACK reason=untracked_connection\n",
+                native_xcb);
+        }
+    }
+    result = my->XCloseDisplay(dpy);
+    if (tracked) {
+        finish_xcb_connection_disconnect(&lease);
+    }
+    (void)pthread_setcancelstate(old_cancel_state, NULL);
+    return result;
+}
+
 EXPORT void* my_XInternAtom(my_XDisplay_t* dpy, void* name, int32_t onlyIfExists);
 EXPORT void* my_XInternAtom(my_XDisplay_t* dpy, void* name, int32_t onlyIfExists)
 {
@@ -1503,16 +1555,17 @@ int latx_dpy_xcb_sync(void *v1)
     return sync_xcb_connection(*dpy->xcb);
 }
 
-extern void* x86pthread_setcanceltype;
 EXPORT int32_t my_XNextEvent(void* v1, void* v2);
 EXPORT int32_t my_XNextEvent(void* v1, void* v2)
 {
-    int oldtype;
+    kzt_guest_cancel_scope_t cancel = { 0 };
     int32_t ret;
-    uint64_t callbackret = RunFunctionWithState((uintptr_t)x86pthread_setcanceltype ,2, PTHREAD_CANCEL_ASYNCHRONOUS, &oldtype);
+
+    pthread_cleanup_push(kzt_guest_cancel_scope_cleanup, &cancel);
+    kzt_guest_cancel_scope_begin(my_context, &cancel);
     ret = my->XNextEvent(v1,v2);
-    callbackret = RunFunctionWithState((uintptr_t)x86pthread_setcanceltype ,2, oldtype, NULL);
-    (void)callbackret;
+    kzt_guest_cancel_scope_end(&cancel);
+    pthread_cleanup_pop(0);
     return ret;
 }
 

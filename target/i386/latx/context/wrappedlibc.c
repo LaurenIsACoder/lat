@@ -87,9 +87,6 @@ const char* libcName =
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmissing-prototypes"
-void* x86free;
-void* x86realloc;
-void* x86pthread_setcanceltype;
 typedef int (*iFi_t)(int);
 typedef int (*iFp_t)(void*);
 typedef int (*iFL_t)(unsigned long);
@@ -3657,16 +3654,20 @@ static uintptr_t kzt_guest_dlerror_entry_slow(box64context_t *context)
 static char *kzt_guest_dlerror_slow_path(
     box64context_t *context, CPUX86State *cpu,
     kzt_guest_dlerror_state_t *error_state,
-    uintptr_t guest_dlerror) __attribute__((noinline, cold));
+    uintptr_t guest_dlerror,
+    int guest_route_may_have_pending_error) __attribute__((noinline, cold));
 
 static char *kzt_guest_dlerror_slow_path(
     box64context_t *context, CPUX86State *cpu,
-    kzt_guest_dlerror_state_t *error_state, uintptr_t guest_dlerror)
+    kzt_guest_dlerror_state_t *error_state, uintptr_t guest_dlerror,
+    int guest_route_may_have_pending_error)
 {
     kzt_guest_dlerror_result_t result;
 
     if (kzt_guest_dl_api_dlerror_needs_slow_path(error_state)) {
-        result = kzt_guest_dl_api_dlerror(error_state, guest_dlerror);
+        result = kzt_guest_dl_api_dlerror(
+            error_state, guest_dlerror,
+            guest_route_may_have_pending_error);
         if (!result.forward_to_guest_caller) {
             return result.value;
         }
@@ -3688,6 +3689,8 @@ static char *kzt_guest_dlerror_slow_path(
 
 char* my_dlerror(void)
 {
+    int guest_loader_route = my_context && __atomic_load_n(
+        &my_context->kzt_guest_loader_route_present, __ATOMIC_ACQUIRE);
 #if defined(__loongarch__)
     register char *fast_result __asm__("r4") =
 #else
@@ -3697,14 +3700,18 @@ char* my_dlerror(void)
 
     /* Keep the clean sentinel in the return register across the cold test. */
     __asm__ volatile("" : "+r"(fast_result));
-    if (fast_result) {
+    if (fast_result || guest_loader_route) {
         dlprivate_t *dl = my_context->dlprivate;
         __MY_CPU;
         kzt_guest_dlerror_state_t *error_state = DLERROR_STATE(cpu, dl);
         uintptr_t guest_dlerror = error_state->guest_dlerror_entry;
 
+        if (guest_loader_route) {
+            kzt_guest_dl_api_set_slow_required(error_state, 1);
+        }
         return kzt_guest_dlerror_slow_path(
-            my_context, cpu, error_state, guest_dlerror);
+            my_context, cpu, error_state, guest_dlerror,
+            guest_loader_route);
     }
     return fast_result;
 }

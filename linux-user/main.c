@@ -90,8 +90,8 @@ int fix_64bit_inodes = 0;
 int box64_nopulse = 0;
 int box64_novulkan = 0;
 char* libGL = NULL;
-int kzt_init(char** argv, int argc,char** target_argv, int  target_argc,
-    struct linux_binprm* bprm);
+int kzt_init(CPUX86State *env, char** argv, int argc, char** target_argv,
+    int target_argc, struct linux_binprm* bprm);
 void kzt_bridge_init(void);
 int is_user_map = 0;
 #endif
@@ -1562,7 +1562,7 @@ int main(int argc, char **argv, char **envp)
         }
 #endif
 #if defined(CONFIG_LATX_KZT) && defined(TARGET_X86_64)
-    kzt_init(argv, argc, target_argv, target_argc, &bprm);
+    kzt_init(env, argv, argc, target_argv, target_argc, &bprm);
 #endif
     for (wrk = target_environ; *wrk; wrk++) {
         g_free(*wrk);

@@ -15,6 +15,21 @@ static int kzt_wrapper_bridge_provider_string_equal(const char *left,
            strcmp(left, right) == 0;
 }
 
+static int kzt_wrapper_bridge_provider_guard_valid(
+    const kzt_wrapper_bridge_provider_match_t *match)
+{
+    if (!match) {
+        return 0;
+    }
+    if (match->guard_kind == KZT_BRIDGE_GUARD_NONE) {
+        return match->guest_fallback_target == 0;
+    }
+    return match->guard_kind == KZT_BRIDGE_GUARD_XCB_CONNECTION &&
+           match->guest_fallback_target != 0 &&
+           !match->resolved_bridge_target &&
+           !match->resolved_bridge_exact;
+}
+
 static uintptr_t kzt_wrapper_bridge_provider_check_bridge(
     uintptr_t native_symbol, void *opaque)
 {
@@ -59,6 +74,12 @@ static uintptr_t kzt_wrapper_bridge_provider_add_bridge(
         &provider->match, request, provider->runtime_ops.opaque);
     if (!created) {
         return 0;
+    }
+    /* Guarded bridges are intentionally unique and absent from CheckBridged.
+       Their runtime add callback validates the newly allocated entry before
+       returning it.  Ordinary bridges retain the map-based post-add proof. */
+    if (provider->match.guard_kind != KZT_BRIDGE_GUARD_NONE) {
+        return created;
     }
     verified = provider->runtime_ops.check_bridge(
         &provider->match, provider->runtime_ops.opaque);
@@ -128,6 +149,7 @@ int kzt_wrapper_bridge_provider_prepare_with_version_evidence(
             candidate.stack_bytes < 0 || !candidate.native_name[0] ||
             (!!candidate.resolved_bridge_target !=
              !!candidate.resolved_bridge_exact) ||
+            !kzt_wrapper_bridge_provider_guard_valid(&candidate) ||
             (!candidate.resolved_bridge_target &&
              !runtime_ops->add_bridge) ||
             !candidate.wrapper_provider_lifetime_bound ||

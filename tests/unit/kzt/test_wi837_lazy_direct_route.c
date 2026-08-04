@@ -11,6 +11,7 @@ typedef struct fixture {
     int provider_available;
     int provider_generation_delta;
     int bridge_available;
+    int transient_safe;
     int wrong_bridge_version;
     int lease_available;
     int final_valid;
@@ -97,6 +98,7 @@ static int find_wrapper_bridge(
         .version_evidence = input->version_evidence,
         .version = fixture->wrong_bridge_version ?
                        "GLIBC_2.2.5" : input->version,
+        .transient_safe = fixture->transient_safe,
     };
     return 0;
 }
@@ -178,6 +180,7 @@ static fixture_t fixture(void)
         .source_valid = 1,
         .provider_available = 1,
         .bridge_available = 1,
+        .transient_safe = 1,
         .lease_available = 1,
         .final_valid = 1,
         .cas_status = KZT_LAZY_DIRECT_ROUTE_CAS_APPLIED,
@@ -632,6 +635,21 @@ static void test_guest_owned_dlclose_requires_guest_without_callbacks(void)
           f.lease_acquire_calls == 0 &&
           f.final_validate_calls == 0 &&
           f.cas_calls == 0);
+
+    f = fixture();
+    input = input_for(&f, &view);
+    ops = ops_for(&f);
+    original = f.slot;
+    input.symbol = "free";
+    check_guest_required(
+        "guest-free",
+        kzt_lazy_direct_route_apply(&input, &ops, &result),
+        &result, KZT_LAZY_DIRECT_ROUTE_REASON_GUEST_OWNED_SYMBOL,
+        &f, original);
+    CHECK("guest-free.no-callbacks",
+          f.source_calls == 0 && f.provider_acquire_calls == 0 &&
+              f.bridge_calls == 0 && f.lease_acquire_calls == 0 &&
+              f.final_validate_calls == 0 && f.cas_calls == 0);
 }
 
 static void test_cas_mismatch_requires_guest_without_writing(void)
@@ -675,6 +693,119 @@ static void test_cas_error_requires_guest_without_writing(void)
           f.cas_calls == 1 && f.write_calls == 0);
 }
 
+static void test_budget_exhaustion_can_use_verified_loader_bridge_once(void)
+{
+    fixture_t f = fixture();
+    kzt_guest_dynamic_view_t view = complete_dynamic_view();
+    kzt_lazy_direct_route_input_t input = input_for(&f, &view);
+    kzt_lazy_direct_route_ops_t ops = ops_for(&f);
+    kzt_lazy_direct_route_result_t result;
+    uintptr_t original = f.slot;
+
+    input.symbol = "dlopen";
+    input.allow_budget_transient_native = 1;
+    f.cas_status = KZT_LAZY_DIRECT_ROUTE_CAS_BUDGET_EXHAUSTED;
+    CHECK("budget-transient.status",
+          kzt_lazy_direct_route_apply(&input, &ops, &result) ==
+              KZT_LAZY_DIRECT_ROUTE_NATIVE_TRANSIENT);
+    CHECK("budget-transient.result",
+          result.status == KZT_LAZY_DIRECT_ROUTE_NATIVE_TRANSIENT &&
+          result.reason == KZT_LAZY_DIRECT_ROUTE_REASON_NATIVE_TRANSIENT &&
+          result.selected_target == f.bridge_target);
+    CHECK("budget-transient.no-write",
+          f.slot == original && f.write_calls == 0 && f.cas_calls == 1);
+    CHECK("budget-transient.cleanup",
+          f.lease_release_calls == 1 && f.provider_release_calls == 1);
+}
+
+static void test_transient_flags_do_not_apply_to_non_loader_symbols(void)
+{
+    fixture_t f = fixture();
+    kzt_guest_dynamic_view_t view = complete_dynamic_view();
+    kzt_lazy_direct_route_input_t input = input_for(&f, &view);
+    kzt_lazy_direct_route_ops_t ops = ops_for(&f);
+    kzt_lazy_direct_route_result_t result;
+    uintptr_t original = f.slot;
+
+    input.symbol = "puts";
+    input.allow_budget_transient_native = 1;
+    f.cas_status = KZT_LAZY_DIRECT_ROUTE_CAS_BUDGET_EXHAUSTED;
+    check_guest_required(
+        "non-loader-transient",
+        kzt_lazy_direct_route_apply(&input, &ops, &result),
+        &result, KZT_LAZY_DIRECT_ROUTE_REASON_BUDGET_EXHAUSTED,
+        &f, original);
+    CHECK("non-loader-transient.one-attempt",
+          f.cas_calls == 1 && f.write_calls == 0);
+}
+
+static void test_budget_transient_requires_context_owned_wrapper(void)
+{
+    fixture_t f = fixture();
+    kzt_guest_dynamic_view_t view = complete_dynamic_view();
+    kzt_lazy_direct_route_input_t input = input_for(&f, &view);
+    kzt_lazy_direct_route_ops_t ops = ops_for(&f);
+    kzt_lazy_direct_route_result_t result;
+    uintptr_t original = f.slot;
+
+    input.symbol = "dlopen";
+    input.allow_budget_transient_native = 1;
+    f.transient_safe = 0;
+    f.cas_status = KZT_LAZY_DIRECT_ROUTE_CAS_BUDGET_EXHAUSTED;
+    check_guest_required(
+        "unsafe-budget-transient",
+        kzt_lazy_direct_route_apply(&input, &ops, &result),
+        &result, KZT_LAZY_DIRECT_ROUTE_REASON_BUDGET_EXHAUSTED,
+        &f, original);
+    CHECK("unsafe-budget-transient.one-attempt",
+          f.cas_calls == 1 && f.write_calls == 0);
+}
+
+static void test_writer_rollback_remains_distinct_from_cas_error(void)
+{
+    fixture_t f = fixture();
+    kzt_guest_dynamic_view_t view = complete_dynamic_view();
+    kzt_lazy_direct_route_input_t input = input_for(&f, &view);
+    kzt_lazy_direct_route_ops_t ops = ops_for(&f);
+    kzt_lazy_direct_route_result_t result;
+    uintptr_t original = f.slot;
+
+    f.cas_status = KZT_LAZY_DIRECT_ROUTE_CAS_ROLLED_BACK;
+    CHECK("rolled-back.status",
+          kzt_lazy_direct_route_apply(&input, &ops, &result) ==
+              KZT_LAZY_DIRECT_ROUTE_WRITE_ROLLED_BACK);
+    CHECK("rolled-back.result",
+          result.status == KZT_LAZY_DIRECT_ROUTE_WRITE_ROLLED_BACK &&
+          result.reason == KZT_LAZY_DIRECT_ROUTE_REASON_WRITE_ROLLED_BACK);
+    CHECK("rolled-back.slot", f.slot == original && f.write_calls == 0);
+    CHECK("rolled-back.cleanup",
+          f.cas_calls == 1 && f.lease_release_calls == 1 &&
+          f.provider_release_calls == 1);
+}
+
+static void test_unrecoverable_writer_failure_is_terminal(void)
+{
+    fixture_t f = fixture();
+    kzt_guest_dynamic_view_t view = complete_dynamic_view();
+    kzt_lazy_direct_route_input_t input = input_for(&f, &view);
+    kzt_lazy_direct_route_ops_t ops = ops_for(&f);
+    kzt_lazy_direct_route_result_t result;
+    uintptr_t original = f.slot;
+
+    f.cas_status = KZT_LAZY_DIRECT_ROUTE_CAS_UNRECOVERABLE;
+    CHECK("unrecoverable.status",
+          kzt_lazy_direct_route_apply(&input, &ops, &result) ==
+              KZT_LAZY_DIRECT_ROUTE_UNRECOVERABLE);
+    CHECK("unrecoverable.result",
+          result.status == KZT_LAZY_DIRECT_ROUTE_UNRECOVERABLE &&
+          result.reason == KZT_LAZY_DIRECT_ROUTE_REASON_UNRECOVERABLE);
+    CHECK("unrecoverable.no-fake-write",
+          f.slot == original && f.write_calls == 0);
+    CHECK("unrecoverable.cleanup",
+          f.cas_calls == 1 && f.lease_release_calls == 1 &&
+          f.provider_release_calls == 1);
+}
+
 int main(void)
 {
     test_only_strong_global_binding_is_eligible();
@@ -697,6 +828,11 @@ int main(void)
     test_final_validation_failure_requires_guest();
     test_cas_mismatch_requires_guest_without_writing();
     test_cas_error_requires_guest_without_writing();
+    test_budget_exhaustion_can_use_verified_loader_bridge_once();
+    test_transient_flags_do_not_apply_to_non_loader_symbols();
+    test_budget_transient_requires_context_owned_wrapper();
+    test_writer_rollback_remains_distinct_from_cas_error();
+    test_unrecoverable_writer_failure_is_terminal();
 
     if (failures) {
         fprintf(stderr, "%d WI-837 lazy direct route checks failed\n",

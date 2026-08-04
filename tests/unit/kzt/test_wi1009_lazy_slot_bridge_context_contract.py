@@ -5,6 +5,13 @@ import sys
 
 
 root = pathlib.Path(sys.argv[1]).resolve()
+for removed_path in (
+    "target/i386/latx/context/kzt_lazy_slot_bridge.c",
+    "target/i386/latx/include/kzt_lazy_slot_bridge.h",
+):
+    if (root / removed_path).exists():
+        raise AssertionError(f"superseded lazy slot module exists: {removed_path}")
+
 header = (
     root / "target/i386/latx/include/box64context.h"
 ).read_text(encoding="utf-8")
@@ -35,5 +42,20 @@ for forbidden in (
 
 if "'kzt_lazy_slot_bridge.c'" in meson:
     raise AssertionError("superseded lazy slot implementation is still built")
+
+for path in (root / "target/i386/latx").rglob("*"):
+    if not path.is_file() or path.suffix not in {".c", ".h", ".build"}:
+        continue
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    for forbidden in (
+        "kzt_lazy_slot_bridge",
+        "kzt_lazy_slot_bridges",
+        "KZT_LAZY_SLOT_BRIDGE",
+    ):
+        if forbidden in text:
+            raise AssertionError(
+                f"production tree retains superseded lazy slot state: "
+                f"{path.relative_to(root)}: {forbidden}"
+            )
 
 print("WI-1009 lazy slot bridge removal contract: PASS")

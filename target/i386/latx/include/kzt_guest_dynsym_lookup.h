@@ -7,6 +7,11 @@
 #include "kzt_guest_link_map_reader.h"
 #include "kzt_patch_planner.h"
 
+enum {
+    KZT_ELF_STB_GNU_UNIQUE = 10,
+    KZT_ELF_STT_GNU_IFUNC = 10,
+};
+
 typedef enum kzt_guest_dynsym_lookup_status {
     KZT_GUEST_DYNSYM_LOOKUP_FOUND = 0,
     KZT_GUEST_DYNSYM_LOOKUP_NOT_FOUND,

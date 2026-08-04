@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "bridge_private.h"
 #include "kzt_guest_library_binding.h"
 #include "kzt_wrapper_probe.h"
 
@@ -29,6 +30,8 @@ typedef struct kzt_wrapper_bridge_provider_match {
     int wrapper_provider_lifetime_bound;
     int native_owner_lifetime_bound;
     int bridge_owner_lifetime_bound;
+    uintptr_t guest_fallback_target;
+    kzt_bridge_guard_kind_t guard_kind;
     const kzt_guest_library_handle_t *retained_provider_handle;
 } kzt_wrapper_bridge_provider_match_t;
 

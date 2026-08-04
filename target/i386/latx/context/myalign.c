@@ -14,8 +14,11 @@
 #include "elfloader.h"
 #include "elfloader_private.h"
 #include "kzt_loader_event_hook.h"
+#include "kzt_xcb_connection_guard.h"
+#include "kzt_xcb_queue_mirror.h"
 #ifdef CONFIG_LATX_KZT
 #include "kzt_guest_dl_api.h"
+#include "kzt_guest_dl_init.h"
 #include "kzt_observation_adapter.h"
 #include "kzt_guest_library_adapter.h"
 #include "kzt_jump_slot_production.h"
@@ -26,6 +29,7 @@
 #include <sys/epoll.h>
 #include <sys/sem.h>
 #include <sys/syscall.h>
+#include <pthread.h>
 #include <time.h>
 
 #pragma GCC diagnostic push
@@ -1657,22 +1661,12 @@ typedef struct x64_xcb_connection_s {
     x64_xcb_xid_t xid;
 } x64_xcb_connection_t;
 
-#define NXCB 8
-my_xcb_connection_t* my_xcb_connects[NXCB] = {0};
-x64_xcb_connection_t x64_xcb_connects[NXCB] = {0};
 #ifdef CONFIG_LATX_DEBUG
-/* check x64_xcb_connects had sync my_xcb_connects*/
-/*
-* Use align_xcb_connection and unalign_xcb_connection sync x64_xcb_connects.
-* But, For latx, my_xcb_connects had changed by other FUNC, insead of xcb api.
-*So we need latx_xcb_cmp for check xcb changed or not.
-*/
-
-static void latx_xcb_cmp(void* src, void* dst)
+static void latx_xcb_cmp(void *guest, void *native)
 {
-    my_xcb_connection_t * dest = dst;
-    my_xcb_connection_t * source = src;
- #define GO(member,mtype) do{lsassertm(source->member == dest->member, "x64_xcb_connects->"#member"="#mtype" != my_xcb_connects->"#member"="#mtype"\n", source->member, dest->member );} while(0)
+    x64_xcb_connection_t *source = guest;
+    my_xcb_connection_t *dest = native;
+ #define GO(member,mtype) do{lsassertm(source->member == dest->member, "guest_xcb->"#member"="#mtype" != native_xcb->"#member"="#mtype"\n", source->member, dest->member );} while(0)
     GO(has_error,"%d");
     GO(setup, "%p");
     GO(fd, "%d");
@@ -1686,78 +1680,113 @@ static void latx_xcb_cmp(void* src, void* dst)
 }
 #endif
 
-EXPORT int32_t my_xcb_flush(void* v1);
-void* align_xcb_connection(void* src)
+uintptr_t kzt_xcb_guard_acquire_for_bridge(
+    CPUX86State *env, uintptr_t guest)
 {
-    if(!src)
-        return src;
-    // find it
-    my_xcb_connection_t * dest = NULL;
-    for(int i=0; i<NXCB && !dest; ++i)
-        if(src==&x64_xcb_connects[i])
-            dest = my_xcb_connects[i];
-    #if 1
-    if (!(src&&dest&&((my_xcb_connection_t *)src)->xid.last == ((my_xcb_connection_t *)dest)->xid.last)) {
-        my_xcb_flush(dest);
+    box64context_t *context = env ? env->kzt_runtime_context : NULL;
+    x64_xcb_connection_t *connection = (void *)guest;
+    int status;
+
+    if (!guest) {
+        kzt_xcb_connection_guard_cancel();
+        return 0;
     }
-#ifdef CONFIG_LATX_DEBUG
-    if (dest) {
-        latx_xcb_cmp(src,dest);
+    if (!context || !context->kzt_xcb_connection_map) {
+        return 0;
     }
-#endif
-    if(!dest)
-        dest = add_xcb_connection(src);
-    #else
-    if(!dest) {
-        printf_log(LOG_NONE, "BOX64: Error, xcb_connect %p not found\n", src);
-        abort();
+    status = kzt_xcb_connection_guard_prepare(
+        context->kzt_xcb_connection_map, (void *)guest);
+    if (status != 0) {
+        printf_kzt_registry_diagnostics(
+            "kzt_xcb_guard schema=1 phase=prepare guest=%p map=%p "
+            "result=FALLBACK reason=unknown_connection\n",
+            (void *)guest, (void *)context->kzt_xcb_connection_map);
+        return 0;
     }
-    #endif
-    #if 1
-    // do not update most values
-    x64_xcb_connection_t* source = src;
+    if (!kzt_xcb_flush_state_is_supported(
+            connection->out.queue_len, sizeof(connection->out.queue),
+            connection->out.out_fd.nfd, connection->out.out_fd.ifd,
+            connection->out.writing, connection->out.socket_moving,
+            (uintptr_t)connection->out.return_socket,
+            (uintptr_t)connection->out.socket_closure)) {
+        printf_kzt_registry_diagnostics(
+            "kzt_xcb_guard schema=1 phase=prepare guest=%p map=%p "
+            "result=FALLBACK reason=unsupported_flush_state\n",
+            (void *)guest, (void *)context->kzt_xcb_connection_map);
+        kzt_xcb_connection_guard_cancel();
+        return 0;
+    }
+    printf_kzt_registry_diagnostics(
+        "kzt_xcb_guard schema=1 phase=prepare guest=%p map=%p result=READY\n",
+        (void *)guest, (void *)context->kzt_xcb_connection_map);
+    return 1;
+}
+
+static void kzt_xcb_copy_guest_to_native(void *native, void *guest)
+{
+    my_xcb_connection_t *dest = native;
+    x64_xcb_connection_t *source = guest;
+
     dest->has_error = source->has_error;
     dest->setup = source->setup;
     dest->fd = source->fd;
-    //memcpy(&dest->iolock, source->iolock, MUTEX_SIZE_X64);
-    //dest->in = source->in;
-    //dest->out = source->out;
-    //memcpy(&dest->ext.lock, source->ext.lock, MUTEX_SIZE_X64);
     dest->ext.extensions = source->ext.extensions;
     dest->ext.extensions_size = source->ext.extensions_size;
-    //memcpy(&dest->xid.lock, source->xid.lock, MUTEX_SIZE_X64);
+    kzt_xcb_queue_copy(
+        dest->out.queue, sizeof(dest->out.queue), &dest->out.queue_len,
+        source->out.queue, sizeof(source->out.queue), source->out.queue_len);
+    dest->out.request = source->out.request;
+    dest->out.request_written = source->out.request_written;
+    dest->out.out_fd = source->out.out_fd;
     dest->xid.base = source->xid.base;
     dest->xid.inc = source->xid.inc;
     if (dest->xid.last > source->xid.last) {
         source->xid.last = dest->xid.last;
-        //waring: dest->xid.last > source->xid.last skip.
     } else {
         dest->xid.last = source->xid.last;
     }
     dest->xid.max = source->xid.max;
-    #endif
-    return dest;
+#ifdef CONFIG_LATX_DEBUG
+    latx_xcb_cmp(guest, native);
+#endif
 }
 
-void unalign_xcb_connection(void* src, void* dst)
+static void kzt_xcb_copy_native_to_guest(void *native, void *guest)
 {
-    if(!src || !dst || src==dst)
-        return;
-    // update values
-    my_xcb_connection_t* source = src;
-    x64_xcb_connection_t* dest = dst;
+    my_xcb_connection_t *source = native;
+    x64_xcb_connection_t *dest = guest;
+
     dest->has_error = source->has_error;
     dest->setup = source->setup;
     dest->fd = source->fd;
     memcpy(dest->iolock, &source->iolock, MUTEX_SIZE_X64);
-    dest->in = source->in;
+    dest->in.event_cond = source->in.event_cond;
+    dest->in.reading = source->in.reading;
+    kzt_xcb_queue_copy(
+        dest->in.queue, sizeof(dest->in.queue), &dest->in.queue_len,
+        source->in.queue, sizeof(source->in.queue), source->in.queue_len);
+    dest->in.request_expected = source->in.request_expected;
+    dest->in.request_read = source->in.request_read;
+    dest->in.request_completed = source->in.request_completed;
+    dest->in.current_reply = source->in.current_reply;
+    dest->in.current_reply_tail = source->in.current_reply_tail;
+    dest->in.replies = source->in.replies;
+    dest->in.events = source->in.events;
+    dest->in.events_tail = source->in.events_tail;
+    dest->in.readers = source->in.readers;
+    dest->in.special_waiters = source->in.special_waiters;
+    dest->in.pending_replies = source->in.pending_replies;
+    dest->in.pending_replies_tail = source->in.pending_replies_tail;
+    dest->in.in_fd = source->in.in_fd;
+    dest->in.special_events = source->in.special_events;
     memcpy(dest->out.reqlenlock, &source->out.reqlenlock, MUTEX_SIZE_X64);
     dest->out.cond = source->out.cond;
     dest->out.maximum_request_length = source->out.maximum_request_length;
     dest->out.maximum_request_length_tag = source->out.maximum_request_length_tag;
     dest->out.out_fd = source->out.out_fd;
-    memcpy(dest->out.queue, source->out.queue, sizeof(dest->out.queue));
-    dest->out.queue_len = source->out.queue_len;
+    kzt_xcb_queue_copy(
+        dest->out.queue, sizeof(dest->out.queue), &dest->out.queue_len,
+        source->out.queue, sizeof(source->out.queue), source->out.queue_len);
     dest->out.request = source->out.request;
     dest->out.request_written = source->out.request_written;
     dest->out.return_socket = source->out.return_socket;
@@ -1775,49 +1804,207 @@ void unalign_xcb_connection(void* src, void* dst)
     dest->xid.max = source->xid.max;
 }
 
-void* add_xcb_connection(void* src)
+static int kzt_xcb_call_cancel_disable(void)
 {
-    if(!src)
-        return src;
-    // check if already exist
-    for(int i=0; i<NXCB; ++i)
-        if(my_xcb_connects[i] == src) {
-            unalign_xcb_connection(src, &x64_xcb_connects[i]);
-            return &x64_xcb_connects[i];
-        }
-    // find a free slot
-    for(int i=0; i<NXCB; ++i)
-        if(!my_xcb_connects[i]) {
-            my_xcb_connects[i] = src;
-            unalign_xcb_connection(src, &x64_xcb_connects[i]);
-            return &x64_xcb_connects[i];
-        }
-    printf_log(LOG_NONE, "BOX64: Error, no more free xcb_connect slot for %p\n", src);
-    return src;
+    int old_state = PTHREAD_CANCEL_ENABLE;
+
+    (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_state);
+    return old_state;
 }
 
-void del_xcb_connection(void* src)
+static void kzt_xcb_call_cancel_restore(int old_state)
 {
-    if(!src)
-        return;
-    // find it
-    for(int i=0; i<NXCB; ++i)
-        if(src==&x64_xcb_connects[i]) {
-            my_xcb_connects[i] = NULL;
-            memset(&x64_xcb_connects[i], 0, sizeof(x64_xcb_connection_t));
-            return;
-        }
-    printf_log(LOG_NONE, "BOX64: Error, xcb_connect %p not found for deletion\n", src);
+    (void)pthread_setcancelstate(old_state, NULL);
 }
-int sync_xcb_connection(void* src)
+
+static int kzt_xcb_mirror_guest_to_native(
+    const kzt_xcb_connection_lease_t *lease)
 {
-    for(int i=0; i<NXCB; ++i) {
-        if(my_xcb_connects[i] == src) {
-            unalign_xcb_connection(src, &x64_xcb_connects[i]);
-            return 0;
-        }
+    int old_cancel_state = kzt_xcb_call_cancel_disable();
+
+    if (kzt_xcb_connection_lease_lock_mirror(lease) != 0) {
+        kzt_xcb_call_cancel_restore(old_cancel_state);
+        return -1;
     }
-    return -1;
+    kzt_xcb_copy_guest_to_native(lease->native, lease->guest);
+    kzt_xcb_connection_lease_unlock_mirror(lease);
+    kzt_xcb_call_cancel_restore(old_cancel_state);
+    return 0;
+}
+
+static int kzt_xcb_mirror_native_to_guest(
+    const kzt_xcb_connection_lease_t *lease)
+{
+    int old_cancel_state = kzt_xcb_call_cancel_disable();
+
+    if (kzt_xcb_connection_lease_lock_mirror(lease) != 0) {
+        kzt_xcb_call_cancel_restore(old_cancel_state);
+        return -1;
+    }
+    kzt_xcb_copy_native_to_guest(lease->native, lease->guest);
+    kzt_xcb_connection_lease_unlock_mirror(lease);
+    kzt_xcb_call_cancel_restore(old_cancel_state);
+    return 0;
+}
+
+void *align_xcb_connection(void *guest)
+{
+    kzt_xcb_connection_map_t *map;
+    kzt_xcb_connection_lease_t lease = { 0 };
+
+    if (!guest || !my_context ||
+        !(map = my_context->kzt_xcb_connection_map)) {
+        printf_kzt_registry_diagnostics(
+            "kzt_xcb_guard schema=1 phase=align guest=%p map=%p "
+            "result=FALLBACK reason=input\n",
+            guest, my_context ? (void *)my_context->kzt_xcb_connection_map :
+                                NULL);
+        return NULL;
+    }
+    if (kzt_xcb_connection_guard_acquire(map, guest, &lease) != 0) {
+        printf_kzt_registry_diagnostics(
+            "kzt_xcb_guard schema=1 phase=align guest=%p map=%p "
+            "result=FALLBACK reason=unknown_connection\n",
+            guest, (void *)map);
+        return NULL;
+    }
+    printf_kzt_registry_diagnostics(
+        "kzt_xcb_guard schema=1 phase=align guest=%p native=%p map=%p "
+        "result=TRACKED_LEASE\n",
+        guest, lease.native, (void *)map);
+    if (kzt_xcb_mirror_guest_to_native(&lease) != 0) {
+        (void)kzt_xcb_connection_guard_release(
+            map, lease.native, lease.guest);
+        return NULL;
+    }
+    return lease.native;
+}
+
+void unalign_xcb_connection(void *native, void *guest)
+{
+    kzt_xcb_connection_map_t *map;
+    kzt_xcb_connection_lease_t lease = { 0 };
+
+    if (!native || !guest || !my_context ||
+        !(map = my_context->kzt_xcb_connection_map)) {
+        return;
+    }
+    if (kzt_xcb_connection_guard_active_lease(
+            map, native, guest, &lease) != 0 ||
+        kzt_xcb_mirror_native_to_guest(&lease) != 0) {
+        printf_kzt_registry_diagnostics(
+            "kzt_xcb_guard schema=1 phase=unalign guest=%p native=%p "
+            "map=%p result=ERROR reason=mirror_lease\n",
+            guest, native, (void *)map);
+    }
+    if (kzt_xcb_connection_guard_release(map, native, guest) != 0) {
+        printf_kzt_registry_diagnostics(
+            "kzt_xcb_guard schema=1 phase=unalign guest=%p native=%p "
+            "map=%p result=ERROR reason=untracked_lease\n",
+            guest, native, (void *)map);
+    }
+}
+
+void *add_xcb_connection(void *native)
+{
+    kzt_xcb_connection_map_t *map;
+    x64_xcb_connection_t *proposed_guest;
+    void *canonical_guest = NULL;
+    uint64_t generation = 0;
+    kzt_xcb_connection_map_result_t result;
+
+    if (!native || !my_context ||
+        !(map = my_context->kzt_xcb_connection_map)) {
+        return NULL;
+    }
+    proposed_guest = calloc(1, sizeof(*proposed_guest));
+    if (!proposed_guest) {
+        return NULL;
+    }
+    kzt_xcb_copy_native_to_guest(native, proposed_guest);
+    result = kzt_xcb_connection_map_register(
+        map, native, proposed_guest, &canonical_guest, &generation);
+    if (result == KZT_XCB_CONNECTION_MAP_ADDED) {
+        return canonical_guest;
+    }
+    free(proposed_guest);
+    if (result == KZT_XCB_CONNECTION_MAP_UNCHANGED) {
+        kzt_xcb_connection_lease_t lease = { 0 };
+        int old_cancel_state = kzt_xcb_call_cancel_disable();
+
+        if (kzt_xcb_connection_map_acquire_by_native(
+                map, native, &lease) == 0) {
+            if (kzt_xcb_mirror_native_to_guest(&lease) != 0) {
+                kzt_xcb_connection_map_release_pair(
+                    map, lease.native, lease.guest);
+                kzt_xcb_call_cancel_restore(old_cancel_state);
+                return NULL;
+            }
+            canonical_guest = lease.guest;
+            kzt_xcb_connection_map_release_pair(
+                map, lease.native, lease.guest);
+            kzt_xcb_call_cancel_restore(old_cancel_state);
+            return canonical_guest;
+        }
+        kzt_xcb_call_cancel_restore(old_cancel_state);
+    }
+    return NULL;
+}
+
+int sync_xcb_connection(void *connection)
+{
+    kzt_xcb_connection_map_t *map;
+    kzt_xcb_connection_lease_t lease = { 0 };
+    int old_cancel_state;
+
+    if (!connection || !my_context ||
+        !(map = my_context->kzt_xcb_connection_map)) {
+        return -1;
+    }
+    old_cancel_state = kzt_xcb_call_cancel_disable();
+    if (kzt_xcb_connection_map_acquire_by_native(
+            map, connection, &lease) != 0 &&
+        kzt_xcb_connection_map_acquire_by_guest(
+            map, connection, &lease) != 0) {
+        kzt_xcb_call_cancel_restore(old_cancel_state);
+        return -1;
+    }
+    if (kzt_xcb_mirror_native_to_guest(&lease) != 0) {
+        kzt_xcb_connection_map_release_pair(
+            map, lease.native, lease.guest);
+        kzt_xcb_call_cancel_restore(old_cancel_state);
+        return -1;
+    }
+    kzt_xcb_connection_map_release_pair(map, lease.native, lease.guest);
+    kzt_xcb_call_cancel_restore(old_cancel_state);
+    return 0;
+}
+
+int begin_xcb_connection_disconnect(
+    void *guest, kzt_xcb_connection_lease_t *lease)
+{
+    if (!guest || !lease || !my_context ||
+        !my_context->kzt_xcb_connection_map) {
+        return -1;
+    }
+    return kzt_xcb_connection_map_begin_remove_by_guest(
+        my_context->kzt_xcb_connection_map, guest, lease);
+}
+
+int begin_xcb_connection_disconnect_native(
+    void *native, kzt_xcb_connection_lease_t *lease)
+{
+    if (!native || !lease || !my_context ||
+        !my_context->kzt_xcb_connection_map) {
+        return -1;
+    }
+    return kzt_xcb_connection_map_begin_remove_by_native(
+        my_context->kzt_xcb_connection_map, native, lease);
+}
+
+void finish_xcb_connection_disconnect(kzt_xcb_connection_lease_t *lease)
+{
+    kzt_xcb_connection_map_finish_remove(lease);
 }
 static void LoadEnvPath(path_collection_t *col, const char* defpath, const char* env)
 {
@@ -2149,7 +2336,6 @@ static void init_main_elf(elfheader_t* elf_header,int fd, uintptr_t load_addr,
     AddElfHeader(my_context, elf_header);
     elf_header->latx_type = LATX_ELF_TYPE_MAIN;
     ElfHeadReFix(elf_header, load_addr);
-    collectX86free(elf_header);
     if (CalcLoadAddrNative(elf_header, align)) {
         printf_log(LOG_INFO, "Error: reading elf header of %s\n", my_context->argv[0]);
         close(fd);
@@ -2169,12 +2355,15 @@ static void init_main_elf(elfheader_t* elf_header,int fd, uintptr_t load_addr,
     ResetSpecialCaseMainElf(elf_header);
 }
 int wine_option_kzt;
-int kzt_init(char** argv, int argc,char** target_argv, int target_argc,
-        struct linux_binprm* bprm) {
+int kzt_init(CPUX86State *env, char** argv, int argc, char** target_argv,
+        int target_argc, struct linux_binprm* bprm) {
+    kzt_guest_dl_entries_t fallback = { 0 };
+
     if (!option_kzt && !wine_option_kzt) {
         return -1;
     }
     my_context = NewBox64Context(bprm->argc);
+    env->kzt_runtime_context = my_context;
     if (option_kzt && info->interpreter_path) {
         elf_header = LoadFromNative(bprm, info);
     }
@@ -2199,6 +2388,10 @@ int kzt_init(char** argv, int argc,char** target_argv, int target_argc,
     if(elf_header != NULL){
         init_main_elf(elf_header, bprm->exec_fd, info1.load_addr, info->alignment);
     }
+    if (!kzt_guest_dl_init_entries(my_context, &fallback)) {
+        printf_log(LOG_INFO,
+                   "KZT: guest runtime entry initialization is unavailable\n");
+    }
     return 0;
 }
 
@@ -2210,80 +2403,6 @@ struct x86_ld_info {
     uintptr_t r_debug_addr;
 #endif
 };
-static struct x86_ld_info * ld_info = NULL;
-#ifdef CONFIG_LATX_KZT
-static kzt_loader_event_hook_t kzt_loader_event_hook;
-#endif
-extern void* x86free;
-extern void* x86realloc;
-extern void* x86pthread_setcanceltype;
-static int x64free_fini = 0;
-//before _init, free possibly be call.so x86free must be refleshed everytime.
-int collectX86free(elfheader_t* h)
-{
-    if (x64free_fini) {
-        return 0;
-    }
-    int cnt;
-    Elf64_Rela *rela;
-    void* found_malloc = NULL;
-    void* found_free = NULL;
-    void* found_realloc = NULL;
-    struct malloc_map * m;
-    Elf64_Sym *sym = NULL;
-    for (size_t i=0; i<h->numDynSym; ++i) {
-        sym = h->DynSym+i;
-        if (h->DynSym[i].st_shndx != SHN_UNDEF && sym->st_value) {
-            const char * symname = h->DynStr+sym->st_name;
-            if (!strcmp(symname, "malloc")) {
-                found_malloc = (void*)sym->st_value+h->delta;
-                printf_log(LOG_DEBUG, "latx x86malloc=%p type=0x%x from %s\n", x86free, ELF64_ST_TYPE(sym->st_info), h->path);
-                if (found_free && found_realloc) {
-                    goto found;
-                }
-            } else if (!strcmp(symname, "free")) {
-                found_free = (void*)sym->st_value+h->delta;
-                printf_log(LOG_DEBUG, "latx x86free=%p type=0x%x from %s\n", x86free, ELF64_ST_TYPE(sym->st_info), h->path);
-                if (found_malloc && found_realloc) {
-                    goto found;
-                }
-            } else if (!strcmp(symname, "realloc")) {
-                found_realloc = (void*)sym->st_value+h->delta;
-                printf_log(LOG_DEBUG, "latx x86realloc=%p type=0x%x from %s\n", x86realloc, ELF64_ST_TYPE(sym->st_info), h->path);
-                if (found_malloc && found_free) {
-                    goto found;
-                }
-            }
-        }
-    }
-    return -1;
-found:
-    /*
-      * If the plt of this elf file has free, __libc_free, __free jump_slot, this jump_slot will be rewrited by kzt bridge, a moment later.
-      * So this file should be skiped. If do not do this, when x86free be called, Target exe will fall into dead loop.
-    */
-    cnt = h->pltsz / h->pltent;
-    rela = (Elf64_Rela *)(h->jmprel + h->delta);
-    for (int i=0; i<cnt; ++i) {
-        int t = ELF64_R_TYPE(rela[i].r_info);
-        if(t == R_X86_64_JUMP_SLOT){
-            Elf64_Sym *sym = &h->DynSym[ELF64_R_SYM(rela[i].r_info)];
-            const char* symname = SymName(h, sym);
-            if (!strcmp(symname, "free") ||
-                !strcmp(symname, "__libc_free") ||
-                !strcmp(symname, "__free")) {
-                return -1;
-            }
-        }
-    }
-    m = malloc(sizeof(struct malloc_map));
-    m->mallocp = found_malloc;
-    m->freep = found_free;
-    m->reallocp = found_realloc;
-    m->h = h;
-    AddMallocMap(my_context, m);
-    return 0;
-}
 #ifdef CONFIG_LATX_KZT
 static int kzt_callback_read_memory(uintptr_t guest_addr,
                                     void *dst,
@@ -2312,61 +2431,86 @@ static int kzt_callback_read_memory(uintptr_t guest_addr,
 #endif
 
 #ifdef CONFIG_LATX_KZT
+typedef struct kzt_tb_callback_scope {
+    box64context_t *context;
+    const kzt_guest_library_loader_scope_t *loader_scope;
+} kzt_tb_callback_scope_t;
+
 static int kzt_tb_callback_materialize_binding(uintptr_t link_map_addr,
                                                void *opaque)
 {
-    const kzt_guest_library_loader_scope_t *loader_scope = opaque;
-    struct link_map_x64 *link_map = (struct link_map_x64 *)link_map_addr;
+    const kzt_tb_callback_scope_t *scope = opaque;
+    box64context_t *context = scope ? scope->context : NULL;
+    const kzt_guest_library_loader_scope_t *loader_scope =
+        scope ? scope->loader_scope : NULL;
+    kzt_guest_registry_address_match_t match = { 0 };
     kzt_guest_wrapper_source_proof_t source_proof = { 0 };
     const char *name;
     const char *basename;
     library_t *library = NULL;
+    kzt_guest_library_binding_result_t binding_result;
     int loader_scope_active;
 
-    if (!link_map || !link_map->l_name || !link_map->l_name[0]) {
+    if (!context || !link_map_addr ||
+        kzt_guest_registry_find_live_object(
+            KztGuestRegistryForContext(context), link_map_addr, &match) != 0 ||
+        match.match_count != 1 ||
+        match.path_status != KZT_GUEST_FIELD_OK) {
+        return -1;
+    }
+    if (!match.path[0]) {
         return 0;
     }
-    name = link_map->l_name;
+    name = match.path;
     basename = strrchr(name, '/');
     basename = basename ? basename + 1 : name;
-    if (!basename[0] || !FindLibIsWrapped((char *)basename) ||
-        kzt_guest_library_wrapper_source_acquire(
-            my_context, link_map_addr, name, basename, &source_proof) != 0) {
+    if (!basename[0] || !FindLibIsWrapped((char *)basename)) {
         return 0;
     }
+    if (kzt_guest_library_wrapper_source_acquire(
+            context, link_map_addr, name, basename, &source_proof) != 0) {
+        return -1;
+    }
     (void)AddNeededLibWithLibrary(
-        my_context->maplib, &my_context->neededlibs, NULL, 0, 1,
-        basename, my_context, &library);
+        context->maplib, &context->neededlibs, NULL, 0, 1,
+        basename, context, &library);
     if (!library) {
         kzt_guest_library_wrapper_source_release(&source_proof);
-        return 0;
+        return -1;
     }
     loader_scope_active = loader_scope && loader_scope->bindings &&
                           loader_scope->identity && loader_scope->cookie;
     if (loader_scope_active) {
-        kzt_guest_library_note_loader_pair_pending(
-            my_context, loader_scope, link_map_addr, library, &source_proof);
+        binding_result = kzt_guest_library_note_loader_pair_pending(
+            context, loader_scope, link_map_addr, library, &source_proof);
     } else {
-        kzt_guest_library_note_loader_pair(
-            my_context, link_map_addr, library, &source_proof);
+        binding_result = kzt_guest_library_note_loader_pair(
+            context, link_map_addr, library, &source_proof);
     }
     kzt_guest_library_wrapper_source_release(&source_proof);
-    return 0;
+    return binding_result == KZT_GUEST_LIBRARY_BINDING_ADDED ||
+                   binding_result == KZT_GUEST_LIBRARY_BINDING_UNCHANGED ||
+                   binding_result == KZT_GUEST_LIBRARY_BINDING_PENDING
+               ? 0
+               : -1;
 }
 
 static int kzt_tb_callback_per_object_got_plt(uintptr_t link_map_addr,
                                               void *opaque)
 {
+    const kzt_tb_callback_scope_t *scope = opaque;
+    box64context_t *context = scope ? scope->context : NULL;
     kzt_per_object_got_plt_request_t request = {
-        .registry = KztGuestRegistryForContext(my_context),
+        .registry = KztGuestRegistryForContext(context),
         .link_map_addr = link_map_addr,
         .apply = KztPerObjectGotPltWrite,
-        .opaque = my_context,
+        .opaque = context,
     };
     kzt_per_object_got_plt_result_t result = { 0 };
 
-    (void)kzt_tb_callback_materialize_binding(link_map_addr, opaque);
-    if (kzt_per_object_got_plt_apply(&request, &result) != 0) {
+    if (kzt_tb_callback_materialize_binding(link_map_addr, opaque) != 0 ||
+        kzt_per_object_got_plt_apply(&request, &result) != 0 ||
+        result.status == KZT_PER_OBJECT_GOT_PLT_FAIL_OPEN) {
         return -1;
     }
     return 0;
@@ -2390,12 +2534,13 @@ static int kzt_tb_callback_prebind_invalidate(
 
 #endif
 
-static void kzt_tb_callback_consume(CPUX86State *env,
+static void kzt_tb_callback_consume(box64context_t *context,
+                                    CPUX86State *env,
                                     const kzt_loader_event_t *event)
 {
 #ifdef CONFIG_LATX_KZT
     uintptr_t link_map_addr = event ? event->link_map_addr : 0;
-    kzt_guest_registry_t *registry = KztGuestRegistryForContext(my_context);
+    kzt_guest_registry_t *registry;
     int diagnostics_enabled = kzt_registry_diagnostics_enabled();
     int lifecycle_scoped =
         env->kzt_guest_library_loader_scope.bindings &&
@@ -2419,15 +2564,25 @@ static void kzt_tb_callback_consume(CPUX86State *env,
     uintptr_t predecessor = 0;
     kzt_observation_adapter_result_t observation_result;
     int main_namespace;
+    kzt_tb_callback_scope_t callback_scope;
+
+    if (!context || !env) {
+        return;
+    }
+    registry = KztGuestRegistryForContext(context);
+    callback_scope = (kzt_tb_callback_scope_t) {
+        .context = context,
+        .loader_scope = &env->kzt_guest_library_loader_scope,
+    };
 
     (void)kzt_guest_registry_context_get_main_namespace_head(
-        &my_context->kzt_guest_registry_context, &confirmed_main_head);
+        &context->kzt_guest_registry_context, &confirmed_main_head);
     if (kzt_guest_link_map_read_identity(
         link_map_addr, &reader_ops, &object_identity) != 0) {
         main_namespace = -1;
     } else if (confirmed_main_head &&
                kzt_guest_registry_context_has_main_namespace_evidence(
-                   &my_context->kzt_guest_registry_context, registry,
+                   &context->kzt_guest_registry_context, registry,
                    link_map_addr, object_identity.load_bias,
                    object_identity.dynamic_addr)) {
         main_namespace = 1;
@@ -2448,8 +2603,8 @@ static void kzt_tb_callback_consume(CPUX86State *env,
     }
     if (main_namespace == 1 && !confirmed_main_head &&
         kzt_guest_registry_context_confirm_main_namespace_head(
-            &my_context->kzt_guest_registry_context,
-            &my_context->mutex_lock, namespace_head) != 0) {
+            &context->kzt_guest_registry_context,
+            &context->mutex_lock, namespace_head) != 0) {
         main_namespace = -1;
     }
     kzt_observation_adapter_request_t request = {
@@ -2457,17 +2612,17 @@ static void kzt_tb_callback_consume(CPUX86State *env,
         .diagnostics_enabled = diagnostics_enabled,
         .link_map_addr = link_map_addr,
         .registry = registry,
-        .library_bindings = KztGuestLibraryBindingsForContext(my_context),
-        .lazy_prebind_scope = KztLazyPrebindScopeForContext(my_context),
+        .library_bindings = KztGuestLibraryBindingsForContext(context),
+        .lazy_prebind_scope = KztLazyPrebindScopeForContext(context),
         .loader_scope = &env->kzt_guest_library_loader_scope,
         .reader_ops = &reader_ops,
         .reuse_complete_dynamic_view = 1,
         .namespace_id_present = main_namespace == 1,
         .namespace_id = 0,
         .prebind_invalidate = kzt_tb_callback_prebind_invalidate,
-        .prebind_invalidate_opaque = my_context,
+        .prebind_invalidate_opaque = context,
         .per_object_flow = kzt_tb_callback_per_object_got_plt,
-        .per_object_opaque = &env->kzt_guest_library_loader_scope,
+        .per_object_opaque = &callback_scope,
         .legacy_flow = NULL,
         .diagnostic = kzt_callback_diagnostic_log,
         .diagnostic_opaque = registry,
@@ -2494,9 +2649,13 @@ static void kzt_tb_callback_consume(CPUX86State *env,
         observation_result == KZT_OBSERVATION_ADAPTER_UPDATED) {
         if (lifecycle_scoped) {
             env->kzt_guest_library_loader_scope.prebind_refresh_pending = 1;
+        } else if (!kzt_loader_lifecycle_runtime_healthy(context)) {
+            __atomic_store_n(
+                &context->kzt_lazy_prebind_refresh_pending, 1,
+                __ATOMIC_RELEASE);
         } else {
             kzt_production_lazy_prebind_refresh(
-                my_context, kzt_tb_callback_pretranslate_target, env);
+                context, kzt_tb_callback_pretranslate_target, env);
         }
     }
     if (diagnostics_enabled && event) {
@@ -2516,6 +2675,7 @@ static void kzt_tb_callback_consume(CPUX86State *env,
                             consumed_ns - event->published_ns : 0));
     }
 #else
+    (void)context;
     (void)env;
     (void)event;
 #endif
@@ -2524,25 +2684,29 @@ static void kzt_tb_callback_consume(CPUX86State *env,
 static void kzt_tb_callback(CPUX86State *env)
 {
 #ifdef CONFIG_LATX_KZT
+    box64context_t *context = my_context;
+    kzt_loader_event_hook_t *hook =
+        context ? &context->kzt_loader_event_hook : NULL;
+    struct x86_ld_info *ld_info =
+        context ? context->kzt_loader_bridge_info : NULL;
     kzt_loader_event_t event;
     uintptr_t link_map_addr;
 
-    if (!env || !ld_info) {
+    if (!env || !ld_info || !hook) {
         return;
     }
     link_map_addr = env->regs[R_EAX + ld_info->reg];
-    if (kzt_loader_event_hook_publish(&kzt_loader_event_hook, link_map_addr,
-                                      &event) != 0) {
+    if (kzt_loader_event_hook_publish(hook, link_map_addr, &event) != 0) {
         return;
     }
     printf_kzt_registry_diagnostics(
         "kzt_loader_event schema=1 phase=published build_id=%s sequence=%lu "
         "link_map=0x%lx publish_ns=%lu\n",
-        kzt_loader_event_hook.build_id, (unsigned long)event.sequence,
+        hook->build_id, (unsigned long)event.sequence,
         (unsigned long)event.link_map_addr, (unsigned long)event.published_ns);
-    kzt_tb_callback_consume(env, &event);
+    kzt_tb_callback_consume(context, env, &event);
 #else
-    kzt_tb_callback_consume(env, NULL);
+    kzt_tb_callback_consume(my_context, env, NULL);
 #endif
 }
 
@@ -2604,30 +2768,37 @@ static int kzt_tb_cancel_lifecycle_unload(
     return kzt_guest_dl_api_cancel_unload(opaque, &unload);
 }
 
-static void kzt_tb_publish_lifecycle_unload(
+static int kzt_tb_publish_lifecycle_unload(
     const kzt_loader_lifecycle_identity_t *identity,
     void *opaque)
 {
     kzt_guest_loader_identity_t unload;
+    int result;
 
     if (!identity) {
-        return;
+        return -1;
     }
     unload = (kzt_guest_loader_identity_t) {
         .link_map_addr = identity->link_map_addr,
         .generation = identity->generation,
         .namespace_id = identity->namespace_id,
     };
+    result = kzt_guest_dl_api_publish_unload(opaque, &unload);
     printf_kzt_registry_diagnostics(
         "kzt_loader_event schema=1 phase=unload link_map=0x%lx "
         "generation=%lu namespace=0x%lx result=%d\n",
         (unsigned long)unload.link_map_addr, unload.generation,
-        (unsigned long)unload.namespace_id,
-        kzt_guest_dl_api_publish_unload(opaque, &unload));
+        (unsigned long)unload.namespace_id, result);
+    return result;
 }
 
 static void kzt_tb_debug_state_callback(CPUX86State *env)
 {
+    box64context_t *context = my_context;
+    kzt_loader_event_hook_t *hook =
+        context ? &context->kzt_loader_event_hook : NULL;
+    struct x86_ld_info *ld_info =
+        context ? context->kzt_loader_bridge_info : NULL;
     kzt_loader_lifecycle_snapshot_t snapshot = {
         .result = KZT_LOADER_LIFECYCLE_SNAPSHOT_INVALID_INPUT,
     };
@@ -2635,8 +2806,8 @@ static void kzt_tb_debug_state_callback(CPUX86State *env)
     int publication_result;
 
     (void)env;
-    registry = KztGuestRegistryForContext(my_context);
-    if (!registry ||
+    registry = KztGuestRegistryForContext(context);
+    if (!hook || !registry ||
         !ld_info || !ld_info->r_debug_addr ||
         kzt_loader_lifecycle_snapshot_capture(
             registry, ld_info->r_debug_addr,
@@ -2650,11 +2821,11 @@ static void kzt_tb_debug_state_callback(CPUX86State *env)
             "result=FAIL_OPEN reason=%s\n",
             kzt_loader_lifecycle_snapshot_result_name(snapshot.result));
         (void)kzt_loader_event_hook_publish_lifecycle(
-            &kzt_loader_event_hook, KZT_LOADER_DEBUG_ADD, NULL, 0,
+            hook, (kzt_loader_debug_state_t)-1, NULL, 0,
             kzt_tb_resolve_lifecycle_identity,
             kzt_tb_prepare_lifecycle_unload,
             kzt_tb_cancel_lifecycle_unload,
-            kzt_tb_publish_lifecycle_unload, my_context);
+            kzt_tb_publish_lifecycle_unload, context);
         kzt_loader_lifecycle_snapshot_release(&snapshot);
         return;
     }
@@ -2663,19 +2834,25 @@ static void kzt_tb_debug_state_callback(CPUX86State *env)
         "maps=%lu result=OK\n", snapshot.state,
         (unsigned long)snapshot.live_map_count);
     publication_result = kzt_loader_event_hook_publish_lifecycle(
-        &kzt_loader_event_hook, snapshot.state, snapshot.live_maps,
+        hook, snapshot.state, snapshot.live_maps,
         snapshot.live_map_count,
         kzt_tb_resolve_lifecycle_identity,
         kzt_tb_prepare_lifecycle_unload,
         kzt_tb_cancel_lifecycle_unload,
-        kzt_tb_publish_lifecycle_unload, my_context);
+        kzt_tb_publish_lifecycle_unload, context);
     if (publication_result != 0) {
         printf_kzt_registry_diagnostics(
             "kzt_loader_event schema=1 phase=lifecycle-publication "
             "result=FAIL_OPEN reason=%s\n",
             kzt_loader_lifecycle_result_name(
                 kzt_loader_event_hook_lifecycle_result(
-                    &kzt_loader_event_hook)));
+                    hook)));
+    } else if (snapshot.state == KZT_LOADER_DEBUG_CONSISTENT &&
+               __atomic_exchange_n(
+                   &context->kzt_lazy_prebind_refresh_pending, 0,
+                   __ATOMIC_ACQ_REL)) {
+        kzt_production_lazy_prebind_refresh(
+            context, kzt_tb_callback_pretranslate_target, env);
     }
     kzt_loader_lifecycle_snapshot_release(&snapshot);
 }
@@ -2900,19 +3077,22 @@ static struct x86_ld_info *find_ld_bridge(
         return NULL;
     }
 #ifdef CONFIG_LATX_KZT
+    kzt_loader_event_layout_t loader_layout = { 0 };
+
     if (kzt_loader_event_hook_read_build_id(real_dl_file, build_id) != 0) {
         return NULL;
     }
+    (void)kzt_loader_event_hook_lookup_layout(build_id, &loader_layout);
 #else
     (void)build_id;
 #endif
     size_t file_len = st.st_size;
 
 #ifdef CONFIG_LATX_KZT
-    uintptr_t debug_state_addr = (uintptr_t)ld_start +
-        KZT_LOADER_EVENT_HOOK_DEBUG_STATE_OFFSET;
-    uintptr_t r_debug_addr = (uintptr_t)ld_start +
-        KZT_LOADER_EVENT_HOOK_R_DEBUG_OFFSET;
+    uintptr_t debug_state_addr = loader_layout.debug_state_offset
+        ? (uintptr_t)ld_start + loader_layout.debug_state_offset : 0;
+    uintptr_t r_debug_addr = loader_layout.r_debug_offset
+        ? (uintptr_t)ld_start + loader_layout.r_debug_offset : 0;
 #endif
 
     uint8_t* fix_addr = (uint8_t *)(ld_start+0xbc15);
@@ -2922,7 +3102,8 @@ static struct x86_ld_info *find_ld_bridge(
         ret->reg = (*(fix_addr+ 2)) & 0xf;
 #ifdef CONFIG_LATX_KZT
         ret->debug_state_addr =
-            *(uint8_t *)debug_state_addr == 0xc3 ? debug_state_addr : 0;
+            debug_state_addr && *(uint8_t *)debug_state_addr == 0xc3
+                ? debug_state_addr : 0;
         ret->r_debug_addr = ret->debug_state_addr ? r_debug_addr : 0;
 #endif
         printf_log(LOG_DEBUG, "debug find ld so 0x%lx reg = %d\n", ret->addr, ret->reg);
@@ -2935,7 +3116,8 @@ static struct x86_ld_info *find_ld_bridge(
         ret->reg = (*(fix_addr+ 2)) & 0xf;
 #ifdef CONFIG_LATX_KZT
         ret->debug_state_addr =
-            *(uint8_t *)debug_state_addr == 0xc3 ? debug_state_addr : 0;
+            debug_state_addr && *(uint8_t *)debug_state_addr == 0xc3
+                ? debug_state_addr : 0;
         ret->r_debug_addr = ret->debug_state_addr ? r_debug_addr : 0;
 #endif
         printf_log(LOG_DEBUG, "debug find ld so 0x%lx reg = %d\n", ret->addr, ret->reg);
@@ -2948,7 +3130,8 @@ static struct x86_ld_info *find_ld_bridge(
         ret->reg = (*(fix_addr+ 2)) & 0xf;
 #ifdef CONFIG_LATX_KZT
         ret->debug_state_addr =
-            *(uint8_t *)debug_state_addr == 0xc3 ? debug_state_addr : 0;
+            debug_state_addr && *(uint8_t *)debug_state_addr == 0xc3
+                ? debug_state_addr : 0;
         ret->r_debug_addr = ret->debug_state_addr ? r_debug_addr : 0;
 #endif
         printf_log(LOG_DEBUG, "debug find ld so 0x%lx reg = %d\n", ret->addr, ret->reg);
@@ -2961,7 +3144,8 @@ static struct x86_ld_info *find_ld_bridge(
         ret->reg = (*(fix_addr+ 2)) & 0xf;
 #ifdef CONFIG_LATX_KZT
         ret->debug_state_addr =
-            *(uint8_t *)debug_state_addr == 0xc3 ? debug_state_addr : 0;
+            debug_state_addr && *(uint8_t *)debug_state_addr == 0xc3
+                ? debug_state_addr : 0;
         ret->r_debug_addr = ret->debug_state_addr ? r_debug_addr : 0;
 #endif
         printf_log(LOG_DEBUG, "debug find ld so 0x%lx reg = %d\n", ret->addr, ret->reg);
@@ -2975,7 +3159,8 @@ static struct x86_ld_info *find_ld_bridge(
         ret->reg = (*(fix_addr+ 2)) & 0xf;
 #ifdef CONFIG_LATX_KZT
         ret->debug_state_addr =
-            *(uint8_t *)debug_state_addr == 0xc3 ? debug_state_addr : 0;
+            debug_state_addr && *(uint8_t *)debug_state_addr == 0xc3
+                ? debug_state_addr : 0;
         ret->r_debug_addr = ret->debug_state_addr ? r_debug_addr : 0;
 #endif
         printf_log(LOG_DEBUG, "debug find ld so 0x%lx reg = %d\n", ret->addr, ret->reg);
@@ -2989,7 +3174,8 @@ static struct x86_ld_info *find_ld_bridge(
         ret->reg = (*(fix_addr+ 2)) & 0xf;
 #ifdef CONFIG_LATX_KZT
         ret->debug_state_addr =
-            *(uint8_t *)debug_state_addr == 0xc3 ? debug_state_addr : 0;
+            debug_state_addr && *(uint8_t *)debug_state_addr == 0xc3
+                ? debug_state_addr : 0;
         ret->r_debug_addr = ret->debug_state_addr ? r_debug_addr : 0;
 #endif
         printf_log(LOG_DEBUG, "debug find ld so 0x%lx reg = %d\n", ret->addr, ret->reg);
@@ -2999,7 +3185,8 @@ static struct x86_ld_info *find_ld_bridge(
 #ifdef CONFIG_LATX_KZT
     if (ret) {
         ret->debug_state_addr =
-            *(uint8_t *)debug_state_addr == 0xc3 ? debug_state_addr : 0;
+            debug_state_addr && *(uint8_t *)debug_state_addr == 0xc3
+                ? debug_state_addr : 0;
         ret->r_debug_addr = ret->debug_state_addr ? r_debug_addr : 0;
     }
 #endif
@@ -3008,20 +3195,26 @@ static struct x86_ld_info *find_ld_bridge(
 
 void init_tb_callback_bridge(CPUState *cpu, void* info)
 {
-    static uint32 jmpinst_ld [2] = {0};
+    box64context_t *context = my_context;
+    struct x86_ld_info *ld_info =
+        context ? context->kzt_loader_bridge_info : NULL;
 #ifdef CONFIG_LATX_KZT
-    static uint32 jmpinst_debug_state[2] = { 0 };
+    kzt_loader_event_hook_t *hook =
+        context ? &context->kzt_loader_event_hook : NULL;
 #endif
+    if (!context) {
+        return;
+    }
     if (!ld_info) {
         char build_id[KZT_LOADER_EVENT_HOOK_BUILD_ID_SIZE] = { 0 };
         struct x86_ld_info *candidate = find_ld_bridge(info, build_id);
 #ifdef CONFIG_LATX_KZT
-        if (my_context) {
-            my_context->kzt_guest_scope_layout =
+        if (context) {
+            context->kzt_guest_scope_layout =
                 KZT_GUEST_SCOPE_LAYOUT_UNSUPPORTED;
         }
-        if (!candidate ||
-            kzt_loader_event_hook_install(&kzt_loader_event_hook,
+        if (!hook || !candidate ||
+            kzt_loader_event_hook_install(hook,
                                           build_id[0] ? build_id : NULL,
                                           candidate ? candidate->addr : 0,
                                           candidate ? candidate->reg : 0,
@@ -3030,24 +3223,26 @@ void init_tb_callback_bridge(CPUState *cpu, void* info)
             printf_kzt_registry_diagnostics(
                 "kzt_loader_event schema=1 phase=install result=%s build_id=%s "
                 "rollback=disabled\n",
-                kzt_loader_event_hook_result_name(kzt_loader_event_hook.result),
+                hook ? kzt_loader_event_hook_result_name(hook->result)
+                     : "NO_CONTEXT",
                 build_id[0] ? build_id : "(unavailable)");
             free(candidate);
             return;
         }
-        if (my_context) {
-            my_context->kzt_guest_scope_layout =
-                kzt_loader_event_hook_scope_layout(&kzt_loader_event_hook);
+        if (context) {
+            context->kzt_guest_scope_layout =
+                kzt_loader_event_hook_scope_layout(hook);
         }
         if (!candidate->debug_state_addr || !candidate->r_debug_addr ||
             kzt_loader_event_hook_enable_lifecycle(
-                &kzt_loader_event_hook, candidate->debug_state_addr,
+                hook, candidate->debug_state_addr,
                 candidate->r_debug_addr) != 0) {
             printf_kzt_registry_diagnostics(
                 "kzt_loader_event schema=1 phase=lifecycle-install "
                 "result=FAIL_OPEN build_id=%s\n", build_id);
         }
 #endif
+        context->kzt_loader_bridge_info = candidate;
         ld_info = candidate;
 #ifdef CONFIG_LATX_KZT
         printf_kzt_registry_diagnostics(
@@ -3063,13 +3258,15 @@ void init_tb_callback_bridge(CPUState *cpu, void* info)
     }
     CPUArchState *env = cpu->env_ptr;
     target_ulong eip = env->eip;
-    kzt_add_fucn_by_addr((uint32 *)&jmpinst_ld, cpu, ld_info->addr, target_latx_ld_callback, kzt_tb_callback);
+    kzt_add_fucn_by_addr(
+        context->kzt_loader_callback_original, cpu, ld_info->addr,
+        target_latx_ld_callback, kzt_tb_callback);
 #ifdef CONFIG_LATX_KZT
-    if (__atomic_load_n(&kzt_loader_event_hook.lifecycle_enabled,
+    if (hook && __atomic_load_n(&hook->lifecycle_enabled,
                         __ATOMIC_ACQUIRE)) {
         kzt_add_fucn_by_addr(
-            (uint32 *)&jmpinst_debug_state, cpu,
-            kzt_loader_event_hook.debug_state_addr,
+            context->kzt_loader_debug_state_original, cpu,
+            hook->debug_state_addr,
             target_latx_ld_callback, kzt_tb_debug_state_callback);
     }
 #endif
@@ -3191,30 +3388,17 @@ void kzt_wine_bridge(abi_ulong start, int fd)
     }
 }
 
-void kzt_wine_init_x86(box64context_t *context, uintptr_t guest_dlsym)
-{
-    if (!context || !option_kzt || !latx_wine || context->mallocmapsize) {
-        return;
-    }
-    struct malloc_map* m = malloc(sizeof(struct malloc_map));
-    m->mallocp = (void *)(uintptr_t)RunFunctionWithState(guest_dlsym, 2,
-    0, "malloc");
-    ;
-    m->freep = (void *)(uintptr_t)RunFunctionWithState(guest_dlsym, 2,
-    0, "free");
-    m->reallocp = (void *)(uintptr_t)RunFunctionWithState(guest_dlsym, 2,
-    0, "realloc");
-    m->h = wine_elf_header;
-    AddMallocMap(context, m);
-    x86free = m->freep;
-    x86realloc = m->reallocp;
-}
-
-elfheader_t* tryLoadElfFromFile(const char* name)
+elfheader_t* tryLoadElfFromFileForContext(
+    box64context_t *context, const char *name)
 {
     elfheader_t* h = NULL;
-    char *tmp = ResolveFile(name, &my_context->box64_ld_lib);
+    char *tmp;
     uintptr_t load_addr;
+
+    if (!context || !name) {
+        return NULL;
+    }
+    tmp = ResolveFile(name, &context->box64_ld_lib);
 
     if (tmp && FileExist(tmp, IS_FILE)) {
         FILE *f = fopen(tmp, "rb");
@@ -3242,6 +3426,11 @@ elfheader_t* tryLoadElfFromFile(const char* name)
     }
     box_free(tmp);
     return h;
+}
+
+elfheader_t* tryLoadElfFromFile(const char* name)
+{
+    return tryLoadElfFromFileForContext(my_context, name);
 }
 
 void freeElfFromFile(elfheader_t **header)

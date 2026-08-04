@@ -15,6 +15,10 @@ typedef struct kzt_guest_wrapper_source_proof {
     kzt_guest_library_binding_key_t key;
 } kzt_guest_wrapper_source_proof_t;
 
+const char *kzt_guest_library_wrapper_name_for_guest(
+    const char *guest_name);
+int kzt_guest_library_wrapper_alias_symbol_allowed(const char *symbol);
+
 int kzt_guest_library_wrapper_source_acquire(
     box64context_t *context, uintptr_t link_map_addr,
     const char *requested_path, const char *wrapper_name,
@@ -64,6 +68,10 @@ int kzt_guest_library_run_dlinfo(
  */
 uintptr_t kzt_guest_library_select_symbol_result(
     box64context_t *context, uintptr_t guest_handle,
+    uintptr_t guest_result, const char *symbol, const char *version);
+uintptr_t kzt_guest_library_select_symbol_result_with_identity(
+    box64context_t *context, uintptr_t guest_handle,
+    const kzt_guest_loader_identity_t *queried_identity,
     uintptr_t guest_result, const char *symbol, const char *version);
 
 /* Shared production adapter used by wrappedlibc, wrappedlibdl, and loader

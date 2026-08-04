@@ -60,8 +60,10 @@ if "kzt_guest_dl_api_bind_current_thread(&env->kzt_guest_dlerror_state)" \
 
 if "kzt_guest_dl_entry_state_t guest_dl_entries;" not in context_header:
     raise AssertionError("context does not own the guest dl entry publication state")
-if "kzt_guest_dl_api_entry_state_destroy(ctx->dlprivate)" not in box_context:
-    raise AssertionError("context destruction does not close guest dl initialization")
+if "kzt_guest_dl_api_entry_state_begin_teardown(ctx->dlprivate)" not in box_context:
+    raise AssertionError("context destruction does not close guest dl admission")
+if "kzt_guest_dl_api_entry_state_destroy(*dl)" not in box_context:
+    raise AssertionError("dlprivate destruction does not release guest dl state")
 
 for source in wrapped_sources:
     if "init_x86dlfun" in source:
@@ -79,7 +81,7 @@ for source in wrapped_sources:
     if start < 0 or end < 0:
         raise AssertionError("libc/libdl dlerror wrapper is missing")
     dlerror_body = source[start:end]
-    state_check = dlerror_body.find("if (fast_result)")
+    state_check = dlerror_body.find("if (fast_result || guest_loader_route)")
     slow = dlerror_body.find("kzt_guest_dlerror_slow_path(")
     fast_return = dlerror_body.find("return fast_result;")
     if min(state_check, slow, fast_return) < 0 or not (
@@ -125,8 +127,10 @@ if dl_init.count("freeElfFromFile(&header)") != 2:
     raise AssertionError("guest dl resolver does not release transient headers")
 if "FindInCollection(path, &context->box64_ld_lib)" not in dl_init:
     raise AssertionError("guest dl resolver retry duplicates the hwcaps path")
-if "kzt_wine_init_x86(opaque, entries->dlsym)" not in dl_init:
-    raise AssertionError("guest dl prepare is not bound to the owning context")
+if "kzt_guest_dl_api_ensure_entries_prepared(" not in dl_init:
+    raise AssertionError("guest dl initialization is not bound to owning state")
+if "kzt_wine_init_x86" in dl_init:
+    raise AssertionError("guest dl initialization retains Wine-only entry setup")
 for required in (
     "load_addr = h ? loadSoaddrFromMap(tmp) : 0;",
     "if (!h || !load_addr)",

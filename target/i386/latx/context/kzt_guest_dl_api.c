@@ -8,6 +8,7 @@
 #include "kzt_guest_library_adapter.h"
 #include "kzt_guest_library_binding.h"
 #include "kzt_guest_registry.h"
+#include "kzt_guest_runtime_entry_state.h"
 #include "kzt_lifecycle_diagnostics.h"
 #ifdef CONFIG_LATX_KZT
 #include "kzt_jump_slot_production.h"
@@ -60,7 +61,10 @@ int kzt_guest_dl_api_entry_state_init(dlprivate_t *dl)
         pthread_mutex_destroy(&state->mutex);
         return -1;
     }
-    state->initialized = 1;
+    __atomic_store_n(
+        &state->lifecycle, KZT_GUEST_DL_LIFECYCLE_OPEN,
+        __ATOMIC_RELEASE);
+    __atomic_store_n(&state->initialized, 1, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -83,23 +87,31 @@ const kzt_guest_dl_entries_t *kzt_guest_dl_api_ensure_entries_prepared(
     kzt_guest_dl_entries_t local = { 0 };
     kzt_guest_dl_entries_t *candidate = NULL;
     uintptr_t observed_dlerror;
+    int prepared = 1;
     int resolved;
 
     if (published_now) {
         *published_now = 0;
     }
-    if (!dl || !resolver || !fallback ||
-        !(state = &dl->guest_dl_entries)->initialized) {
+    if (!dl || !resolver || !fallback) {
+        return NULL;
+    }
+    state = &dl->guest_dl_entries;
+    if (kzt_guest_dl_entry_state_enter(state) != 0) {
         return NULL;
     }
     published = kzt_guest_dl_api_load_entries(dl);
     if (published) {
+        pthread_mutex_lock(&state->mutex);
+        kzt_guest_dl_entry_state_leave_locked(state);
+        pthread_mutex_unlock(&state->mutex);
         return published;
     }
     memset(fallback, 0, sizeof(*fallback));
 
     pthread_mutex_lock(&state->mutex);
     if (state->teardown) {
+        kzt_guest_dl_entry_state_leave_locked(state);
         pthread_mutex_unlock(&state->mutex);
         return NULL;
     }
@@ -108,6 +120,7 @@ const kzt_guest_dl_entries_t *kzt_guest_dl_api_ensure_entries_prepared(
         published = kzt_guest_dl_api_load_entries(dl);
         if (published || state->teardown) {
             kzt_guest_dl_entry_slow_leave(state);
+            kzt_guest_dl_entry_state_leave_locked(state);
             pthread_mutex_unlock(&state->mutex);
             return published;
         }
@@ -120,6 +133,7 @@ const kzt_guest_dl_entries_t *kzt_guest_dl_api_ensure_entries_prepared(
         if (state->initializer_valid &&
             pthread_equal(state->initializer, pthread_self())) {
             kzt_guest_dl_entry_slow_leave(state);
+            kzt_guest_dl_entry_state_leave_locked(state);
             pthread_mutex_unlock(&state->mutex);
             return NULL;
         }
@@ -148,12 +162,12 @@ const kzt_guest_dl_entries_t *kzt_guest_dl_api_ensure_entries_prepared(
         }
         if (prepare) {
             pthread_mutex_unlock(&state->mutex);
-            prepare(candidate, opaque);
+            prepared = prepare(candidate, opaque) == 0;
             pthread_mutex_lock(&state->mutex);
         }
         observed_dlerror = __atomic_load_n(
             &state->observed_dlerror, __ATOMIC_RELAXED);
-        if (!state->teardown &&
+        if (!state->teardown && prepared &&
             observed_dlerror == candidate->dlerror) {
             __atomic_store_n(
                 &state->published, candidate, __ATOMIC_RELEASE);
@@ -167,6 +181,7 @@ const kzt_guest_dl_entries_t *kzt_guest_dl_api_ensure_entries_prepared(
     state->initializer_valid = 0;
     published = kzt_guest_dl_api_load_entries(dl);
     kzt_guest_dl_entry_slow_leave(state);
+    kzt_guest_dl_entry_state_leave_locked(state);
     pthread_mutex_unlock(&state->mutex);
     box_free(candidate);
     return published ? published : fallback;
@@ -180,24 +195,32 @@ const kzt_guest_dl_entries_t *kzt_guest_dl_api_ensure_entries(
         dl, resolver, NULL, opaque, fallback, published_now);
 }
 
-void kzt_guest_dl_api_entry_state_destroy(dlprivate_t *dl)
+void kzt_guest_dl_api_entry_state_begin_teardown(dlprivate_t *dl)
 {
     kzt_guest_dl_entry_state_t *state;
     kzt_guest_dl_entries_t *published;
 
-    if (!dl || !(state = &dl->guest_dl_entries)->initialized) {
+    if (!dl) {
         return;
     }
-    pthread_mutex_lock(&state->mutex);
-    state->teardown = 1;
-    pthread_cond_broadcast(&state->ready);
-    while (state->initializing || state->slow_users) {
-        pthread_cond_wait(&state->ready, &state->mutex);
-    }
+    state = &dl->guest_dl_entries;
+    kzt_guest_runtime_entry_state_begin_teardown(state);
     published = __atomic_exchange_n(
         &state->published, NULL, __ATOMIC_ACQ_REL);
-    pthread_mutex_unlock(&state->mutex);
     box_free(published);
+}
+
+void kzt_guest_dl_api_entry_state_destroy(dlprivate_t *dl)
+{
+    kzt_guest_dl_entry_state_t *state;
+
+    if (!dl || !__atomic_exchange_n(
+                   &dl->guest_dl_entries.initialized, 0,
+                   __ATOMIC_ACQ_REL)) {
+        return;
+    }
+    state = &dl->guest_dl_entries;
+    kzt_guest_dl_api_entry_state_begin_teardown(dl);
     pthread_cond_destroy(&state->ready);
     pthread_mutex_destroy(&state->mutex);
     memset(state, 0, sizeof(*state));
@@ -791,6 +814,9 @@ kzt_guest_dl_symbol_result_t kzt_guest_dl_api_dlsym(
     void *handle, void *symbol)
 {
     kzt_guest_dl_symbol_result_t result = { 0 };
+    kzt_guest_loader_identity_t queried_identity = { 0 };
+    kzt_guest_loader_identity_t known_identity = { 0 };
+    const kzt_guest_loader_identity_t *identity_hint = NULL;
     uintptr_t guest_result;
 
     if (handle == KZT_GUEST_RTLD_NEXT) {
@@ -799,8 +825,21 @@ kzt_guest_dl_symbol_result_t kzt_guest_dl_api_dlsym(
     }
     guest_result = kzt_guest_library_run_dlsym(
         entries->dlsym, handle, symbol);
-    result.value = kzt_guest_library_select_symbol_result(
-        context, (uintptr_t)handle, guest_result,
+#ifdef CONFIG_LATX_KZT
+    if (guest_result && context && handle && kzt_guest_dl_api_enabled()) {
+        kzt_guest_registry_t *registry = KztGuestRegistryForContext(context);
+
+        if (registry && kzt_guest_registry_find_loader_identity(
+                            registry, (uintptr_t)handle,
+                            &known_identity) != 0 &&
+            kzt_guest_dl_api_query_identity(
+                entries, (uintptr_t)handle, &queried_identity) == 0) {
+            identity_hint = &queried_identity;
+        }
+    }
+#endif
+    result.value = kzt_guest_library_select_symbol_result_with_identity(
+        context, (uintptr_t)handle, identity_hint, guest_result,
         (const char *)symbol, NULL);
     return result;
 }
@@ -810,6 +849,9 @@ kzt_guest_dl_symbol_result_t kzt_guest_dl_api_dlvsym(
     void *handle, void *symbol, const char *version)
 {
     kzt_guest_dl_symbol_result_t result = { 0 };
+    kzt_guest_loader_identity_t queried_identity = { 0 };
+    kzt_guest_loader_identity_t known_identity = { 0 };
+    const kzt_guest_loader_identity_t *identity_hint = NULL;
     uintptr_t guest_result;
 
     if (handle == KZT_GUEST_RTLD_NEXT) {
@@ -818,14 +860,28 @@ kzt_guest_dl_symbol_result_t kzt_guest_dl_api_dlvsym(
     }
     guest_result = kzt_guest_library_run_dlvsym(
         entries->dlvsym, handle, symbol, version);
-    result.value = kzt_guest_library_select_symbol_result(
-        context, (uintptr_t)handle, guest_result,
+#ifdef CONFIG_LATX_KZT
+    if (guest_result && context && handle && kzt_guest_dl_api_enabled()) {
+        kzt_guest_registry_t *registry = KztGuestRegistryForContext(context);
+
+        if (registry && kzt_guest_registry_find_loader_identity(
+                            registry, (uintptr_t)handle,
+                            &known_identity) != 0 &&
+            kzt_guest_dl_api_query_identity(
+                entries, (uintptr_t)handle, &queried_identity) == 0) {
+            identity_hint = &queried_identity;
+        }
+    }
+#endif
+    result.value = kzt_guest_library_select_symbol_result_with_identity(
+        context, (uintptr_t)handle, identity_hint, guest_result,
         (const char *)symbol, version);
     return result;
 }
 
 kzt_guest_dlerror_result_t kzt_guest_dl_api_dlerror(
-    kzt_guest_dlerror_state_t *state, uintptr_t guest_dlerror)
+    kzt_guest_dlerror_state_t *state, uintptr_t guest_dlerror,
+    int guest_route_may_have_pending_error)
 {
     kzt_guest_dlerror_result_t result = { 0 };
 
@@ -847,10 +903,13 @@ kzt_guest_dlerror_result_t kzt_guest_dl_api_dlerror(
         if (state->last_error_guest_consumed) {
             state->last_error_guest_consumed = 0;
             kzt_guest_dl_api_set_slow_required(state, 0);
-            return result;
+            if (!guest_route_may_have_pending_error) {
+                return result;
+            }
         }
     }
-    if (state && !state->dlerror_slow_required) {
+    if (state && !state->dlerror_slow_required &&
+        !guest_route_may_have_pending_error) {
         return result;
     }
     result.forward_to_guest_caller = 1;

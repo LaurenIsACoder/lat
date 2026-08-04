@@ -70,11 +70,17 @@ route = (
 production = (
     root / "target/i386/latx/context/kzt_jump_slot_production.c"
 ).read_text(encoding="utf-8")
+glob_dat_source = (
+    root / "target/i386/latx/context/kzt_guest_glob_dat_target.c"
+).read_text(encoding="utf-8")
 
 rela = function_body(elfloader, "int RelocateElfRELA(")
 legacy = function_body(elfloader, "kzt_resolve_legacy_rela_target(")
 glob_dat = function_body(
-    elfloader, "kzt_guest_glob_dat_target_resolve("
+    glob_dat_source, "kzt_guest_glob_dat_target_resolve("
+)
+glob_dat_route = function_body(
+    glob_dat_source, "int kzt_guest_glob_dat_route("
 )
 route_apply = function_body(route, "int kzt_jump_slot_route_apply(")
 acquire = function_body(production, "static int production_acquire_exact(")
@@ -92,7 +98,7 @@ required_glob_dat = (
     "KZT_PATCH_OWNER_MATCH",
     "current_owner.known",
     "KztGuestLibraryLookupForContext(",
-    "GetLibSymbolStartEnd(",
+    "kzt_rela_runtime_select_exact_wrapper_bridge_retained(",
     "STT_FUNC",
     "version >= 2",
 )
@@ -119,26 +125,27 @@ fallback = rela.rfind("kzt_resolve_legacy_rela_target(")
 if fallback < 0 or guest_route.start() > fallback:
     fail("host compatibility lookup must happen after the guest-first route")
 if not re.search(
-    r"kzt_guest_glob_dat_target_resolve\s*\([\s\S]*?\)\s*\)\s*\{"
+    r"kzt_guest_glob_dat_route\s*\([\s\S]*?\)\s*\)\s*\{"
     r"[\s\S]*?continue\s*;",
     rela,
 ):
     fail("authoritative GLOB_DAT guest targets must bypass host lookup")
 if not re.search(
-    r"if\s*\(\s*bind\s*!=\s*STB_LOCAL\s*\)\s*\{[\s\S]*?"
+    r"if\s*\(\s*observed\s*\|\|\s*bind\s*!=\s*STB_LOCAL[\s\S]*?"
     r"route=GUEST_PRESERVED[\s\S]*?host_lookup=0[\s\S]*?continue\s*;",
     rela,
 ):
     fail("KZT GLOB_DAT evidence failure can reach host lookup")
 if not re.search(
-    r"if\s*\(\s*\(option_kzt\s*\|\|\s*wine_option_kzt\)\s*&&\s*"
-    r"bind\s*!=\s*STB_LOCAL\s*\)\s*\{[\s\S]*?"
+    r"if\s*\(\s*option_kzt\s*\|\|\s*wine_option_kzt\s*\)\s*\{[\s\S]*?"
     r"route=GUEST_PRESERVED[\s\S]*?host_lookup=0[\s\S]*?break\s*;",
     rela,
 ):
     fail("KZT JUMP_SLOT evidence failure can reach host lookup")
-if "__atomic_compare_exchange_n(" not in rela:
-    fail("GLOB_DAT exact-owner bridge must not overwrite a competitor")
+if "__atomic_compare_exchange_n(" in rela:
+    fail("eager relocation bypasses the transactional writer")
+if "kzt_production_eager_relocation_write(" not in glob_dat_route:
+    fail("GLOB_DAT exact-owner bridge lacks the transactional writer")
 
 for forbidden in ("input->resolved_target_matches_legacy",):
     if forbidden in route_apply:

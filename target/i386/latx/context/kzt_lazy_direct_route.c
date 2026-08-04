@@ -188,6 +188,21 @@ kzt_lazy_direct_route_status_t kzt_lazy_direct_route_apply(
         result->selected_target = bridge.target;
     } else if (cas_status == KZT_LAZY_DIRECT_ROUTE_CAS_MISMATCH) {
         result->reason = KZT_LAZY_DIRECT_ROUTE_REASON_CAS_MISMATCH;
+    } else if (cas_status == KZT_LAZY_DIRECT_ROUTE_CAS_BUDGET_EXHAUSTED) {
+        if (input->allow_budget_transient_native && bridge.transient_safe &&
+            kzt_patch_symbol_is_loader_route_family(input->symbol)) {
+            result->status = KZT_LAZY_DIRECT_ROUTE_NATIVE_TRANSIENT;
+            result->reason = KZT_LAZY_DIRECT_ROUTE_REASON_NATIVE_TRANSIENT;
+            result->selected_target = bridge.target;
+        } else {
+            result->reason = KZT_LAZY_DIRECT_ROUTE_REASON_BUDGET_EXHAUSTED;
+        }
+    } else if (cas_status == KZT_LAZY_DIRECT_ROUTE_CAS_ROLLED_BACK) {
+        result->status = KZT_LAZY_DIRECT_ROUTE_WRITE_ROLLED_BACK;
+        result->reason = KZT_LAZY_DIRECT_ROUTE_REASON_WRITE_ROLLED_BACK;
+    } else if (cas_status == KZT_LAZY_DIRECT_ROUTE_CAS_UNRECOVERABLE) {
+        result->status = KZT_LAZY_DIRECT_ROUTE_UNRECOVERABLE;
+        result->reason = KZT_LAZY_DIRECT_ROUTE_REASON_UNRECOVERABLE;
     } else {
         result->reason = KZT_LAZY_DIRECT_ROUTE_REASON_CAS_ERROR;
     }

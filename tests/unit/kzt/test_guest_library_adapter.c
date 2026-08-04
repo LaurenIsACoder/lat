@@ -22,6 +22,12 @@ int kzt_registry_diagnostics;
 int option_kzt = 1;
 int wine_option_kzt;
 
+int FindLibIsWrapped(char *name)
+{
+    return name && (strcmp(name, "libwi963.so") == 0 ||
+                    strcmp(name, "libc.so.6") == 0);
+}
+
 static struct kzt_guest_library_bindings bindings;
 static kzt_guest_library_loader_scope_t *thread_scope;
 static uintptr_t expected_function;
@@ -62,8 +68,6 @@ static int resolve_result;
 static int lookup_result;
 static library_t *lookup_library;
 static kzt_guest_library_object_type_t lookup_object_type;
-static int wrapper_lookup_result;
-static int wrapper_function_lookup_result;
 static uintptr_t wrapper_result;
 static int resolve_count;
 static int lookup_count;
@@ -80,6 +84,7 @@ static kzt_guest_loader_identity_t lookup_loader_identity;
 static int lookup_loader_identity_result;
 static int symbol_source_result;
 static int symbol_source_acquire_count;
+static int exact_symbol_source_acquire_count;
 static int dynamic_view_count;
 static int dynsym_lookup_count;
 static int evidence_lookup_count;
@@ -90,13 +95,12 @@ static uintptr_t evidence_runtime_address;
 static unsigned char evidence_symbol_type;
 static kzt_symbol_version_evidence_t expected_dynsym_version_evidence;
 static const char *expected_dynsym_version;
-static int provider_discover_result;
-static int provider_discover_count;
-static int wrapper_probe_count;
-static kzt_patch_wrapper_match_t wrapper_probe_match;
-static kzt_symbol_version_evidence_t wrapper_probe_version_evidence;
-static const char *wrapper_probe_version;
-static uintptr_t wrapper_probe_bridge_target;
+static int exact_selector_count;
+static uintptr_t exact_selector_result;
+static int bridge_evidence_store_count;
+static int bridge_evidence_valid;
+static unsigned long bridge_evidence_dynamic_revision;
+static uintptr_t bridge_evidence_target;
 
 #define CHECK(label, condition)                                              \
     do {                                                                     \
@@ -163,6 +167,48 @@ int kzt_guest_registry_loader_symbol_source_acquire(
           registry == (kzt_guest_registry_t *)(uintptr_t)0x1110);
     CHECK("symbol source handle", handle == lookup_guest_handle);
     ++symbol_source_acquire_count;
+    if (symbol_source_result != 0) {
+        memset(identity, 0, sizeof(*identity));
+        memset(dynamic_view, 0, sizeof(*dynamic_view));
+        *dynamic_status = KZT_GUEST_FIELD_UNKNOWN;
+        *dynamic_revision = 0;
+        memset(lease, 0, sizeof(*lease));
+        return symbol_source_result;
+    }
+    *identity = lookup_loader_identity;
+    memset(dynamic_view, 0, sizeof(*dynamic_view));
+    dynamic_view->status = KZT_GUEST_DYNAMIC_COMPLETE;
+    *dynamic_status = dynamic_view_status;
+    *dynamic_revision = 5;
+    *lease = (kzt_guest_registry_source_lease_t) {
+        .registry = registry,
+        .link_map_addr = identity->link_map_addr,
+        .generation = identity->generation,
+        .namespace_id = identity->namespace_id,
+        .active = 1,
+    };
+    return 0;
+}
+
+int kzt_guest_registry_loader_symbol_source_acquire_exact(
+    kzt_guest_registry_t *registry,
+    const kzt_guest_loader_identity_t *queried_identity,
+    kzt_guest_loader_identity_t *identity,
+    kzt_guest_dynamic_view_t *dynamic_view,
+    kzt_guest_field_status_t *dynamic_status,
+    unsigned long *dynamic_revision,
+    kzt_guest_registry_source_lease_t *lease)
+{
+    CHECK("exact symbol source registry",
+          registry == (kzt_guest_registry_t *)(uintptr_t)0x1110);
+    CHECK("exact symbol source identity",
+          queried_identity &&
+              queried_identity->handle == lookup_guest_handle &&
+              queried_identity->link_map_addr ==
+                  lookup_loader_identity.link_map_addr &&
+              queried_identity->namespace_id ==
+                  lookup_loader_identity.namespace_id);
+    ++exact_symbol_source_acquire_count;
     if (symbol_source_result != 0) {
         memset(identity, 0, sizeof(*identity));
         memset(dynamic_view, 0, sizeof(*dynamic_view));
@@ -300,66 +346,46 @@ kzt_guest_dynsym_lookup_status_t kzt_guest_dynsym_lookup(
     return result->status;
 }
 
-int kzt_rela_runtime_wrapper_provider_discover_retained_with_version_evidence(
+uintptr_t kzt_rela_runtime_select_exact_wrapper_bridge_retained(
     box64context_t *context,
     const kzt_guest_library_handle_t *retained_provider_handle,
     const char *symbol_name,
     kzt_symbol_version_evidence_t version_evidence,
-    const char *symbol_version,
-    kzt_wrapper_bridge_provider_t *provider)
+    const char *symbol_version)
 {
-    CHECK("provider context", context != NULL);
-    CHECK("provider retained binding",
+    CHECK("selector context", context != NULL);
+    CHECK("selector retained binding",
           retained_provider_handle && retained_provider_handle->entry &&
           retained_provider_handle->library == lookup_library);
-    CHECK("provider symbol", strcmp(symbol_name, "wi963_symbol") == 0);
-    CHECK("provider version evidence",
+    CHECK("selector symbol", strcmp(symbol_name, "wi963_symbol") == 0);
+    CHECK("selector version evidence",
           version_evidence == expected_dynsym_version_evidence);
-    CHECK("provider version",
-          expected_dynsym_version && symbol_version &&
-          strcmp(symbol_version, expected_dynsym_version) == 0);
-    ++provider_discover_count;
-    memset(provider, 0, sizeof(*provider));
-    provider->manifest.available = provider_discover_result > 0;
-    return provider_discover_result;
-}
-
-int kzt_wrapper_probe_minimal_manifest(
-    const kzt_wrapper_probe_manifest_t *manifest,
-    const kzt_wrapper_probe_request_t *request,
-    const kzt_wrapper_probe_bridge_ops_t *bridge_ops,
-    kzt_wrapper_probe_result_t *result)
-{
-    CHECK("probe manifest", manifest && manifest->available);
-    CHECK("probe request", request != NULL);
-    CHECK("probe symbol", strcmp(request->symbol_name, "wi963_symbol") == 0);
-    CHECK("probe version evidence",
-          request->symbol_version_evidence == expected_dynsym_version_evidence);
-    CHECK("probe version",
-          expected_dynsym_version && request->symbol_version &&
-          strcmp(request->symbol_version, expected_dynsym_version) == 0);
-    CHECK("probe bridge ops", bridge_ops != NULL);
-    ++wrapper_probe_count;
-    memset(result, 0, sizeof(*result));
-    result->wrapper_match = wrapper_probe_match;
-    result->wrapper_version_evidence = wrapper_probe_version_evidence;
-    result->wrapper_symbol_version = wrapper_probe_version;
-    result->bridge_target = wrapper_probe_bridge_target;
-    return 0;
+    CHECK("selector version",
+          expected_dynsym_version
+              ? symbol_version &&
+                    strcmp(symbol_version, expected_dynsym_version) == 0
+              : symbol_version == NULL);
+    ++exact_selector_count;
+    return exact_selector_result;
 }
 
 int kzt_guest_library_symbol_evidence_lookup(
     const kzt_guest_library_handle_t *handle, const char *symbol,
     unsigned long dynamic_revision, uintptr_t *runtime_address,
-    unsigned char *symbol_type)
+    unsigned char *symbol_type, uintptr_t *bridge_target)
 {
     CHECK("evidence lookup handle", handle && handle->entry);
     CHECK("evidence lookup symbol", strcmp(symbol, "wi963_symbol") == 0);
     ++evidence_lookup_count;
+    if (bridge_target) *bridge_target = 0;
     if (!evidence_valid || evidence_dynamic_revision != dynamic_revision)
         return -1;
     *runtime_address = evidence_runtime_address;
     *symbol_type = evidence_symbol_type;
+    if (bridge_target && bridge_evidence_valid &&
+        bridge_evidence_dynamic_revision == dynamic_revision) {
+        *bridge_target = bridge_evidence_target;
+    }
     return 0;
 }
 
@@ -377,35 +403,16 @@ void kzt_guest_library_symbol_evidence_store(
     evidence_symbol_type = symbol_type;
 }
 
-int GetLibSymbolStartEnd(
-    library_t *library, const char *name, khint_t pre_k,
-    uintptr_t *start, uintptr_t *end, int version,
-    const char *vername, int local)
+void kzt_guest_library_symbol_bridge_store(
+    const kzt_guest_library_handle_t *handle, const char *symbol,
+    unsigned long dynamic_revision, uintptr_t bridge_target)
 {
-    CHECK("wrapper lookup library", library == lookup_library);
-    CHECK("wrapper lookup symbol", strcmp(name, "wi963_symbol") == 0);
-    CHECK("wrapper lookup hash", pre_k == 0);
-    CHECK("wrapper lookup version", version == -1 && vername == NULL);
-    CHECK("wrapper lookup local", local == 1);
-    if (!wrapper_lookup_result)
-        return 0;
-    *start = wrapper_result;
-    *end = wrapper_result + sizeof(void *);
-    return 1;
-}
-
-int GetLibFunctionSymbolStartEnd(
-    library_t *library, const char *name, khint_t pre_k,
-    uintptr_t *start, uintptr_t *end)
-{
-    CHECK("function lookup library", library == lookup_library);
-    CHECK("function lookup symbol", strcmp(name, "wi963_symbol") == 0);
-    CHECK("function lookup hash", pre_k == 0);
-    if (!wrapper_function_lookup_result)
-        return 0;
-    *start = wrapper_result;
-    *end = wrapper_result + sizeof(void *);
-    return 1;
+    CHECK("bridge evidence store handle", handle && handle->entry);
+    CHECK("bridge evidence store symbol", strcmp(symbol, "wi963_symbol") == 0);
+    ++bridge_evidence_store_count;
+    bridge_evidence_valid = 1;
+    bridge_evidence_dynamic_revision = dynamic_revision;
+    bridge_evidence_target = bridge_target;
 }
 
 int kzt_guest_library_loader_scope_begin(
@@ -818,8 +825,6 @@ static void prepare_symbol_selection(library_t *library)
     lookup_result = 0;
     lookup_library = library;
     lookup_object_type = KZT_GUEST_LIBRARY_OBJECT_WRAPPED;
-    wrapper_lookup_result = 1;
-    wrapper_function_lookup_result = 1;
     wrapper_result = 0xf300;
     dynsym_type = STT_FUNC;
     dynsym_status = KZT_GUEST_DYNSYM_LOOKUP_FOUND;
@@ -839,6 +844,7 @@ static void prepare_symbol_selection(library_t *library)
     lookup_loader_identity_result = 0;
     symbol_source_result = 0;
     symbol_source_acquire_count = 0;
+    exact_symbol_source_acquire_count = 0;
     dynamic_view_count = 0;
     dynsym_lookup_count = 0;
     evidence_lookup_count = 0;
@@ -848,13 +854,12 @@ static void prepare_symbol_selection(library_t *library)
     expected_dynsym_version_evidence =
         KZT_SYMBOL_VERSION_CONFIRMED_UNVERSIONED;
     expected_dynsym_version = NULL;
-    provider_discover_result = 0;
-    provider_discover_count = 0;
-    wrapper_probe_count = 0;
-    wrapper_probe_match = KZT_PATCH_WRAPPER_NO_MANIFEST;
-    wrapper_probe_version_evidence = KZT_SYMBOL_VERSION_UNKNOWN;
-    wrapper_probe_version = NULL;
-    wrapper_probe_bridge_target = 0;
+    exact_selector_count = 0;
+    exact_selector_result = wrapper_result;
+    bridge_evidence_store_count = 0;
+    bridge_evidence_valid = 0;
+    bridge_evidence_dynamic_revision = 0;
+    bridge_evidence_target = 0;
 }
 
 static void prepare_trusted_source(library_t *library)
@@ -961,6 +966,49 @@ static void test_wrapper_source_rejects_untrusted_same_basename(void)
     CHECK("trusted-prefix proof remains inactive", !proof.lease.active);
 }
 
+static void test_new_world_libdl_uses_exact_libc_wrapper_alias(void)
+{
+    box64context_t context = { 0 };
+    kzt_guest_wrapper_source_proof_t proof = { 0 };
+    const char *wrapper_name;
+
+    reset_counters();
+    wrapper_name = kzt_guest_library_wrapper_name_for_guest("libdl.so.2");
+    CHECK("libdl alias selected", wrapper_name &&
+          strcmp(wrapper_name, "libc.so.6") == 0);
+    CHECK("libdl dlsym alias allowed",
+          kzt_guest_library_wrapper_alias_symbol_allowed("dlsym"));
+    CHECK("libdl dlvsym alias allowed",
+          kzt_guest_library_wrapper_alias_symbol_allowed("dlvsym"));
+    CHECK("libdl dlopen alias rejected",
+          !kzt_guest_library_wrapper_alias_symbol_allowed("dlopen"));
+    CHECK("libdl unrelated alias rejected",
+          !kzt_guest_library_wrapper_alias_symbol_allowed("uname"));
+
+    prepare_symbol_selection(NULL);
+    resolved_match.path_status = KZT_GUEST_FIELD_OK;
+    strcpy(resolved_match.path, "/lib/x86_64-linux-gnu/libdl.so.2");
+    resolved_match.soname_status = KZT_GUEST_FIELD_OK;
+    strcpy(resolved_match.soname, "libdl.so.2");
+    CHECK("libdl alias source accepted",
+          kzt_guest_library_wrapper_source_acquire(
+              &context, resolved_match.link_map_addr,
+              "/lib/x86_64-linux-gnu/libdl.so.2", wrapper_name,
+              &proof) == 0);
+    kzt_guest_library_wrapper_source_release(&proof);
+
+    prepare_symbol_selection(NULL);
+    resolved_match.path_status = KZT_GUEST_FIELD_OK;
+    strcpy(resolved_match.path, "/lib/x86_64-linux-gnu/libm.so.6");
+    resolved_match.soname_status = KZT_GUEST_FIELD_OK;
+    strcpy(resolved_match.soname, "libm.so.6");
+    CHECK("unapproved alias rejected",
+          kzt_guest_library_wrapper_source_acquire(
+              &context, resolved_match.link_map_addr,
+              "/lib/x86_64-linux-gnu/libm.so.6", "libc.so.6",
+              &proof) != 0);
+}
+
 static void test_symbol_selection_requires_exact_wrapped_owner(void)
 {
     box64context_t context = { 0 };
@@ -997,11 +1045,28 @@ static void test_symbol_selection_requires_exact_wrapped_owner(void)
     }
     CHECK("steady cached selector reads dynsym once",
           dynsym_lookup_count == 1 && evidence_lookup_count == 1002 &&
-              evidence_store_count == 1 && resolve_count == 0);
+              evidence_store_count == 1 && exact_selector_count == 1 &&
+              bridge_evidence_store_count == 1 && resolve_count == 0);
+    {
+        const kzt_guest_loader_identity_t queried_identity = {
+            .handle = lookup_guest_handle,
+            .link_map_addr = lookup_loader_identity.link_map_addr,
+            .namespace_id = lookup_loader_identity.namespace_id,
+        };
+
+        selected = kzt_guest_library_select_symbol_result_with_identity(
+            &context, lookup_guest_handle, &queried_identity,
+            resolved_guest_address, "wi963_symbol", NULL);
+        CHECK("dlinfo exact wrapped bridge selected",
+              selected == wrapper_result);
+        CHECK("dlinfo exact source avoids stored handle assumption",
+              exact_symbol_source_acquire_count == 1 &&
+                  symbol_source_acquire_count == 1002);
+    }
 
     reset_counters();
     prepare_symbol_selection(&library);
-    wrapper_function_lookup_result = 0;
+    exact_selector_result = 0;
     selected = kzt_guest_library_select_symbol_result(
         &context, lookup_guest_handle, resolved_guest_address,
         "wi963_symbol", NULL);
@@ -1117,8 +1182,7 @@ static void test_symbol_selection_requires_exact_wrapped_owner(void)
 
     reset_counters();
     prepare_symbol_selection(&library);
-    wrapper_lookup_result = 0;
-    wrapper_function_lookup_result = 0;
+    exact_selector_result = 0;
     selected = kzt_guest_library_select_symbol_result(
         &context, lookup_guest_handle, resolved_guest_address,
         "wi963_symbol", NULL);
@@ -1137,11 +1201,6 @@ static void test_symbol_selection_requires_exact_wrapped_owner(void)
     prepare_symbol_selection(&library);
     expected_dynsym_version_evidence = KZT_SYMBOL_VERSION_VERSIONED;
     expected_dynsym_version = "WI982_1.0";
-    provider_discover_result = 1;
-    wrapper_probe_match = KZT_PATCH_WRAPPER_VERSION_MATCH;
-    wrapper_probe_version_evidence = KZT_SYMBOL_VERSION_VERSIONED;
-    wrapper_probe_version = expected_dynsym_version;
-    wrapper_probe_bridge_target = wrapper_result;
     selected = kzt_guest_library_select_symbol_result(
         &context, lookup_guest_handle, resolved_guest_address,
         "wi963_symbol", "WI982_1.0");
@@ -1149,8 +1208,8 @@ static void test_symbol_selection_requires_exact_wrapped_owner(void)
           selected == wrapper_result);
     CHECK("versioned selection proves exact owner",
           symbol_source_acquire_count == 1 && lookup_count == 1 &&
-          dynsym_lookup_count == 1 && provider_discover_count == 1 &&
-          wrapper_probe_count == 1 && release_count == 1);
+          dynsym_lookup_count == 1 && exact_selector_count == 1 &&
+          release_count == 1);
     CHECK("versioned selection bypasses unversioned evidence cache",
           evidence_lookup_count == 0 && evidence_store_count == 0);
 
@@ -1158,33 +1217,27 @@ static void test_symbol_selection_requires_exact_wrapped_owner(void)
     prepare_symbol_selection(&library);
     expected_dynsym_version_evidence = KZT_SYMBOL_VERSION_VERSIONED;
     expected_dynsym_version = "WI982_1.0";
-    provider_discover_result = 1;
-    wrapper_probe_match = KZT_PATCH_WRAPPER_VERSION_MATCH;
-    wrapper_probe_version_evidence = KZT_SYMBOL_VERSION_VERSIONED;
-    wrapper_probe_version = "WI982_2.0";
-    wrapper_probe_bridge_target = wrapper_result;
+    exact_selector_result = 0;
     selected = kzt_guest_library_select_symbol_result(
         &context, lookup_guest_handle, resolved_guest_address,
         "wi963_symbol", "WI982_1.0");
     CHECK("wrapper version mismatch keeps guest",
           selected == resolved_guest_address);
     CHECK("wrapper version mismatch releases exact binding",
-          provider_discover_count == 1 && wrapper_probe_count == 1 &&
-          release_count == 1);
+          exact_selector_count == 1 && release_count == 1);
 
     reset_counters();
     prepare_symbol_selection(&library);
     expected_dynsym_version_evidence = KZT_SYMBOL_VERSION_VERSIONED;
     expected_dynsym_version = "WI982_1.0";
-    provider_discover_result = 0;
+    exact_selector_result = 0;
     selected = kzt_guest_library_select_symbol_result(
         &context, lookup_guest_handle, resolved_guest_address,
         "wi963_symbol", "WI982_1.0");
     CHECK("missing versioned wrapper evidence keeps guest",
           selected == resolved_guest_address);
     CHECK("missing versioned wrapper evidence releases exact binding",
-          provider_discover_count == 1 && wrapper_probe_count == 0 &&
-          release_count == 1);
+          exact_selector_count == 1 && release_count == 1);
 
     reset_counters();
     prepare_symbol_selection(&library);
@@ -1209,6 +1262,7 @@ int main(void)
     test_symbol_selection_requires_exact_wrapped_owner();
     test_wrapper_source_rejects_untrusted_same_basename();
     test_wrapper_source_accepts_only_exact_trusted_identity();
+    test_new_world_libdl_uses_exact_libc_wrapper_alias();
     puts("kzt-guest-library-adapter: PASS");
     return EXIT_SUCCESS;
 }

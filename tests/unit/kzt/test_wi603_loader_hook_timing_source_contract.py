@@ -28,6 +28,9 @@ myalign = (root / "target/i386/latx/context/myalign.c").read_text(
 adapter = (root / "target/i386/latx/context/kzt_observation_adapter.c").read_text(
     encoding="utf-8"
 )
+hook_source = (
+    root / "target/i386/latx/context/kzt_loader_event_hook.c"
+).read_text(encoding="utf-8")
 
 locator = function_body(myalign, "static struct x86_ld_info * find_ld_part(")
 for required in (
@@ -53,15 +56,30 @@ if "env->regs[R_EAX + ld_info->reg]" not in callback:
     raise AssertionError("loader hook does not capture link_map from located register")
 if "kzt_loader_event_hook_publish(" not in callback:
     raise AssertionError("loader hook does not publish through the event seam")
-if "kzt_tb_callback_consume(env, &event)" not in callback:
+if "kzt_tb_callback_consume(context, env, &event)" not in callback:
     raise AssertionError("loader hook does not hand events to the consumer")
+
+publish = function_body(hook_source, "int kzt_loader_event_hook_publish(")
+for required in (
+    "!__atomic_load_n(&hook->installed, __ATOMIC_ACQUIRE)",
+    "event->link_map_addr = link_map_addr;",
+    "event->sequence = __atomic_add_fetch(&hook->event_sequence",
+    "clock_gettime(CLOCK_MONOTONIC_RAW, &timestamp)",
+    "event->published_ns =",
+):
+    if required not in publish:
+        raise AssertionError(f"loader event publication misses {required}")
 
 consumer = function_body(myalign, "static void kzt_tb_callback_consume(")
 for required in (
-    ".link_map_addr = link_map_addr,",
+    ".context = context,",
     ".loader_scope = &env->kzt_guest_library_loader_scope,",
+    ".link_map_addr = link_map_addr,",
+    ".registry = registry,",
+    ".library_bindings = KztGuestLibraryBindingsForContext(context),",
     ".reuse_complete_dynamic_view = 1,",
     ".per_object_flow = kzt_tb_callback_per_object_got_plt,",
+    ".per_object_opaque = &callback_scope,",
     ".legacy_flow = NULL,",
     "kzt_observe_guest_object_from_callback(&request, &observation_result)",
 ):

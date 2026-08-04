@@ -10,6 +10,9 @@
 typedef enum kzt_lazy_direct_route_status {
     KZT_LAZY_DIRECT_ROUTE_GUEST_REQUIRED = 0,
     KZT_LAZY_DIRECT_ROUTE_NATIVE_APPLIED,
+    KZT_LAZY_DIRECT_ROUTE_NATIVE_TRANSIENT,
+    KZT_LAZY_DIRECT_ROUTE_WRITE_ROLLED_BACK,
+    KZT_LAZY_DIRECT_ROUTE_UNRECOVERABLE,
 } kzt_lazy_direct_route_status_t;
 
 typedef enum kzt_lazy_direct_route_reason {
@@ -21,6 +24,7 @@ typedef enum kzt_lazy_direct_route_reason {
     KZT_LAZY_DIRECT_ROUTE_REASON_INVALID_VERSION,
     KZT_LAZY_DIRECT_ROUTE_REASON_UNSUPPORTED_SYMBOL_BINDING,
     KZT_LAZY_DIRECT_ROUTE_REASON_GUEST_OWNED_SYMBOL,
+    KZT_LAZY_DIRECT_ROUTE_REASON_DLERROR_PREBIND_REQUIRED,
     KZT_LAZY_DIRECT_ROUTE_REASON_PREEMPTION_UNPROVEN,
     KZT_LAZY_DIRECT_ROUTE_REASON_SOURCE_REJECTED,
     KZT_LAZY_DIRECT_ROUTE_REASON_PROVIDER_UNAVAILABLE,
@@ -31,10 +35,17 @@ typedef enum kzt_lazy_direct_route_reason {
     KZT_LAZY_DIRECT_ROUTE_REASON_FINAL_VALIDATION_FAILED,
     KZT_LAZY_DIRECT_ROUTE_REASON_CAS_MISMATCH,
     KZT_LAZY_DIRECT_ROUTE_REASON_CAS_ERROR,
+    KZT_LAZY_DIRECT_ROUTE_REASON_BUDGET_EXHAUSTED,
+    KZT_LAZY_DIRECT_ROUTE_REASON_WRITE_ROLLED_BACK,
+    KZT_LAZY_DIRECT_ROUTE_REASON_UNRECOVERABLE,
     KZT_LAZY_DIRECT_ROUTE_REASON_NATIVE_APPLIED,
+    KZT_LAZY_DIRECT_ROUTE_REASON_NATIVE_TRANSIENT,
 } kzt_lazy_direct_route_reason_t;
 
 typedef enum kzt_lazy_direct_route_cas_status {
+    KZT_LAZY_DIRECT_ROUTE_CAS_UNRECOVERABLE = -4,
+    KZT_LAZY_DIRECT_ROUTE_CAS_BUDGET_EXHAUSTED = -3,
+    KZT_LAZY_DIRECT_ROUTE_CAS_ROLLED_BACK = -2,
     KZT_LAZY_DIRECT_ROUTE_CAS_ERROR = -1,
     KZT_LAZY_DIRECT_ROUTE_CAS_MISMATCH = 0,
     KZT_LAZY_DIRECT_ROUTE_CAS_APPLIED = 1,
@@ -60,6 +71,7 @@ typedef struct kzt_lazy_direct_route_input {
     uintptr_t slot_addr;
     uintptr_t guest_unresolved_slot;
     uintptr_t expected_current_slot;
+    int allow_budget_transient_native;
 } kzt_lazy_direct_route_input_t;
 
 typedef struct kzt_lazy_direct_route_provider {
@@ -74,6 +86,7 @@ typedef struct kzt_lazy_direct_route_bridge {
     uintptr_t target;
     kzt_symbol_version_evidence_t version_evidence;
     const char *version;
+    int transient_safe;
 } kzt_lazy_direct_route_bridge_t;
 
 typedef struct kzt_lazy_direct_route_lease {

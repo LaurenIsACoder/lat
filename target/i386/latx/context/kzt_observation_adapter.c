@@ -410,8 +410,10 @@ int kzt_observe_guest_object_from_callback(
     if (request && request->per_object_flow &&
         (observation_result == KZT_OBSERVATION_ADAPTER_ADDED ||
          observation_result == KZT_OBSERVATION_ADAPTER_UPDATED)) {
-        (void)request->per_object_flow(request->link_map_addr,
-                                       request->per_object_opaque);
+        if (request->per_object_flow(request->link_map_addr,
+                                     request->per_object_opaque) != 0) {
+            observation_result = KZT_OBSERVATION_ADAPTER_PER_OBJECT_FAILED;
+        }
     }
 
     if (request && request->legacy_flow) {

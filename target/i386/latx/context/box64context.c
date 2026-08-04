@@ -30,6 +30,12 @@
 #endif
 #include <pthread.h>
 
+static void kzt_xcb_shadow_destroy(void *guest, void *opaque)
+{
+    (void)opaque;
+    free(guest);
+}
+
 #ifdef CONFIG_LATX_KZT
 static uint64_t kzt_context_init_timing_now(void)
 {
@@ -99,6 +105,8 @@ box64context_t *NewBox64Context(int argc)
     context->system = NewBridge();
     context->dlprivate = NewDLPrivate();
     context->box64lib = dlopen(NULL, RTLD_NOW|RTLD_GLOBAL);
+    context->kzt_xcb_connection_map =
+        kzt_xcb_connection_map_init(kzt_xcb_shadow_destroy, NULL);
     context->argc = argc;
     context->argv = (char**)box_calloc(context->argc+1, sizeof(char*));
     pthread_mutex_init(&context->mutex_lock, NULL);
@@ -109,6 +117,7 @@ box64context_t *NewBox64Context(int argc)
     /* Optional acceleration metadata is created on first KZT use so a
      * context that never observes a guest link-map keeps the old footprint. */
     (void)kzt_guest_library_access_init(&context->kzt_guest_library_access);
+    kzt_loader_event_hook_context_init(&context->kzt_loader_event_hook);
     context->kzt_lazy_prebind_scope = kzt_lazy_prebind_scope_init();
     if (timing_enabled) {
         timing_access = kzt_context_init_timing_now();
@@ -187,7 +196,9 @@ void FreeBox64Context(box64context_t** context)
 
     box64context_t* ctx = *context;   // local copy to do the cleanning
 
-    kzt_guest_dl_api_entry_state_destroy(ctx->dlprivate);
+    kzt_guest_dl_api_entry_state_begin_teardown(ctx->dlprivate);
+    free(ctx->kzt_loader_bridge_info);
+    ctx->kzt_loader_bridge_info = NULL;
 
 #ifdef CONFIG_LATX_KZT
     /* FreeBox64Context is entered only after guest execution and loader
@@ -198,11 +209,13 @@ void FreeBox64Context(box64context_t** context)
         &ctx->kzt_guest_library_access);
 #endif
 
+    kzt_xcb_connection_map_destroy(&ctx->kzt_xcb_connection_map);
     if(ctx->local_maplib)
         FreeLibrarian(&ctx->local_maplib);
     if(ctx->maplib)
         FreeLibrarian(&ctx->maplib);
 #ifdef CONFIG_LATX_KZT
+    kzt_loader_event_hook_context_destroy(&ctx->kzt_loader_event_hook);
     kzt_guest_library_access_destroy(&ctx->kzt_guest_library_access);
     kzt_lazy_prebind_scope_destroy(&ctx->kzt_lazy_prebind_scope);
     kzt_guest_registry_context_destroy(&ctx->kzt_guest_registry_context,
@@ -254,28 +267,6 @@ void FreeBox64Context(box64context_t** context)
 
     box_free(ctx);
 }
-int AddMallocMap(box64context_t* ctx, struct malloc_map* map) {
-    int idx = ctx->mallocmapsize;
-    if(idx==ctx->mallocmapcap) {
-        // resize...
-        ctx->mallocmapcap += 16;
-        ctx->mallocmaps = (struct malloc_map**)box_realloc(ctx->mallocmaps, sizeof(struct malloc_map *) * ctx->mallocmapcap);
-    }
-    ctx->mallocmaps[idx] = map;
-    ctx->mallocmapsize++;
-    printf_log(LOG_INFO, "Adding \"%p\" as #%d in mallocmap collection\n", ctx->mallocmaps[idx], idx);
-    return idx;
-}
-struct malloc_map * SearchMallocMap(box64context_t* ctx, char *elfname)
-{
-    for (int i =0; i < ctx->mallocmapsize; i++) {
-        if (!strcmp(basename(ElfName(ctx->mallocmaps[i]->h)), elfname)) {
-            return ctx->mallocmaps[i];
-        }
-    }
-    return NULL;
-}
-
 #if defined(CONFIG_LATX_KZT) && defined(CONFIG_LATX_DEBUG)
 int AddKztDebugInfo(box64context_t* ctx, struct latx_kzt_debug* debuginfo)
 {

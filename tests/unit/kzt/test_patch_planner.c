@@ -450,6 +450,76 @@ static void test_guest_owned_dlclose_is_kept_guest(void)
     assert_decision("guest-dlclose", &decision,
                     KZT_PATCH_DECISION_REJECTED,
                     KZT_PATCH_REASON_POLICY_KEEP_GUEST, 0);
+
+    candidate.symbol_name = "free";
+    check_int("guest-free.policy",
+              kzt_patch_symbol_must_stay_guest(candidate.symbol_name), 1);
+    check_int("guest-free.decide",
+              kzt_patch_planner_decide(&candidate, &decision), 0);
+    assert_decision("guest-free", &decision,
+                    KZT_PATCH_DECISION_REJECTED,
+                    KZT_PATCH_REASON_POLICY_KEEP_GUEST, 0);
+
+    check_int("guest-__free.policy",
+              kzt_patch_symbol_must_stay_guest("__free"), 1);
+    check_int("guest-__libc_free.policy",
+              kzt_patch_symbol_must_stay_guest("__libc_free"), 1);
+    check_int("guest-realloc.policy",
+              kzt_patch_symbol_must_stay_guest("realloc"), 1);
+    check_int("guest-XOpenDisplay.policy",
+              kzt_patch_symbol_must_stay_guest("XOpenDisplay"), 1);
+    check_int("guest-XCloseDisplay.policy",
+              kzt_patch_symbol_must_stay_guest("XCloseDisplay"), 1);
+    check_int("guest-XGetXCBConnection.policy",
+              kzt_patch_symbol_must_stay_guest("XGetXCBConnection"), 1);
+    check_int("guest-XSetEventQueueOwner.policy",
+              kzt_patch_symbol_must_stay_guest("XSetEventQueueOwner"), 1);
+    check_int("native-xcb-connection.policy",
+              kzt_patch_symbol_must_stay_guest("xcb_connection_has_error"), 0);
+    check_int("native-xcb-flush.policy",
+              kzt_patch_symbol_must_stay_guest("xcb_flush"), 0);
+    check_int("guest-xcb-connect.policy",
+              kzt_patch_symbol_must_stay_guest("xcb_connect"), 1);
+    check_int("guest-xcb-connect-auth.policy",
+              kzt_patch_symbol_must_stay_guest(
+                  "xcb_connect_to_display_with_auth_info"), 1);
+    check_int("guest-xcb-disconnect.policy",
+              kzt_patch_symbol_must_stay_guest("xcb_disconnect"), 1);
+    check_int("guest-xcb-unknown.policy",
+              kzt_patch_symbol_must_stay_guest("xcb_send_request"), 1);
+    check_int("dlopen.requires-dlerror-prebind",
+              kzt_patch_symbol_requires_dlerror_prebind("dlopen"), 1);
+    check_int("dlmopen.requires-dlerror-prebind",
+              kzt_patch_symbol_requires_dlerror_prebind("dlmopen"), 1);
+    check_int("dlsym.requires-dlerror-prebind",
+              kzt_patch_symbol_requires_dlerror_prebind("dlsym"), 1);
+    check_int("dlvsym.requires-dlerror-prebind",
+              kzt_patch_symbol_requires_dlerror_prebind("dlvsym"), 1);
+    check_int("dlinfo.requires-dlerror-prebind",
+              kzt_patch_symbol_requires_dlerror_prebind("dlinfo"), 1);
+    check_int("dladdr.requires-dlerror-prebind",
+              kzt_patch_symbol_requires_dlerror_prebind("dladdr"), 1);
+    check_int("dladdr1.requires-dlerror-prebind",
+              kzt_patch_symbol_requires_dlerror_prebind("dladdr1"), 1);
+    check_int("dlerror.is-prebind-anchor",
+              kzt_patch_symbol_requires_dlerror_prebind("dlerror"), 0);
+    check_int("ordinary-symbol.no-dlerror-prebind",
+              kzt_patch_symbol_requires_dlerror_prebind("puts"), 0);
+
+    candidate = base_candidate();
+    candidate.symbol_name = "xcb_flush";
+    check_int("native-xcb-flush.decide",
+              kzt_patch_planner_decide(&candidate, &decision), 0);
+    assert_decision("native-xcb-flush", &decision,
+                    KZT_PATCH_DECISION_APPROVED,
+                    KZT_PATCH_REASON_APPROVED_NATIVE_BRIDGE, 1);
+
+    candidate.symbol_name = "xcb_send_request";
+    check_int("guest-xcb-unknown.decide",
+              kzt_patch_planner_decide(&candidate, &decision), 0);
+    assert_decision("guest-xcb-unknown", &decision,
+                    KZT_PATCH_DECISION_REJECTED,
+                    KZT_PATCH_REASON_POLICY_KEEP_GUEST, 0);
 }
 
 static int test_matches_filter(const char *name, int argc, char **argv)

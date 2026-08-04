@@ -199,6 +199,29 @@ void kzt_guest_registry_test_fail_next_cond_init(void)
     test_fail_next_cond_init = 1;
 }
 
+int kzt_guest_registry_test_set_active_source_leases(
+    kzt_guest_registry_t *registry, uintptr_t link_map_addr,
+    unsigned long generation, unsigned long active_source_leases)
+{
+    size_t i;
+
+    if (!registry || !link_map_addr || !generation ||
+        kzt_registry_api_lock(registry) != 0) {
+        return -1;
+    }
+    for (i = 0; i < registry->count; ++i) {
+        if (registry->objects[i].link_map_addr == link_map_addr &&
+            registry->objects[i].generation == generation) {
+            registry->objects[i].active_source_leases =
+                active_source_leases;
+            kzt_registry_api_unlock(registry);
+            return 0;
+        }
+    }
+    kzt_registry_api_unlock(registry);
+    return -1;
+}
+
 static int kzt_registry_test_should_fail_dynamic_commit(void)
 {
     if (test_dynamic_commit_failure_after == 0) {
@@ -1380,6 +1403,7 @@ int kzt_guest_registry_source_lease_acquire(
         registry->objects[index].generation != generation ||
         registry->objects[index].namespace_id.status != KZT_GUEST_FIELD_OK ||
         registry->objects[index].namespace_id.value != namespace_id ||
+        registry->objects[index].active_source_leases == ULONG_MAX ||
         registry->objects[index].state == KZT_GUEST_OBJECT_UNLOADING ||
         registry->objects[index].state == KZT_GUEST_OBJECT_DEAD) {
         kzt_registry_api_unlock(registry);
@@ -1478,6 +1502,114 @@ void kzt_guest_registry_patch_decision_lease_release(
     }
     pthread_mutex_unlock(&registry->lock);
     memset(lease, 0, sizeof(*lease));
+}
+
+int kzt_guest_registry_symbol_candidate_acquire_next(
+    const kzt_guest_registry_patch_decision_lease_t *decision_lease,
+    size_t *cursor, kzt_guest_registry_symbol_candidate_t *candidate)
+{
+    kzt_guest_registry_t *registry;
+    kzt_guest_object_snapshot_t *source;
+    size_t index;
+    ssize_t source_index;
+
+    if (candidate) {
+        memset(candidate, 0, sizeof(*candidate));
+    }
+    if (!decision_lease || !decision_lease->active ||
+        !(registry = decision_lease->registry) || !cursor || !candidate ||
+        decision_lease->namespace_id != 0 ||
+        kzt_registry_api_lock(registry) != 0) {
+        return -1;
+    }
+    source_index = kzt_find_object_index(
+        registry, decision_lease->link_map_addr);
+    if (registry->disabled || registry->evidence_mutators_waiting ||
+        !registry->active_patch_decision_leases || source_index < 0) {
+        kzt_registry_api_unlock(registry);
+        return -1;
+    }
+    source = &registry->objects[source_index];
+    if (source->generation != decision_lease->generation ||
+        source->namespace_id.status != KZT_GUEST_FIELD_OK ||
+        source->namespace_id.value != decision_lease->namespace_id ||
+        !source->active_source_leases ||
+        source->state == KZT_GUEST_OBJECT_UNLOADING ||
+        source->state == KZT_GUEST_OBJECT_DEAD) {
+        kzt_registry_api_unlock(registry);
+        return -1;
+    }
+
+    for (index = *cursor; index < registry->count; ++index) {
+        kzt_guest_object_snapshot_t *object = &registry->objects[index];
+
+        if (object->state == KZT_GUEST_OBJECT_UNLOADING ||
+            object->state == KZT_GUEST_OBJECT_DEAD) {
+            continue;
+        }
+        if (object->namespace_id.status != KZT_GUEST_FIELD_OK) {
+            kzt_registry_api_unlock(registry);
+            return -1;
+        }
+        if (object->namespace_id.value != 0) {
+            continue;
+        }
+        if (!object->link_map_addr || !object->generation ||
+            object->active_source_leases == ULONG_MAX) {
+            kzt_registry_api_unlock(registry);
+            return -1;
+        }
+        candidate->link_map_addr = object->link_map_addr;
+        candidate->generation = object->generation;
+        candidate->namespace_id = object->namespace_id.value;
+        candidate->map_start = object->map_start.status == KZT_GUEST_FIELD_OK
+                                   ? object->map_start.value : 0;
+        candidate->map_end = object->map_end.status == KZT_GUEST_FIELD_OK
+                                 ? object->map_end.value : 0;
+        candidate->dynamic_view_status = object->dynamic_view_status;
+        candidate->dynamic_view = object->dynamic_view;
+        candidate->dynamic_view_revision = object->dynamic_view_revision;
+        candidate->path_status = object->path.status;
+        candidate->soname_status = object->soname.status;
+        if (object->path.value &&
+            strlen(object->path.value) < sizeof(candidate->path)) {
+            snprintf(candidate->path, sizeof(candidate->path), "%s",
+                     object->path.value);
+        } else if (object->path.value) {
+            candidate->path_status = KZT_GUEST_FIELD_UNKNOWN;
+        }
+        if (object->soname.value &&
+            strlen(object->soname.value) < sizeof(candidate->soname)) {
+            snprintf(candidate->soname, sizeof(candidate->soname), "%s",
+                     object->soname.value);
+        } else if (object->soname.value) {
+            candidate->soname_status = KZT_GUEST_FIELD_UNKNOWN;
+        }
+        ++object->active_source_leases;
+        candidate->lease = (kzt_guest_registry_source_lease_t) {
+            .registry = registry,
+            .link_map_addr = object->link_map_addr,
+            .generation = object->generation,
+            .namespace_id = object->namespace_id.value,
+            .active = 1,
+        };
+        *cursor = index + 1;
+        kzt_registry_api_unlock(registry);
+        return 1;
+    }
+    *cursor = registry->count;
+    kzt_registry_api_unlock(registry);
+    return 0;
+}
+
+void kzt_guest_registry_symbol_candidate_release(
+    kzt_guest_registry_symbol_candidate_t *candidate)
+{
+    if (!candidate) {
+        return;
+    }
+    kzt_guest_registry_source_lease_release(&candidate->lease);
+    memset(candidate, 0, sizeof(*candidate));
 }
 
 static int kzt_registry_got_plt_view_complete(
@@ -2147,6 +2279,7 @@ int kzt_guest_registry_loader_symbol_source_acquire(
     if (object->generation != entry->identity.generation ||
         object->namespace_id.status != KZT_GUEST_FIELD_OK ||
         object->namespace_id.value != entry->identity.namespace_id ||
+        object->active_source_leases == ULONG_MAX ||
         object->state == KZT_GUEST_OBJECT_UNLOADING ||
         object->state == KZT_GUEST_OBJECT_DEAD ||
         object->dynamic_view_status != KZT_GUEST_FIELD_OK) {
@@ -2156,6 +2289,67 @@ int kzt_guest_registry_loader_symbol_source_acquire(
 
     ++object->active_source_leases;
     *identity = entry->identity;
+    *dynamic_view = object->dynamic_view;
+    *dynamic_status = object->dynamic_view_status;
+    *dynamic_revision = object->dynamic_view_revision;
+    lease->registry = registry;
+    lease->link_map_addr = object->link_map_addr;
+    lease->generation = object->generation;
+    lease->namespace_id = object->namespace_id.value;
+    lease->active = 1;
+    kzt_registry_api_unlock(registry);
+    return 0;
+}
+
+int kzt_guest_registry_loader_symbol_source_acquire_exact(
+    kzt_guest_registry_t *registry,
+    const kzt_guest_loader_identity_t *queried_identity,
+    kzt_guest_loader_identity_t *identity,
+    kzt_guest_dynamic_view_t *dynamic_view,
+    kzt_guest_field_status_t *dynamic_status,
+    unsigned long *dynamic_revision,
+    kzt_guest_registry_source_lease_t *lease)
+{
+    kzt_guest_object_snapshot_t *object;
+    ssize_t object_index;
+
+    if (identity) memset(identity, 0, sizeof(*identity));
+    if (dynamic_view) memset(dynamic_view, 0, sizeof(*dynamic_view));
+    if (dynamic_status) *dynamic_status = KZT_GUEST_FIELD_NOT_PARSED;
+    if (dynamic_revision) *dynamic_revision = 0;
+    if (lease) memset(lease, 0, sizeof(*lease));
+    if (!registry || !queried_identity || !queried_identity->handle ||
+        !queried_identity->link_map_addr || queried_identity->namespace_id != 0 ||
+        !identity || !dynamic_view || !dynamic_status || !dynamic_revision ||
+        !lease || kzt_registry_api_lock(registry) != 0) {
+        return -1;
+    }
+    object_index = kzt_find_object_index(
+        registry, queried_identity->link_map_addr);
+    if (registry->disabled || registry->evidence_mutators_waiting ||
+        object_index < 0) {
+        kzt_registry_api_unlock(registry);
+        return -1;
+    }
+    object = &registry->objects[object_index];
+    if (!object->generation ||
+        object->namespace_id.status != KZT_GUEST_FIELD_OK ||
+        object->namespace_id.value != queried_identity->namespace_id ||
+        object->active_source_leases == ULONG_MAX ||
+        object->state == KZT_GUEST_OBJECT_UNLOADING ||
+        object->state == KZT_GUEST_OBJECT_DEAD ||
+        object->dynamic_view_status != KZT_GUEST_FIELD_OK) {
+        kzt_registry_api_unlock(registry);
+        return -1;
+    }
+
+    ++object->active_source_leases;
+    *identity = (kzt_guest_loader_identity_t) {
+        .handle = queried_identity->handle,
+        .link_map_addr = object->link_map_addr,
+        .generation = object->generation,
+        .namespace_id = object->namespace_id.value,
+    };
     *dynamic_view = object->dynamic_view;
     *dynamic_status = object->dynamic_view_status;
     *dynamic_revision = object->dynamic_view_revision;

@@ -37,6 +37,7 @@ typedef int32_t (*iFppLp_t)(void*, void*, uintptr_t, void*);
 typedef void* (*pFpppp_t)(void*, void*, void*, void*);
 
 #define SUPER() ADDED_FUNCTIONS() \
+        GO(XCloseDisplay, iFp_t) \
         GO(XDestroyImage, iFp_t) \
         GO(XInitImage, iFp_t) \
         GO(XOpenDisplay, pFp_t) \

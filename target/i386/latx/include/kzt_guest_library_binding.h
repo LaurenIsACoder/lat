@@ -203,6 +203,11 @@ int kzt_guest_library_access_lookup_by_library(
     kzt_guest_library_access_t *access, library_t *library,
     kzt_guest_library_binding_key_t *key,
     kzt_guest_library_handle_t *handle);
+/* Revalidates that a retained handle still pins the same LIVE exact binding
+ * entry.  This does not acquire a second reference. */
+int kzt_guest_library_handle_matches_key(
+    const kzt_guest_library_handle_t *handle,
+    const kzt_guest_library_binding_key_t *key);
 #ifdef KZT_GUEST_LIBRARY_BINDING_TEST
 int kzt_guest_library_lookup(kzt_guest_library_bindings_t *bindings,
                              const kzt_guest_library_binding_key_t *key,
@@ -212,11 +217,14 @@ void kzt_guest_library_handle_release(kzt_guest_library_handle_t *handle);
 int kzt_guest_library_symbol_evidence_lookup(
     const kzt_guest_library_handle_t *handle, const char *symbol,
     unsigned long dynamic_revision, uintptr_t *runtime_address,
-    unsigned char *symbol_type);
+    unsigned char *symbol_type, uintptr_t *bridge_target);
 void kzt_guest_library_symbol_evidence_store(
     const kzt_guest_library_handle_t *handle, const char *symbol,
     unsigned long dynamic_revision, uintptr_t runtime_address,
     unsigned char symbol_type);
+void kzt_guest_library_symbol_bridge_store(
+    const kzt_guest_library_handle_t *handle, const char *symbol,
+    unsigned long dynamic_revision, uintptr_t bridge_target);
 /* Consumes one pinned exact handle, closes only that binding, and invokes a
  * non-blocking library cleanup callback before concurrent unbind can free the
  * library.  The callback must not enter bindings or Registry APIs. */

@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <pthread.h>
 
 #include "wrappedlibs.h"
 
@@ -20,6 +21,7 @@
 #include "callback.h"
 #include "librarian.h"
 #include "box64context.h"
+#include "kzt_guest_cancel_scope.h"
 
 const char* libxcbName = "libxcb.so.1";
 #define LIBNAME libxcb
@@ -30,59 +32,87 @@ const char* libxcbName = "libxcb.so.1";
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmissing-prototypes"
 
-extern void* x86pthread_setcanceltype;
 EXPORT void* my_xcb_wait_for_event(void* v1);
 EXPORT void* my_xcb_wait_for_event(void* v1)
 {
-    int oldtype;
+    void *native = align_xcb_connection(v1);
+    kzt_guest_cancel_scope_t cancel = { 0 };
     void* ret;
-    uint64_t callbackret = RunFunctionWithState((uintptr_t)x86pthread_setcanceltype , 2, PTHREAD_CANCEL_ASYNCHRONOUS, &oldtype);
-    ret = my->xcb_wait_for_event(v1);
-    callbackret = RunFunctionWithState((uintptr_t)x86pthread_setcanceltype , 2, oldtype, NULL);
-    (void)callbackret;
+
+    if (!native)
+        return NULL;
+    pthread_cleanup_push(kzt_guest_cancel_scope_cleanup, &cancel);
+    kzt_guest_cancel_scope_begin(my_context, &cancel);
+    ret = my->xcb_wait_for_event(native);
+    kzt_guest_cancel_scope_end(&cancel);
+    pthread_cleanup_pop(0);
+    unalign_xcb_connection(native, v1);
     return ret;
 }
 EXPORT int32_t my_xcb_flush(void* v1);
 EXPORT int32_t my_xcb_flush(void* v1)
 {
-    int32_t ret = my->xcb_flush(v1);
-    sync_xcb_connection(v1);
+    void *native = align_xcb_connection(v1);
+    int32_t ret;
+
+    if (!native)
+        return 0;
+    ret = my->xcb_flush(native);
+    unalign_xcb_connection(native, v1);
     return ret;
 }
 
 EXPORT void* my_xcb_wait_for_reply(void* v1, uint32_t v2, void* v3);
 EXPORT void* my_xcb_wait_for_reply(void* v1, uint32_t v2, void* v3)
 {
-    int oldtype;
+    void *native = align_xcb_connection(v1);
+    kzt_guest_cancel_scope_t cancel = { 0 };
     void* ret;
-    uint64_t callbackret = RunFunctionWithState((uintptr_t)x86pthread_setcanceltype , 2, PTHREAD_CANCEL_ASYNCHRONOUS, &oldtype);
-    ret = my->xcb_wait_for_reply(v1, v2, v3);
-    callbackret = RunFunctionWithState((uintptr_t)x86pthread_setcanceltype , 2, oldtype, NULL);
-    (void)callbackret;
+
+    if (!native)
+        return NULL;
+    pthread_cleanup_push(kzt_guest_cancel_scope_cleanup, &cancel);
+    kzt_guest_cancel_scope_begin(my_context, &cancel);
+    ret = my->xcb_wait_for_reply(native, v2, v3);
+    kzt_guest_cancel_scope_end(&cancel);
+    pthread_cleanup_pop(0);
+    unalign_xcb_connection(native, v1);
     return ret;
 }
 
 EXPORT void* my_xcb_wait_for_reply64(void* v1, uint64_t v2, void* v3);
 EXPORT void* my_xcb_wait_for_reply64(void* v1, uint64_t v2, void* v3)
 {
-    int oldtype;
+    void *native = align_xcb_connection(v1);
+    kzt_guest_cancel_scope_t cancel = { 0 };
     void* ret;
-    uint64_t callbackret = RunFunctionWithState((uintptr_t)x86pthread_setcanceltype , 2, PTHREAD_CANCEL_ASYNCHRONOUS, &oldtype);
-    ret = my->xcb_wait_for_reply64(v1, v2, v3);
-    callbackret = RunFunctionWithState((uintptr_t)x86pthread_setcanceltype , 2, oldtype, NULL);
-    (void)callbackret;
+
+    if (!native)
+        return NULL;
+    pthread_cleanup_push(kzt_guest_cancel_scope_cleanup, &cancel);
+    kzt_guest_cancel_scope_begin(my_context, &cancel);
+    ret = my->xcb_wait_for_reply64(native, v2, v3);
+    kzt_guest_cancel_scope_end(&cancel);
+    pthread_cleanup_pop(0);
+    unalign_xcb_connection(native, v1);
     return ret;
 }
 
 EXPORT void* my_xcb_wait_for_special_event(void* v1, void* v2);
 EXPORT void* my_xcb_wait_for_special_event(void* v1, void* v2)
 {
-    int oldtype;
+    void *native = align_xcb_connection(v1);
+    kzt_guest_cancel_scope_t cancel = { 0 };
     void* ret;
-    uint64_t callbackret = RunFunctionWithState((uintptr_t)x86pthread_setcanceltype , 2, PTHREAD_CANCEL_ASYNCHRONOUS, &oldtype);
-    ret = my->xcb_wait_for_special_event(v1, v2);
-    callbackret = RunFunctionWithState((uintptr_t)x86pthread_setcanceltype , 2, oldtype, NULL);
-    (void)callbackret;
+
+    if (!native)
+        return NULL;
+    pthread_cleanup_push(kzt_guest_cancel_scope_cleanup, &cancel);
+    kzt_guest_cancel_scope_begin(my_context, &cancel);
+    ret = my->xcb_wait_for_special_event(native, v2);
+    kzt_guest_cancel_scope_end(&cancel);
+    pthread_cleanup_pop(0);
+    unalign_xcb_connection(native, v1);
     return ret;
 }
 
@@ -93,8 +123,17 @@ EXPORT void* my_xcb_connect(void* dispname, void* screen)
 
 EXPORT void my_xcb_disconnect(void* conn)
 {
-	my->xcb_disconnect(align_xcb_connection(conn));
-	del_xcb_connection(conn);
+	kzt_xcb_connection_lease_t lease = { 0 };
+	int old_cancel_state = PTHREAD_CANCEL_ENABLE;
+
+	(void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel_state);
+	if (begin_xcb_connection_disconnect(conn, &lease) != 0) {
+		(void)pthread_setcancelstate(old_cancel_state, NULL);
+		return;
+	}
+	my->xcb_disconnect(lease.native);
+	finish_xcb_connection_disconnect(&lease);
+	(void)pthread_setcancelstate(old_cancel_state, NULL);
 }
 #pragma GCC diagnostic pop
 

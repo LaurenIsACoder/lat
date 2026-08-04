@@ -58,6 +58,9 @@ static int kzt_lazy_prebind_record_valid(
     const kzt_lazy_prebind_record_t *record)
 {
     return kzt_lazy_prebind_record_key_valid(record) &&
+           (!record->loader_mutation_invariant ||
+            (record->bridge_custom_wrapper &&
+             kzt_patch_symbol_is_loader_route_family(record->symbol))) &&
            kzt_lazy_prebind_identity_valid(&record->provider) &&
            record->bridge_target && record->bridge_generation &&
            record->bridge_generation == record->provider.generation &&
@@ -102,6 +105,8 @@ static int kzt_lazy_prebind_record_equal(
                                             &right->provider) &&
            left->bridge_target == right->bridge_target &&
            left->bridge_generation == right->bridge_generation &&
+           left->loader_mutation_invariant ==
+               right->loader_mutation_invariant &&
            left->scope_proof.selected_provider_address ==
                right->scope_proof.selected_provider_address &&
            left->scope_proof.selected_provider_binding ==
@@ -279,10 +284,42 @@ uint64_t kzt_lazy_prebind_scope_mutate(
         ++scope->epoch;
     }
     kzt_lazy_prebind_scope_wait_all_leases_locked(scope);
+    for (entry = scope->entries; entry; entry = entry->next) {
+        if (!entry->retired && entry->published &&
+            entry->record.loader_mutation_invariant) {
+            entry->record.scope_epoch = scope->epoch;
+        }
+    }
     kzt_lazy_prebind_scope_prune_closed_locked(scope);
     pthread_cond_broadcast(&scope->changed);
     pthread_mutex_unlock(&scope->lock);
     return kzt_lazy_prebind_scope_epoch(scope);
+}
+
+int kzt_lazy_prebind_scope_has_native_dlerror(
+    kzt_lazy_prebind_scope_t *scope,
+    const kzt_lazy_prebind_identity_t *source)
+{
+    kzt_lazy_prebind_entry_t *entry;
+    int found = 0;
+
+    if (!scope || !kzt_lazy_prebind_identity_valid(source)) {
+        return 0;
+    }
+    pthread_mutex_lock(&scope->lock);
+    for (entry = scope->entries; entry; entry = entry->next) {
+        if (!entry->retired && entry->published &&
+            entry->record.scope_epoch == scope->epoch &&
+            entry->record.bridge_custom_wrapper &&
+            strcmp(entry->record.symbol, "dlerror") == 0 &&
+            kzt_lazy_prebind_identity_equal(
+                &entry->record.source, source)) {
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&scope->lock);
+    return found;
 }
 
 kzt_lazy_prebind_claim_result_t kzt_lazy_prebind_scope_claim(
@@ -354,6 +391,26 @@ int kzt_lazy_prebind_scope_acquire(
     }
     pthread_mutex_unlock(&scope->lock);
     return -1;
+}
+
+int kzt_lazy_prebind_scope_lease_published(
+    const kzt_lazy_prebind_lease_t *lease)
+{
+    const kzt_lazy_prebind_entry_t *entry;
+    int published = 0;
+
+    if (!lease || !lease->active || !lease->scope || !lease->entry) {
+        return 0;
+    }
+    entry = lease->entry;
+    pthread_mutex_lock(&lease->scope->lock);
+    published = !entry->retired && entry->published &&
+                entry->record.scope_epoch == lease->scope->epoch &&
+                entry->record.scope_epoch == lease->record.scope_epoch &&
+                kzt_lazy_prebind_record_equal(
+                    &entry->record, &lease->record);
+    pthread_mutex_unlock(&lease->scope->lock);
+    return published;
 }
 
 void kzt_lazy_prebind_scope_release(kzt_lazy_prebind_lease_t *lease)
@@ -524,8 +581,11 @@ int kzt_lazy_prebind_scope_retire(
     }
     pthread_mutex_lock(&scope->lock);
     for (entry = scope->entries; entry; entry = entry->next) {
-        if (kzt_lazy_prebind_identity_equal(&entry->record.source, identity) ||
-            kzt_lazy_prebind_identity_equal(&entry->record.provider, identity)) {
+        if (!entry->record.loader_mutation_invariant &&
+            (kzt_lazy_prebind_identity_equal(
+                 &entry->record.source, identity) ||
+             kzt_lazy_prebind_identity_equal(
+                 &entry->record.provider, identity))) {
             entry->retired = 1;
             found = 1;
         }
@@ -538,7 +598,7 @@ int kzt_lazy_prebind_scope_retire(
         unsigned long leases = 0;
 
         for (entry = scope->entries; entry; entry = entry->next) {
-            if (entry->retired &&
+            if (!entry->record.loader_mutation_invariant && entry->retired &&
                 (kzt_lazy_prebind_identity_equal(&entry->record.source,
                                                   identity) ||
                  kzt_lazy_prebind_identity_equal(&entry->record.provider,

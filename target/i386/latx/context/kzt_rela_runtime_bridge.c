@@ -14,10 +14,16 @@
 #include "library.h"
 #include "library_private.h"
 
+typedef struct bridge_s bridge_t;
+
 extern uintptr_t CheckBridged(bridge_t *bridge, void *fnc);
 extern uintptr_t AddCheckBridge(bridge_t *bridge, wrapper_t wrapper,
                                 void *fnc, int stack_bytes,
                                 const char *name) __attribute__((weak));
+extern uintptr_t AddGuardedBridge(
+    bridge_t *bridge, wrapper_t wrapper, void *fnc, int stack_bytes,
+    const char *name, uintptr_t guest_fallback_target,
+    kzt_bridge_guard_kind_t guard_kind) __attribute__((weak));
 extern int BridgeForkProtectionAvailable(void);
 extern void *GetNativeSymbolUnversionned(
     void *lib, const char *name) __attribute__((weak));
@@ -70,9 +76,17 @@ typedef struct kzt_rela_runtime_wrapper_candidate {
 typedef struct kzt_rela_runtime_provider_state {
     box64context_t *context;
     uintptr_t resolved_target;
+    uintptr_t guest_fallback_target;
+    kzt_bridge_guard_kind_t guard_kind;
     int discover_bridge;
     const kzt_guest_library_handle_t *retained_provider_handle;
 } kzt_rela_runtime_provider_state_t;
+
+static int kzt_rela_runtime_provider_state_guarded(
+    const kzt_rela_runtime_provider_state_t *state)
+{
+    return state && state->guard_kind != KZT_BRIDGE_GUARD_NONE;
+}
 
 static void *kzt_rela_runtime_lookup_native(
     void *handle, const char *native_name, int custom_wrapper)
@@ -175,6 +189,7 @@ static int kzt_rela_runtime_retained_match_valid(
 
     if (!match || !(handle = match->retained_provider_handle) ||
         !handle->bindings || !handle->entry ||
+        handle->object_type != KZT_GUEST_LIBRARY_OBJECT_WRAPPED ||
         !(context = match->context_owner) ||
         !(provider = match->wrapper_provider) ||
         handle->library != provider) {
@@ -395,9 +410,11 @@ static int kzt_rela_runtime_provider_inspect(
     if (!match->native_symbol) {
         return -1;
     }
-    bridge_target = kzt_rela_runtime_provider_exact_bridge(
-        lib, state->resolved_target, wrapper, (void *)match->native_symbol);
-    if (!bridge_target &&
+    bridge_target = kzt_rela_runtime_provider_state_guarded(state) ? 0 :
+        kzt_rela_runtime_provider_exact_bridge(
+            lib, state->resolved_target, wrapper,
+            (void *)match->native_symbol);
+    if (!kzt_rela_runtime_provider_state_guarded(state) && !bridge_target &&
         kzt_rela_runtime_provider_cached_bridge(
             lib, (void *)match->native_symbol)) {
         return -1;
@@ -446,6 +463,8 @@ static int kzt_rela_runtime_provider_inspect(
     match->wrapper_provider_lifetime_bound = 1;
     match->native_owner_lifetime_bound = 1;
     match->bridge_owner_lifetime_bound = 1;
+    match->guest_fallback_target = state->guest_fallback_target;
+    match->guard_kind = state->guard_kind;
     match->retained_provider_handle = state->retained_provider_handle;
     if (state->retained_provider_handle &&
         !kzt_rela_runtime_retained_match_valid(match)) {
@@ -480,7 +499,8 @@ static uintptr_t kzt_rela_runtime_provider_check(
     library_t *provider;
 
     (void)opaque;
-    if (!match || !match->bridge_owner || !match->abi_wrapper ||
+    if (!match || match->guard_kind != KZT_BRIDGE_GUARD_NONE ||
+        !match->bridge_owner || !match->abi_wrapper ||
         !match->native_symbol ||
         !kzt_rela_runtime_match_lifetime_valid(match) ||
         (!!match->resolved_bridge_target != !!match->resolved_bridge_exact)) {
@@ -510,19 +530,37 @@ static uintptr_t kzt_rela_runtime_provider_add(
     }
 
     provider = match->bridge_owner;
-    if (!provider->priv.w.bridge || !provider->context || !AddCheckBridge) {
+    if (!provider->priv.w.bridge || !provider->context) {
+        return 0;
+    }
+
+    if (match->guard_kind != KZT_BRIDGE_GUARD_NONE) {
+        if (!AddGuardedBridge || !match->guest_fallback_target ||
+            match->guard_kind != KZT_BRIDGE_GUARD_XCB_CONNECTION) {
+            return 0;
+        }
+        target = AddGuardedBridge(
+            provider->priv.w.bridge, match->abi_wrapper,
+            (void *)match->native_symbol, match->stack_bytes,
+            request->symbol_name, match->guest_fallback_target,
+            match->guard_kind);
+        return kzt_guarded_bridge_is_exact(
+                   target, match->abi_wrapper,
+                   (void *)match->native_symbol,
+                   match->guest_fallback_target, match->guard_kind) ?
+                   target : 0;
+    }
+
+    if (!AddCheckBridge) {
         return 0;
     }
     target = AddCheckBridge(provider->priv.w.bridge, match->abi_wrapper,
                             (void *)match->native_symbol, match->stack_bytes,
                             request->symbol_name);
-    if (!target ||
-        kzt_rela_runtime_provider_exact_bridge(
-            provider, target, match->abi_wrapper,
-            (void *)match->native_symbol) != target) {
-        target = 0;
-    }
-    return target;
+    return target &&
+           kzt_rela_runtime_provider_exact_bridge(
+               provider, target, match->abi_wrapper,
+               (void *)match->native_symbol) == target ? target : 0;
 }
 
 static int kzt_rela_runtime_wrapper_provider_prepare_mode(
@@ -531,11 +569,15 @@ static int kzt_rela_runtime_wrapper_provider_prepare_mode(
     kzt_symbol_version_evidence_t version_evidence,
     const char *symbol_version, int discover_bridge,
     const kzt_guest_library_handle_t *retained_provider_handle,
+    uintptr_t guest_fallback_target,
+    kzt_bridge_guard_kind_t guard_kind,
     kzt_wrapper_bridge_provider_t *provider)
 {
     kzt_rela_runtime_provider_state_t state = {
         .context = context,
         .resolved_target = resolved_target,
+        .guest_fallback_target = guest_fallback_target,
+        .guard_kind = guard_kind,
         .discover_bridge = discover_bridge,
         .retained_provider_handle = retained_provider_handle,
     };
@@ -550,6 +592,14 @@ static int kzt_rela_runtime_wrapper_provider_prepare_mode(
 
     if (!provider) {
         return -1;
+    }
+    if ((guard_kind == KZT_BRIDGE_GUARD_NONE && guest_fallback_target) ||
+        (guard_kind != KZT_BRIDGE_GUARD_NONE &&
+         (!guest_fallback_target ||
+          guard_kind != KZT_BRIDGE_GUARD_XCB_CONNECTION ||
+          !discover_bridge || resolved_target))) {
+        memset(provider, 0, sizeof(*provider));
+        return 0;
     }
     if (!BridgeForkProtectionAvailable()) {
         memset(provider, 0, sizeof(*provider));
@@ -572,7 +622,7 @@ int kzt_rela_runtime_wrapper_provider_prepare(
         context, resolved_provider, resolved_target, symbol_name,
         symbol_version && symbol_version[0] ? KZT_SYMBOL_VERSION_VERSIONED :
                                              KZT_SYMBOL_VERSION_UNKNOWN,
-        symbol_version, 0, NULL, provider);
+        symbol_version, 0, NULL, 0, KZT_BRIDGE_GUARD_NONE, provider);
 }
 
 int kzt_rela_runtime_wrapper_provider_prepare_with_version_evidence(
@@ -584,7 +634,8 @@ int kzt_rela_runtime_wrapper_provider_prepare_with_version_evidence(
 {
     return kzt_rela_runtime_wrapper_provider_prepare_mode(
         context, resolved_provider, resolved_target, symbol_name,
-        version_evidence, symbol_version, 0, NULL, provider);
+        version_evidence, symbol_version, 0, NULL, 0,
+        KZT_BRIDGE_GUARD_NONE, provider);
 }
 
 int kzt_rela_runtime_wrapper_provider_discover(
@@ -596,7 +647,7 @@ int kzt_rela_runtime_wrapper_provider_discover(
         context, resolved_provider, 0, symbol_name,
         symbol_version && symbol_version[0] ? KZT_SYMBOL_VERSION_VERSIONED :
                                              KZT_SYMBOL_VERSION_UNKNOWN,
-        symbol_version, 1, NULL, provider);
+        symbol_version, 1, NULL, 0, KZT_BRIDGE_GUARD_NONE, provider);
 }
 
 int kzt_rela_runtime_wrapper_provider_discover_with_version_evidence(
@@ -608,7 +659,21 @@ int kzt_rela_runtime_wrapper_provider_discover_with_version_evidence(
 {
     return kzt_rela_runtime_wrapper_provider_prepare_mode(
         context, resolved_provider, 0, symbol_name, version_evidence,
-        symbol_version, 1, NULL, provider);
+        symbol_version, 1, NULL, 0, KZT_BRIDGE_GUARD_NONE, provider);
+}
+
+int kzt_rela_runtime_wrapper_provider_discover_guarded_with_version_evidence(
+    box64context_t *context, library_t *resolved_provider,
+    const char *symbol_name,
+    kzt_symbol_version_evidence_t version_evidence,
+    const char *symbol_version, uintptr_t guest_fallback_target,
+    kzt_bridge_guard_kind_t guard_kind,
+    kzt_wrapper_bridge_provider_t *provider)
+{
+    return kzt_rela_runtime_wrapper_provider_prepare_mode(
+        context, resolved_provider, 0, symbol_name, version_evidence,
+        symbol_version, 1, NULL, guest_fallback_target, guard_kind,
+        provider);
 }
 
 int kzt_rela_runtime_wrapper_provider_discover_retained_with_version_evidence(
@@ -625,7 +690,67 @@ int kzt_rela_runtime_wrapper_provider_discover_retained_with_version_evidence(
     return kzt_rela_runtime_wrapper_provider_prepare_mode(
         context, retained_provider_handle->library, 0, symbol_name,
         version_evidence, symbol_version, 1, retained_provider_handle,
-        provider);
+        0, KZT_BRIDGE_GUARD_NONE, provider);
+}
+
+uintptr_t kzt_rela_runtime_select_exact_wrapper_bridge_retained(
+    box64context_t *context,
+    const kzt_guest_library_handle_t *retained_provider_handle,
+    const char *symbol_name,
+    kzt_symbol_version_evidence_t version_evidence,
+    const char *symbol_version)
+{
+    kzt_wrapper_bridge_provider_t provider = { 0 };
+    kzt_wrapper_probe_request_t request = {
+        .symbol_name = symbol_name,
+        .symbol_version_evidence = version_evidence,
+        .symbol_version = symbol_version,
+    };
+    kzt_wrapper_probe_result_t probe = { 0 };
+    kzt_patch_wrapper_match_t expected_match;
+
+    if (!context || !retained_provider_handle ||
+        retained_provider_handle->object_type !=
+            KZT_GUEST_LIBRARY_OBJECT_WRAPPED ||
+        !symbol_name || !symbol_name[0] ||
+        !kzt_symbol_version_evidence_valid(version_evidence,
+                                           symbol_version)) {
+        return 0;
+    }
+    expected_match = version_evidence ==
+            KZT_SYMBOL_VERSION_CONFIRMED_UNVERSIONED
+        ? KZT_PATCH_WRAPPER_UNVERSIONED_MATCH
+        : KZT_PATCH_WRAPPER_VERSION_MATCH;
+    if (kzt_rela_runtime_wrapper_provider_discover_retained_with_version_evidence(
+            context, retained_provider_handle, symbol_name, version_evidence,
+            symbol_version, &provider) <= 0 ||
+        kzt_wrapper_probe_minimal_manifest(
+            &provider.manifest, &request, &provider.bridge_ops, &probe) != 0 ||
+        probe.wrapper_match != expected_match || !probe.bridge_target ||
+        !kzt_symbol_version_evidence_matches(
+            version_evidence, symbol_version,
+            probe.wrapper_version_evidence, probe.wrapper_symbol_version)) {
+        return 0;
+    }
+    return probe.bridge_target;
+}
+
+int kzt_rela_runtime_wrapper_provider_discover_guarded_retained_with_version_evidence(
+    box64context_t *context,
+    const kzt_guest_library_handle_t *retained_provider_handle,
+    const char *symbol_name,
+    kzt_symbol_version_evidence_t version_evidence,
+    const char *symbol_version, uintptr_t guest_fallback_target,
+    kzt_bridge_guard_kind_t guard_kind,
+    kzt_wrapper_bridge_provider_t *provider)
+{
+    if (!retained_provider_handle || !retained_provider_handle->library) {
+        return 0;
+    }
+    return kzt_rela_runtime_wrapper_provider_prepare_mode(
+        context, retained_provider_handle->library, 0, symbol_name,
+        version_evidence, symbol_version, 1, retained_provider_handle,
+        guest_fallback_target, guard_kind, provider);
 }
 
 int kzt_rela_runtime_wrapper_provider_bind_retained_handle(

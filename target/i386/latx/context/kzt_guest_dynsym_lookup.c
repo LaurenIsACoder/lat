@@ -313,17 +313,11 @@ kzt_guest_dynsym_inspect_symbol(
     visibility = candidate.st_other & 0x3;
     if (candidate.st_shndx == SHN_UNDEF ||
         (visibility != STV_DEFAULT && visibility != STV_PROTECTED) ||
-        (binding != STB_GLOBAL && binding != STB_WEAK
-#ifdef STB_GNU_UNIQUE
-         && binding != STB_GNU_UNIQUE
-#endif
-        ) ||
+        (binding != STB_GLOBAL && binding != STB_WEAK &&
+         binding != KZT_ELF_STB_GNU_UNIQUE) ||
         (type != STT_NOTYPE && type != STT_OBJECT &&
-         type != STT_FUNC && type != STT_COMMON && type != STT_TLS
-#ifdef STT_GNU_IFUNC
-         && type != STT_GNU_IFUNC
-#endif
-        )) {
+         type != STT_FUNC && type != STT_COMMON && type != STT_TLS &&
+         type != KZT_ELF_STT_GNU_IFUNC)) {
         return KZT_GUEST_DYNSYM_SYMBOL_NO_MATCH;
     }
     if (candidate.st_value > UINTPTR_MAX) {

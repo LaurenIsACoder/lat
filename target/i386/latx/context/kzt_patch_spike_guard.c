@@ -140,18 +140,13 @@ unsigned long kzt_patch_spike_guard_budget_remaining(
 static int kzt_patch_spike_guard_reserve_budget(kzt_patch_spike_guard_t *guard)
 {
     unsigned long attempts;
-
-    for (;;) {
-        attempts = __atomic_load_n(&guard->write_attempts, __ATOMIC_ACQUIRE);
-        if (attempts >= guard->config.budget) {
-            return 0;
-        }
-        if (__atomic_compare_exchange_n(&guard->write_attempts, &attempts,
-                                        attempts + 1, 0, __ATOMIC_ACQ_REL,
-                                        __ATOMIC_ACQUIRE)) {
-            return 1;
-        }
+    attempts = __atomic_load_n(&guard->write_attempts, __ATOMIC_ACQUIRE);
+    if (attempts >= guard->config.budget) {
+        return 0;
     }
+    __atomic_store_n(&guard->write_attempts, attempts + 1,
+                     __ATOMIC_RELEASE);
+    return 1;
 }
 
 static int kzt_patch_spike_failure_preserves_guest(
@@ -170,7 +165,7 @@ static int kzt_patch_spike_decision_allows_write(
            decision->allow_native_bridge;
 }
 
-int kzt_patch_spike_guard_try_write(
+static int kzt_patch_spike_guard_try_write_internal(
     kzt_patch_spike_guard_t *guard,
     const kzt_patch_decision_t *decision,
     const kzt_patch_spike_writer_ops_t *writer,
@@ -365,6 +360,16 @@ int kzt_patch_spike_guard_try_write(
         KZT_PATCH_SPIKE_ACTION_USE_NATIVE_BRIDGE, guard);
     kzt_patch_spike_guard_unlock(guard);
     return 0;
+}
+
+int kzt_patch_spike_guard_try_write(
+    kzt_patch_spike_guard_t *guard,
+    const kzt_patch_decision_t *decision,
+    const kzt_patch_spike_writer_ops_t *writer,
+    kzt_patch_spike_outcome_t *outcome)
+{
+    return kzt_patch_spike_guard_try_write_internal(
+        guard, decision, writer, outcome);
 }
 
 const char *kzt_patch_spike_result_name(kzt_patch_spike_result_t result)

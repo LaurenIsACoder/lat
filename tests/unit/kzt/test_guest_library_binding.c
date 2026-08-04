@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include "kzt_guest_library_binding.h"
@@ -186,7 +187,14 @@ static void test_reverse_lookup_unique_main_binding(void)
     CHECK("reverse unique handle",
           handle.library == (library_t *)&lib &&
           handle.object_type == KZT_GUEST_LIBRARY_OBJECT_WRAPPED);
+    CHECK("reverse unique retained key",
+          kzt_guest_library_handle_matches_key(&handle, &expected));
+    expected.generation++;
+    CHECK("reverse unique rejects different key",
+          !kzt_guest_library_handle_matches_key(&handle, &expected));
     kzt_guest_library_handle_release(&handle);
+    CHECK("reverse unique released handle rejects key",
+          !kzt_guest_library_handle_matches_key(&handle, &found));
     kzt_guest_library_access_destroy(&access);
 }
 
@@ -2426,6 +2434,7 @@ static void test_symbol_evidence_cache_is_generation_local(void)
     kzt_guest_library_binding_key_t second = key(0x17000, 91);
     kzt_guest_library_handle_t handle = { 0 };
     uintptr_t address = 0;
+    uintptr_t bridge = 0;
     unsigned char type = 0;
 
     CHECK("symbol cache access init",
@@ -2442,15 +2451,34 @@ static void test_symbol_evidence_cache_is_generation_local(void)
         &handle, "cached_function", 1, 0x17100, 2);
     CHECK("symbol cache first hit",
           kzt_guest_library_symbol_evidence_lookup(
-              &handle, "cached_function", 1, &address, &type) == 0 &&
-          address == 0x17100 && type == 2);
+              &handle, "cached_function", 1, &address, &type, &bridge) == 0 &&
+          address == 0x17100 && type == 2 && !bridge);
+    CHECK("bridge cache misses before exact selection",
+          !bridge);
+    kzt_guest_library_symbol_bridge_store(
+        &handle, "cached_function", 1, 0x17200);
+    CHECK("bridge cache first hit",
+          kzt_guest_library_symbol_evidence_lookup(
+              &handle, "cached_function", 1, &address, &type, &bridge) == 0 &&
+          bridge == 0x17200);
     CHECK("symbol cache dynamic revision misses",
           kzt_guest_library_symbol_evidence_lookup(
-              &handle, "cached_function", 2, &address, &type) != 0);
+              &handle, "cached_function", 2, &address, &type, &bridge) != 0 &&
+          !bridge);
     CHECK("symbol cache first hit remains revision local",
           kzt_guest_library_symbol_evidence_lookup(
-              &handle, "cached_function", 1, &address, &type) == 0 &&
-          address == 0x17100 && type == 2);
+              &handle, "cached_function", 1, &address, &type, &bridge) == 0 &&
+          address == 0x17100 && type == 2 && bridge == 0x17200);
+    CHECK("bridge cache dynamic revision misses",
+          kzt_guest_library_symbol_evidence_lookup(
+              &handle, "cached_function", 2, &address, &type, &bridge) != 0 &&
+          !bridge);
+    kzt_guest_library_symbol_evidence_store(
+        &handle, "cached_function", 2, 0x17300, 2);
+    CHECK("new symbol evidence invalidates old bridge",
+          kzt_guest_library_symbol_evidence_lookup(
+              &handle, "cached_function", 1, &address, &type, &bridge) != 0 &&
+          !bridge);
     kzt_guest_library_handle_release(&handle);
 
     kzt_guest_library_inactivate(
@@ -2465,18 +2493,227 @@ static void test_symbol_evidence_cache_is_generation_local(void)
           &access, &second, &handle) == 0);
     CHECK("symbol cache old generation misses",
           kzt_guest_library_symbol_evidence_lookup(
-              &handle, "cached_function", 1, &address, &type) != 0);
+              &handle, "cached_function", 1, &address, &type, &bridge) != 0);
+    CHECK("bridge cache old generation misses",
+          !bridge);
     kzt_guest_library_handle_release(&handle);
     kzt_guest_library_access_destroy(&access);
 }
 
-int main(void)
+static void test_symbol_bridge_cache_does_not_cross_symbol_aliases(void)
 {
+    fake_library_t lib = { 90 };
+    kzt_guest_library_access_t access;
+    kzt_guest_library_binding_key_t binding_key = key(0x18000, 92);
+    kzt_guest_library_handle_t handle = { 0 };
+    uintptr_t address = 0;
+    uintptr_t bridge = 0;
+    unsigned char type = 0;
+    char symbol[32];
+
+    CHECK("alias cache access init",
+          kzt_guest_library_access_init(&access) == 0);
+    CHECK("alias cache track", kzt_guest_library_track(
+          access.bindings, (library_t *)&lib) == 0);
+    CHECK("alias cache bind", kzt_guest_library_bind(
+          access.bindings, &binding_key, (library_t *)&lib,
+          KZT_GUEST_LIBRARY_OBJECT_WRAPPED) ==
+          KZT_GUEST_LIBRARY_BINDING_ADDED);
+    CHECK("alias cache lookup", kzt_guest_library_access_lookup(
+          &access, &binding_key, &handle) == 0);
+    kzt_guest_library_symbol_evidence_store(
+        &handle, "original_alias", 1, 0x18100, 2);
+    kzt_guest_library_symbol_bridge_store(
+        &handle, "original_alias", 1, 0x18200);
+    for (size_t i = 0; i < 16; ++i) {
+        snprintf(symbol, sizeof(symbol), "replacement_alias_%zu", i);
+        kzt_guest_library_symbol_evidence_store(
+            &handle, symbol, 1, 0x18100, 2);
+    }
+    CHECK("evicted alias cannot inherit old bridge",
+          kzt_guest_library_symbol_evidence_lookup(
+              &handle, "replacement_alias_15", 1, &address, &type,
+              &bridge) == 0 &&
+          address == 0x18100 && type == 2 && !bridge);
+    kzt_guest_library_handle_release(&handle);
+    kzt_guest_library_access_destroy(&access);
+}
+
+static void test_symbol_bridge_cache_rejects_unloading_handle(void)
+{
+    fake_library_t lib = { 91 };
+    kzt_guest_library_access_t access;
+    kzt_guest_library_binding_key_t binding_key = key(0x19000, 93);
+    kzt_guest_library_handle_t held = { 0 }, probe = { 0 };
+    uintptr_t address = 1;
+    uintptr_t bridge = 1;
+    unsigned char type = 1;
+    pthread_t thread;
+    unbind_thread_arg_t arg = {
+        .library = (library_t *)&lib,
+        .lock = PTHREAD_MUTEX_INITIALIZER,
+        .cond = PTHREAD_COND_INITIALIZER,
+    };
+
+    CHECK("unload cache access init",
+          kzt_guest_library_access_init(&access) == 0);
+    arg.bindings = access.bindings;
+    CHECK("unload cache track", kzt_guest_library_track(
+          access.bindings, (library_t *)&lib) == 0);
+    CHECK("unload cache bind", kzt_guest_library_bind(
+          access.bindings, &binding_key, (library_t *)&lib,
+          KZT_GUEST_LIBRARY_OBJECT_WRAPPED) ==
+          KZT_GUEST_LIBRARY_BINDING_ADDED);
+    CHECK("unload cache lookup", kzt_guest_library_access_lookup(
+          &access, &binding_key, &held) == 0);
+    kzt_guest_library_symbol_evidence_store(
+        &held, "unloading_symbol", 1, 0x19100, 2);
+    kzt_guest_library_symbol_bridge_store(
+        &held, "unloading_symbol", 1, 0x19200);
+    CHECK("unload cache thread", pthread_create(
+          &thread, NULL, unbind_thread, &arg) == 0);
+    pthread_mutex_lock(&arg.lock);
+    while (!arg.started) pthread_cond_wait(&arg.cond, &arg.lock);
+    pthread_mutex_unlock(&arg.lock);
+    while (kzt_guest_library_lookup(
+               access.bindings, &binding_key, &probe) == 0) {
+        kzt_guest_library_handle_release(&probe);
+    }
+    CHECK("unloading handle rejects cached evidence",
+          kzt_guest_library_symbol_evidence_lookup(
+              &held, "unloading_symbol", 1, &address, &type,
+              &bridge) != 0 &&
+          !address && !type && !bridge);
+    pthread_mutex_lock(&arg.lock);
+    CHECK("unload cache waits for held handle", !arg.done);
+    pthread_mutex_unlock(&arg.lock);
+    kzt_guest_library_handle_release(&held);
+    pthread_join(thread, NULL);
+    pthread_cond_destroy(&arg.cond);
+    pthread_mutex_destroy(&arg.lock);
+    kzt_guest_library_access_destroy(&access);
+}
+
+#define SYMBOL_CACHE_BENCHMARK_ROUNDS 21
+#define SYMBOL_CACHE_BENCHMARK_REPEATS 100000
+
+static volatile uintptr_t symbol_cache_benchmark_sink;
+
+static uint64_t symbol_cache_benchmark_now(void)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * UINT64_C(1000000000) + now.tv_nsec;
+}
+
+static int compare_u64(const void *left, const void *right)
+{
+    uint64_t a = *(const uint64_t *)left;
+    uint64_t b = *(const uint64_t *)right;
+
+    return a < b ? -1 : a > b;
+}
+
+static uint64_t benchmark_symbol_evidence_lookup(
+    const kzt_guest_library_handle_t *handle, int include_bridge)
+{
+    uintptr_t address = 0;
+    uintptr_t bridge = 0;
+    unsigned char type = 0;
+    uint64_t start = symbol_cache_benchmark_now();
+
+    for (size_t i = 0; i < SYMBOL_CACHE_BENCHMARK_REPEATS; ++i) {
+        if (kzt_guest_library_symbol_evidence_lookup(
+                handle, "benchmark_symbol", 1, &address, &type,
+                include_bridge ? &bridge : NULL) != 0) {
+            return 0;
+        }
+        symbol_cache_benchmark_sink ^= address ^ bridge ^ type;
+    }
+    return symbol_cache_benchmark_now() - start;
+}
+
+static void test_symbol_bridge_cache_performance(void)
+{
+    fake_library_t lib = { 92 };
+    kzt_guest_library_access_t access;
+    kzt_guest_library_binding_key_t binding_key = key(0x1a000, 94);
+    kzt_guest_library_handle_t handle = { 0 };
+    uint64_t evidence_only[SYMBOL_CACHE_BENCHMARK_ROUNDS];
+    uint64_t evidence_with_bridge[SYMBOL_CACHE_BENCHMARK_ROUNDS];
+    uint64_t baseline;
+    uint64_t candidate;
+    uint64_t limit;
+
+    CHECK("benchmark cache access init",
+          kzt_guest_library_access_init(&access) == 0);
+    CHECK("benchmark cache track", kzt_guest_library_track(
+          access.bindings, (library_t *)&lib) == 0);
+    CHECK("benchmark cache bind", kzt_guest_library_bind(
+          access.bindings, &binding_key, (library_t *)&lib,
+          KZT_GUEST_LIBRARY_OBJECT_WRAPPED) ==
+          KZT_GUEST_LIBRARY_BINDING_ADDED);
+    CHECK("benchmark cache lookup", kzt_guest_library_access_lookup(
+          &access, &binding_key, &handle) == 0);
+    kzt_guest_library_symbol_evidence_store(
+        &handle, "benchmark_symbol", 1, 0x1a100, 2);
+    kzt_guest_library_symbol_bridge_store(
+        &handle, "benchmark_symbol", 1, 0x1a200);
+    for (size_t i = 0; i < SYMBOL_CACHE_BENCHMARK_ROUNDS; ++i) {
+        if (i & 1) {
+            evidence_with_bridge[i] =
+                benchmark_symbol_evidence_lookup(&handle, 1);
+            evidence_only[i] =
+                benchmark_symbol_evidence_lookup(&handle, 0);
+        } else {
+            evidence_only[i] =
+                benchmark_symbol_evidence_lookup(&handle, 0);
+            evidence_with_bridge[i] =
+                benchmark_symbol_evidence_lookup(&handle, 1);
+        }
+        CHECK("benchmark cache sample", evidence_only[i] &&
+              evidence_with_bridge[i]);
+    }
+    qsort(evidence_only, SYMBOL_CACHE_BENCHMARK_ROUNDS,
+          sizeof(evidence_only[0]), compare_u64);
+    qsort(evidence_with_bridge, SYMBOL_CACHE_BENCHMARK_ROUNDS,
+          sizeof(evidence_with_bridge[0]), compare_u64);
+    baseline = evidence_only[SYMBOL_CACHE_BENCHMARK_ROUNDS / 2];
+    candidate = evidence_with_bridge[SYMBOL_CACHE_BENCHMARK_ROUNDS / 2];
+    limit = baseline + baseline / 10 +
+            SYMBOL_CACHE_BENCHMARK_REPEATS * UINT64_C(5);
+    printf("symbol-bridge-cache-performance baseline_total_ns=%llu "
+           "candidate_total_ns=%llu limit_total_ns=%llu "
+           "candidate_ns_op=%llu result=%s\n",
+           (unsigned long long)baseline,
+           (unsigned long long)candidate,
+           (unsigned long long)limit,
+           (unsigned long long)(candidate /
+                                SYMBOL_CACHE_BENCHMARK_REPEATS),
+           candidate <= limit ? "PASS" : "FAIL");
+    CHECK("symbol bridge cache performance", candidate <= limit);
+    kzt_guest_library_handle_release(&handle);
+    kzt_guest_library_access_destroy(&access);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "--benchmark") == 0) {
+        test_symbol_bridge_cache_performance();
+        return failures ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
+    if (argc != 1) {
+        fprintf(stderr, "usage: %s [--benchmark]\n", argv[0]);
+        return 2;
+    }
     test_reverse_lookup_unique_main_binding();
     test_reverse_lookup_zero_match_clears_outputs();
     test_wrapped_producer_cannot_own_two_live_identities();
     test_reverse_lookup_non_main_binding_is_rejected();
     test_symbol_evidence_cache_is_generation_local();
+    test_symbol_bridge_cache_does_not_cross_symbol_aliases();
+    test_symbol_bridge_cache_rejects_unloading_handle();
     test_init_failure_is_fail_open();
     test_loader_quiescence_lease_acquire_release();
     test_loader_quiescence_writer_token_is_stable();

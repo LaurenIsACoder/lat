@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "box64context.h"
+
 #define CHECK(condition) \
     do { \
         if (!(condition)) { \
@@ -60,12 +62,40 @@ static void test_event_publishes_exact_map_with_monotonic_sequence(void)
     kzt_loader_event_hook_destroy(&hook);
 }
 
+static void test_glibc_228_layout_is_exactly_authorized(void)
+{
+    kzt_loader_event_hook_t hook;
+    kzt_loader_event_layout_t layout;
+
+    CHECK(kzt_loader_event_hook_lookup_layout(
+              KZT_LOADER_EVENT_HOOK_GLIBC_2_28_BUILD_ID, &layout) == 0);
+    CHECK(layout.scope_layout == KZT_GUEST_SCOPE_LAYOUT_UNSUPPORTED);
+    CHECK(layout.debug_state_offset == 0xfb10);
+    CHECK(layout.r_debug_offset == 0x29160);
+    CHECK(kzt_loader_event_hook_install(
+              &hook, KZT_LOADER_EVENT_HOOK_GLIBC_2_28_BUILD_ID,
+              0x1000, 3, 1) == 0);
+    CHECK(kzt_loader_event_hook_scope_layout(&hook) ==
+          KZT_GUEST_SCOPE_LAYOUT_UNSUPPORTED);
+    kzt_loader_event_hook_destroy(&hook);
+
+    memset(&layout, 0xa5, sizeof(layout));
+    CHECK(kzt_loader_event_hook_lookup_layout("unknown", &layout) != 0);
+    CHECK(layout.scope_layout == KZT_GUEST_SCOPE_LAYOUT_UNSUPPORTED);
+    CHECK(layout.debug_state_offset == 0);
+    CHECK(layout.r_debug_offset == 0);
+}
+
 typedef struct lifecycle_fixture {
     kzt_loader_lifecycle_identity_t identities[2];
     kzt_loader_lifecycle_identity_t unloaded;
     int unload_calls;
     int prepare_calls;
     int cancel_calls;
+    int fail_resolve;
+    int fail_prepare;
+    int fail_cancel;
+    int fail_unload;
 } lifecycle_fixture_t;
 
 static int resolve_lifecycle_identity(
@@ -75,6 +105,9 @@ static int resolve_lifecycle_identity(
 {
     lifecycle_fixture_t *fixture = opaque;
 
+    if (fixture->fail_resolve) {
+        return -1;
+    }
     for (size_t i = 0; i < 2; ++i) {
         if (fixture->identities[i].link_map_addr == link_map_addr) {
             *identity = fixture->identities[i];
@@ -84,7 +117,7 @@ static int resolve_lifecycle_identity(
     return -1;
 }
 
-static void publish_lifecycle_unload(
+static int publish_lifecycle_unload(
     const kzt_loader_lifecycle_identity_t *identity,
     void *opaque)
 {
@@ -92,6 +125,7 @@ static void publish_lifecycle_unload(
 
     fixture->unloaded = *identity;
     ++fixture->unload_calls;
+    return fixture->fail_unload ? -1 : 0;
 }
 
 static int prepare_lifecycle_unload(
@@ -102,7 +136,7 @@ static int prepare_lifecycle_unload(
 
     CHECK(identity != NULL);
     ++fixture->prepare_calls;
-    return 0;
+    return fixture->fail_prepare ? -1 : 0;
 }
 
 static int cancel_lifecycle_unload(
@@ -113,7 +147,7 @@ static int cancel_lifecycle_unload(
 
     CHECK(identity != NULL);
     ++fixture->cancel_calls;
-    return 0;
+    return fixture->fail_cancel ? -1 : 0;
 }
 
 static void test_delete_consistent_publishes_exact_removed_identity(void)
@@ -133,6 +167,7 @@ static void test_delete_consistent_publishes_exact_removed_identity(void)
               0x1000, 3, 1) == 0);
     CHECK(kzt_loader_event_hook_enable_lifecycle(
               &hook, 0x2000, 0x3000) == 0);
+    CHECK(!kzt_loader_event_hook_lifecycle_healthy(&hook));
     CHECK(kzt_loader_event_hook_publish_lifecycle(
               &hook, KZT_LOADER_DEBUG_DELETE,
               before, 2, resolve_lifecycle_identity,
@@ -147,12 +182,14 @@ static void test_delete_consistent_publishes_exact_removed_identity(void)
               before, 2, resolve_lifecycle_identity,
               prepare_lifecycle_unload, cancel_lifecycle_unload,
               publish_lifecycle_unload, &fixture) == 0);
+    CHECK(kzt_loader_event_hook_lifecycle_healthy(&hook));
     CHECK(fixture.unload_calls == 0);
     CHECK(kzt_loader_event_hook_publish_lifecycle(
               &hook, KZT_LOADER_DEBUG_DELETE,
               before, 2, resolve_lifecycle_identity,
               prepare_lifecycle_unload, cancel_lifecycle_unload,
               publish_lifecycle_unload, &fixture) == 0);
+    CHECK(!kzt_loader_event_hook_lifecycle_healthy(&hook));
     CHECK(kzt_loader_event_hook_publish_lifecycle(
               &hook, KZT_LOADER_DEBUG_CONSISTENT,
               after, 1, resolve_lifecycle_identity,
@@ -198,6 +235,7 @@ static void test_add_does_not_discard_pending_delete(void)
               before, 2, resolve_lifecycle_identity,
               prepare_lifecycle_unload, cancel_lifecycle_unload,
               publish_lifecycle_unload, &fixture) == 0);
+    CHECK(!kzt_loader_event_hook_lifecycle_healthy(&hook));
     CHECK(kzt_loader_event_hook_publish_lifecycle(
               &hook, KZT_LOADER_DEBUG_CONSISTENT,
               after, 1, resolve_lifecycle_identity,
@@ -289,7 +327,7 @@ static int cancel_allocation_unload(
     return 0;
 }
 
-static void publish_allocation_unload(
+static int publish_allocation_unload(
     const kzt_loader_lifecycle_identity_t *identity,
     void *opaque)
 {
@@ -297,6 +335,7 @@ static void publish_allocation_unload(
 
     CHECK(identity != NULL);
     ++fixture->unload_calls;
+    return 0;
 }
 
 static void test_pending_growth_allocation_failure_cancels_all(void)
@@ -318,6 +357,12 @@ static void test_pending_growth_allocation_failure_cancels_all(void)
               0x1000, 3, 1) == 0);
     CHECK(kzt_loader_event_hook_enable_lifecycle(
               &hook, 0x2000, 0x3000) == 0);
+    CHECK(kzt_loader_event_hook_publish_lifecycle(
+              &hook, KZT_LOADER_DEBUG_CONSISTENT,
+              live_maps, 1, resolve_allocation_identity,
+              prepare_allocation_unload, cancel_allocation_unload,
+              publish_allocation_unload, &fixture) == 0);
+    CHECK(kzt_loader_event_hook_lifecycle_healthy(&hook));
     kzt_loader_event_hook_test_set_alloc_failure_after(1);
     CHECK(kzt_loader_event_hook_publish_lifecycle(
               &hook, KZT_LOADER_DEBUG_DELETE,
@@ -330,18 +375,67 @@ static void test_pending_growth_allocation_failure_cancels_all(void)
     CHECK(fixture.cancel_calls == 65);
     CHECK(fixture.unload_calls == 0);
     CHECK(hook.pending_delete_count == 0);
+    CHECK(!kzt_loader_event_hook_lifecycle_healthy(&hook));
     kzt_loader_event_hook_test_set_alloc_failure_after(-1);
+    CHECK(kzt_loader_event_hook_publish_lifecycle(
+              &hook, KZT_LOADER_DEBUG_CONSISTENT,
+              live_maps, 1, resolve_allocation_identity,
+              prepare_allocation_unload, cancel_allocation_unload,
+              publish_allocation_unload, &fixture) == 0);
+    CHECK(!kzt_loader_event_hook_lifecycle_healthy(&hook));
     CHECK(kzt_loader_event_hook_destroy(&hook) == 0);
+}
+
+static void make_context_lifecycle_healthy(box64context_t *context)
+{
+    lifecycle_fixture_t fixture = { 0 };
+
+    kzt_loader_event_hook_context_init(&context->kzt_loader_event_hook);
+    CHECK(kzt_loader_event_hook_install(
+              &context->kzt_loader_event_hook,
+              KZT_LOADER_EVENT_HOOK_SUPPORTED_BUILD_ID,
+              0x1000, 3, 1) == 0);
+    CHECK(kzt_loader_event_hook_enable_lifecycle(
+              &context->kzt_loader_event_hook, 0x2000, 0x3000) == 0);
+    CHECK(kzt_loader_event_hook_publish_lifecycle(
+              &context->kzt_loader_event_hook,
+              KZT_LOADER_DEBUG_CONSISTENT, NULL, 0,
+              resolve_lifecycle_identity, prepare_lifecycle_unload,
+              cancel_lifecycle_unload, publish_lifecycle_unload,
+              &fixture) == 0);
+}
+
+static void test_context_owned_lifecycle_isolation_and_destroy(void)
+{
+    box64context_t first = { 0 };
+    box64context_t second = { 0 };
+
+    CHECK(!kzt_loader_lifecycle_runtime_healthy(NULL));
+    make_context_lifecycle_healthy(&first);
+    CHECK(kzt_loader_lifecycle_runtime_healthy(&first));
+    CHECK(!kzt_loader_lifecycle_runtime_healthy(&second));
+
+    make_context_lifecycle_healthy(&second);
+    CHECK(kzt_loader_lifecycle_runtime_healthy(&first));
+    CHECK(kzt_loader_lifecycle_runtime_healthy(&second));
+
+    kzt_loader_event_hook_context_destroy(&first.kzt_loader_event_hook);
+    CHECK(!kzt_loader_lifecycle_runtime_healthy(&first));
+    CHECK(kzt_loader_lifecycle_runtime_healthy(&second));
+    kzt_loader_event_hook_context_destroy(&second.kzt_loader_event_hook);
+    CHECK(!kzt_loader_lifecycle_runtime_healthy(&second));
 }
 
 int main(void)
 {
     test_version_and_pattern_fail_open();
     test_event_publishes_exact_map_with_monotonic_sequence();
+    test_glibc_228_layout_is_exactly_authorized();
     test_delete_consistent_publishes_exact_removed_identity();
     test_add_does_not_discard_pending_delete();
     test_same_address_new_identity_retires_old_generation();
     test_pending_growth_allocation_failure_cancels_all();
+    test_context_owned_lifecycle_isolation_and_destroy();
     puts("kzt-loader-event-hook: all tests passed");
     return 0;
 }

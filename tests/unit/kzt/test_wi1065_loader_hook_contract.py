@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 MYALIGN = ROOT / "target/i386/latx/context/myalign.c"
 HOOK = ROOT / "target/i386/latx/context/kzt_loader_event_hook.c"
+HOOK_HEADER = ROOT / "target/i386/latx/include/kzt_loader_event_hook.h"
 
 
 def function_body(source, prefix):
@@ -24,10 +25,10 @@ def function_body(source, prefix):
 
 
 hook = HOOK.read_text(encoding="utf-8")
+hook_header = HOOK_HEADER.read_text(encoding="utf-8")
 myalign = MYALIGN.read_text(encoding="utf-8")
 
 for required in (
-    "KZT_LOADER_EVENT_HOOK_SUPPORTED_BUILD_ID",
     "kzt_loader_event_hook_read_build_id",
     "kzt_loader_event_hook_install",
     "kzt_loader_event_hook_publish",
@@ -36,6 +37,12 @@ for required in (
 ):
     if required not in hook:
         raise AssertionError(f"WI-1065 hook misses {required}")
+for required in (
+    "KZT_LOADER_EVENT_HOOK_GLIBC_2_28_BUILD_ID",
+    "KZT_LOADER_EVENT_HOOK_GLIBC_2_39_BUILD_ID",
+):
+    if required not in hook or required not in hook_header:
+        raise AssertionError(f"WI-1065 exact layout table misses {required}")
 
 publish = function_body(hook, "int kzt_loader_event_hook_publish(")
 for forbidden in (

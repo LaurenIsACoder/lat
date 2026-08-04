@@ -167,6 +167,8 @@ static void test_epoch_invalidates_and_replaces_record(void)
           KZT_LAZY_PREBIND_CLAIM_CREATED);
     CHECK("epoch first acquire", kzt_lazy_prebind_scope_acquire(
           scope, &record, &lease) == 0);
+    CHECK("epoch claimed record is not published",
+          !kzt_lazy_prebind_scope_lease_published(&lease));
     CHECK("epoch exact provider", lease.record.provider.link_map_addr == 0x2000 &&
           lease.record.provider.generation == 9);
     kzt_lazy_prebind_scope_release(&lease);
@@ -302,6 +304,76 @@ static void test_publication_is_unique_and_mutation_drains(void)
     pthread_mutex_destroy(&race.lock);
 }
 
+static void test_loader_invariant_survives_loader_retire_prepare(
+    const char *symbol)
+{
+    kzt_lazy_prebind_scope_t *scope = kzt_lazy_prebind_scope_init();
+    kzt_lazy_prebind_record_t record = record_for(1, 0x2400);
+    kzt_lazy_prebind_lease_t publish = { 0 };
+    kzt_lazy_prebind_lease_t read = { 0 };
+    kzt_lazy_prebind_lease_t revoke = { 0 };
+
+    record.bridge_custom_wrapper = 1;
+    record.loader_mutation_invariant = 1;
+    strcpy(record.symbol, symbol);
+    CHECK("invariant scope", scope != NULL);
+    CHECK("invariant claim", kzt_lazy_prebind_scope_claim(scope, &record) ==
+          KZT_LAZY_PREBIND_CLAIM_CREATED);
+    CHECK("invariant publish", kzt_lazy_prebind_scope_publish_acquire(
+          scope, &record, &publish) == 0);
+    kzt_lazy_prebind_scope_publish_finish(&publish, 1);
+    CHECK("invariant dlerror publication query",
+          kzt_lazy_prebind_scope_has_native_dlerror(
+              scope, &record.source) == (strcmp(symbol, "dlerror") == 0));
+    CHECK("invariant published lease acquire",
+          kzt_lazy_prebind_scope_acquire(scope, &record, &read) == 0);
+    CHECK("invariant published lease state",
+          kzt_lazy_prebind_scope_lease_published(&read));
+    kzt_lazy_prebind_scope_release(&read);
+    CHECK("invariant mutate", kzt_lazy_prebind_scope_mutate(
+          scope, KZT_LAZY_PREBIND_MUTATION_DLOPEN) == 2);
+    CHECK("invariant remains current", kzt_lazy_prebind_scope_acquire(
+          scope, &record, &read) == 0 && read.record.scope_epoch == 2);
+    kzt_lazy_prebind_scope_release(&read);
+    CHECK("invariant not globally revoked",
+          kzt_lazy_prebind_scope_revoke_acquire(
+              scope, NULL, &revoke) == 1);
+    CHECK("invariant retire prepare ignored", kzt_lazy_prebind_scope_retire(
+          scope, &record.source) == 0);
+    CHECK("invariant remains after retire prepare",
+          kzt_lazy_prebind_scope_acquire(scope, &record, &read) == 0);
+    kzt_lazy_prebind_scope_release(&read);
+    CHECK("invariant dlerror query survives mutation",
+          kzt_lazy_prebind_scope_has_native_dlerror(
+              scope, &record.source) == (strcmp(symbol, "dlerror") == 0));
+    CHECK("invariant exact revoke blocked",
+          kzt_lazy_prebind_scope_revoke_acquire(
+              scope, &record.source, &revoke) == 1);
+    kzt_lazy_prebind_scope_destroy(&scope);
+}
+
+static void test_source_dlerror_publication_expires_with_scope(void)
+{
+    kzt_lazy_prebind_scope_t *scope = kzt_lazy_prebind_scope_init();
+    kzt_lazy_prebind_record_t record = record_for(1, 0x2500);
+    kzt_lazy_prebind_lease_t publish = { 0 };
+
+    record.bridge_custom_wrapper = 1;
+    CHECK("source dlerror scope", scope != NULL);
+    CHECK("source dlerror claim", kzt_lazy_prebind_scope_claim(
+          scope, &record) == KZT_LAZY_PREBIND_CLAIM_CREATED);
+    CHECK("source dlerror publish", kzt_lazy_prebind_scope_publish_acquire(
+          scope, &record, &publish) == 0);
+    kzt_lazy_prebind_scope_publish_finish(&publish, 1);
+    CHECK("source dlerror current", kzt_lazy_prebind_scope_has_native_dlerror(
+          scope, &record.source));
+    CHECK("source dlerror mutate", kzt_lazy_prebind_scope_mutate(
+          scope, KZT_LAZY_PREBIND_MUTATION_DLOPEN) == 2);
+    CHECK("source dlerror expired", !kzt_lazy_prebind_scope_has_native_dlerror(
+          scope, &record.source));
+    kzt_lazy_prebind_scope_destroy(&scope);
+}
+
 int main(void)
 {
     test_epoch_invalidates_and_replaces_record();
@@ -309,6 +381,9 @@ int main(void)
     test_incomplete_proof_fails_open();
     test_changed_scope_identity_is_not_reused();
     test_publication_is_unique_and_mutation_drains();
+    test_source_dlerror_publication_expires_with_scope();
+    test_loader_invariant_survives_loader_retire_prepare("dlerror");
+    test_loader_invariant_survives_loader_retire_prepare("dlopen");
     puts("kzt-lazy-prebind-scope: all tests passed");
     return 0;
 }

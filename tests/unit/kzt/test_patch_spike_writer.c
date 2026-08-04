@@ -729,7 +729,7 @@ static void test_non_approved_decision_does_not_write(void)
     check_no_slot_calls("rejected.slot", &slot);
 }
 
-static void test_approved_non_jump_slot_does_not_consume_guard_budget(void)
+static void test_approved_glob_dat_uses_transaction_and_guard_budget(void)
 {
     kzt_patch_decision_t decision = approved_decision(0x7100000018);
     kzt_patch_spike_guard_t guard = init_guard(1, 1, 8);
@@ -750,12 +750,14 @@ static void test_approved_non_jump_slot_does_not_consume_guard_budget(void)
                                                              &ops,
                                                              &record), 0);
     check_int("glob-dat.result", record.result,
-              KZT_PATCH_SPIKE_RESULT_FAIL_OPEN);
+              KZT_PATCH_SPIKE_RESULT_APPLIED);
     check_int("glob-dat.failure", record.failure,
-              KZT_PATCH_SPIKE_FAILURE_INVALID_ARGUMENT);
-    check_int("glob-dat.writer-called", record.writer_called, 0);
-    check_ulong("glob-dat.remaining", record.writes_remaining, 8);
-    check_no_slot_calls("glob-dat.slot", &slot);
+              KZT_PATCH_SPIKE_FAILURE_NONE);
+    check_int("glob-dat.writer-called", record.writer_called, 1);
+    check_ulong("glob-dat.remaining", record.writes_remaining, 7);
+    check_uintptr("glob-dat.slot", slot.value, decision.bridge_target);
+    check_ulong("glob-dat.attempts", guard.write_attempts, 1);
+    check_ulong("glob-dat.successes", guard.write_successes, 1);
 }
 
 static void test_persistent_guard_budget_blocks_second_write(void)
@@ -939,7 +941,7 @@ int main(void)
     test_partial_permission_enable_is_restored();
     test_generation_mismatch_does_not_touch_permissions_or_slot();
     test_non_approved_decision_does_not_write();
-    test_approved_non_jump_slot_does_not_consume_guard_budget();
+    test_approved_glob_dat_uses_transaction_and_guard_budget();
     test_persistent_guard_budget_blocks_second_write();
     test_persistent_guard_circuit_blocks_second_write();
     test_record_fields_are_complete();
