@@ -6,6 +6,10 @@
 #include "segment.h"
 
 /* Exercise the actual guest munmap entry point with real host mappings. */
+#ifdef CONFIG_BUILD_LIBLAT
+/* liblat mapping ownership has dedicated integration coverage. */
+#undef CONFIG_BUILD_LIBLAT
+#endif
 #include "../../../../../linux-user/mmap.c"
 
 int qemu_loglevel;
